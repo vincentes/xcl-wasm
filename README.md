@@ -8,6 +8,26 @@ x64 code runs natively and XCL stands in for the console libraries the PC does n
 (`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …) – in the spirit of Wine/Proton. The console's
 GPU code (RDNA2 machine code) is recompiled into PC shaders (HLSL → DXIL).
 
+**This fork (`xcl-wasm`) takes XCL one layer further: into the browser.** The objective is to run
+the same game files in a browser tab, as a 64-bit WebAssembly module (`wasm64`), with nothing to
+install. A browser cannot run x64 code or call Windows, so each piece of XCL gets a browser
+counterpart:
+
+| On Windows (XCL) | In the browser (this fork) |
+|---|---|
+| the game's x64 code runs natively | it is translated to WebAssembly: an interpreter first, then a JIT |
+| the process's own address space | one 64-bit WebAssembly memory holding the title's address space |
+| console libraries as native functions | the same implementations, called when the game reaches an import |
+| D3D12.X → D3D12, shaders RDNA2 → HLSL → DXIL | D3D12.X → WebGPU, shaders RDNA2 → WGSL |
+| Win32 threads, files, audio and input | Web Workers, the browser's file system, Web Audio and the Gamepad API |
+
+**State of the browser port:** the first step is done – the part of XCL that needs no Windows
+builds for `wasm64`, and `xcl inspect` / `xcl disasm` run on a file picked in a page
+([In the browser](#in-the-browser-webassembly)). **No game runs in the browser yet**; the next
+step is the x64 interpreter running XCL's own test title. Everything below describes the Windows
+runtime this fork starts from; the port is meant to leave it unchanged, which has not been
+re-verified on Windows since the port's first changes.
+
 **Project state:** retail games run – Minecraft Preview and Unicorn Overlord are fully
 playable, Fortnite and XDefiant work as far as each game goes without its online services;
 see [Games](#games). The foundation is tested against real data from retail games
@@ -146,8 +166,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ### In the browser (WebAssembly)
 
 `crates/xcl-web` builds the part of XCL that needs no Windows as a 64-bit WebAssembly module
-(`wasm64-unknown-unknown`). So far that is `xcl inspect` and `xcl disasm` on a file picked in the
-page; it does not run games. See [`crates/xcl-web/README.md`](crates/xcl-web/README.md).
+(`wasm64-unknown-unknown`): the first step towards running games in a browser tab (see the top of
+this page). So far that is `xcl inspect` and `xcl disasm` on a file picked in the page; it does
+not run games. Build, test and run: [`crates/xcl-web/README.md`](crates/xcl-web/README.md).
 
 ## Tests
 
