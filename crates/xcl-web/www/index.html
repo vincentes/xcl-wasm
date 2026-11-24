@@ -14,8 +14,9 @@
   <input type="file" id="file">
   <label><input type="radio" name="cmd" value="inspect" checked> inspect (game exe / dll)</label>
   <label><input type="radio" name="cmd" value="disasm"> disasm (console shader)</label>
+  <label><input type="radio" name="cmd" value="run"> run (title exe, on the x64 guest)</label>
   <label><input type="checkbox" id="json"> JSON</label>
-  <input type="text" id="args" placeholder="disasm options, e.g. --offset 0x40 --all" size="36">
+  <input type="text" id="args" placeholder="disasm options (--offset 0x40 --all) / run arguments" size="44">
 </fieldset>
 <pre id="out"></pre>
 <script type="module">
@@ -34,8 +35,9 @@
     const data = new Uint8Array(await f.arrayBuffer());
     const cmd = document.querySelector("input[name=cmd]:checked").value;
     try {
+      const args = $("args").value.split(/\s+/).filter(Boolean);
       $("out").textContent =
-        cmd === "inspect" ? xcl.inspect(f.name, data, $("json").checked) : xcl.disasm(f.name, data, $("args").value.split(/\s+/).filter(Boolean));
+        cmd === "inspect" ? xcl.inspect(f.name, data, $("json").checked) : cmd === "disasm" ? xcl.disasm(f.name, data, args) : xcl.run(f.name, data, [f.name, ...args].join(" "));
     } catch (e) {
       $("out").textContent = "xcl " + cmd + ": " + e.message;
     }

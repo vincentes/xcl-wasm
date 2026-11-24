@@ -21,10 +21,13 @@ counterpart:
 | D3D12.X → D3D12, shaders RDNA2 → HLSL → DXIL | D3D12.X → WebGPU, shaders RDNA2 → WGSL |
 | Win32 threads, files, audio and input | Web Workers, the browser's file system, Web Audio and the Gamepad API |
 
-**State of the browser port:** the first step is done – the part of XCL that needs no Windows
-builds for `wasm64`, and `xcl inspect` / `xcl disasm` run on a file picked in a page
-([In the browser](#in-the-browser-webassembly)). **No game runs in the browser yet**; the next
-step is the x64 interpreter running XCL's own test title. Everything below describes the Windows
+**State of the browser port:** the part of XCL that needs no Windows builds for `wasm64`, and
+`xcl inspect` / `xcl disasm` run on a file picked in a page
+([In the browser](#in-the-browser-webassembly)). An x64 interpreter (`crates/xcl-emu`) and the
+guest around it (`crates/xcl-guest`: PE loader, threads, exceptions, title memory) run XCL's own
+test title to its end inside the WebAssembly module: 15 of its 50 checks pass, the others wait
+for files, XGameRuntime, game DLLs, D3D12.X, audio and input. **No retail game runs in the
+browser yet**: there is no graphics, and the interpreter is not a JIT. Everything below describes the Windows
 runtime this fork starts from; the port is meant to leave it unchanged, which has not been
 re-verified on Windows since the port's first changes.
 
@@ -167,8 +170,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 
 `crates/xcl-web` builds the part of XCL that needs no Windows as a 64-bit WebAssembly module
 (`wasm64-unknown-unknown`): the first step towards running games in a browser tab (see the top of
-this page). So far that is `xcl inspect` and `xcl disasm` on a file picked in the page; it does
-not run games. Build, test and run: [`crates/xcl-web/README.md`](crates/xcl-web/README.md).
+this page). So far that is `xcl inspect` and `xcl disasm` on a file picked in the page, and
+running a title's x64 code on the guest (XCL's test title; no graphics, no retail game). Build, test and run: [`crates/xcl-web/README.md`](crates/xcl-web/README.md).
 
 ## Tests
 

@@ -22,7 +22,7 @@ export async function load(source) {
     try {
       const args = [];
       for (const i of inputs) {
-        if (typeof i === "number") args.push(i);
+        if (typeof i === "number" || typeof i === "bigint") args.push(i);
         else args.push(...pass(held, i));
       }
       const code = fn(...args);
@@ -40,5 +40,7 @@ export async function load(source) {
     inspect: (name, data, json = false) => call(x.xcl_inspect, name, data, json ? 1 : 0),
     /** `xcl disasm`: RDNA2 listing of a shader blob; `args` as on the command line. */
     disasm: (name, data, args = []) => call(x.xcl_disasm, name, data, args.join("\n")),
+    /** Run a title on the x86-64 guest: its output, then a `--- stopped: …` line. */
+    run: (name, data, commandLine = "", maxInstructions = 0) => call(x.xcl_run, name, data, commandLine, BigInt(maxInstructions)),
   };
 }

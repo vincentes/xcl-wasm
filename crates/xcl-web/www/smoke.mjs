@@ -1,5 +1,5 @@
 // Smoke test of the built module under Node (22+ for 64-bit memories):
-//   node crates/xcl-web/www/smoke.mjs target/wasm64-unknown-unknown/release/xcl_web.wasm
+//   node crates/xcl-web/www/smoke.mjs target/wasm64-unknown-unknown/release/xcl_web.wasm [xcl_testtitle.exe]
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { load } from "./xcl.mjs";
@@ -78,4 +78,23 @@ assert.match(xcl.disasm("blob.bin", new Uint8Array(0)), /no RDNA2 programs found
 // many calls: the page's blocks are freed again
 for (let i = 0; i < 2000; i++) xcl.inspect("game.exe", pe);
 
-console.log(`xcl-web smoke: ok (${xcl.version()}, ${wasm.length} B)`);
+// a title on the x64 guest (the test title, when it is built: scripts/cross-testtitle.sh)
+const titlePath = process.argv[3];
+let ran = "no title given: run not checked";
+if (titlePath) {
+  const t0 = performance.now();
+  const out = xcl.run("xcl_testtitle.exe", readFileSync(titlePath), "xcl_testtitle.exe --hello");
+  const lines = out.split("\n");
+  const passes = lines.filter((l) => l.startsWith("[PASS] ")).length;
+  const fails = lines.filter((l) => l.startsWith("[FAIL] ")).length;
+  assert.match(out, /^xcl_testtitle: start\n/);
+  // it runs to its end (functions the host lacks answer 0, so later checks fail), and the
+  // first ten checks pass
+  assert.match(out, /\nxcl_testtitle: done, failures: \d+\n/);
+  assert.match(out, /--- stopped: Exit\(/);
+  assert.ok(lines.slice(1, 11).every((l) => l.startsWith("[PASS] ")), `the first ten checks:\n${lines.slice(0, 12).join("\n")}`);
+  assert.ok(passes >= 15, `only ${passes} checks passed`);
+  ran = `test title ran to its end: ${passes} checks passed, ${fails} failed, in ${Math.round(performance.now() - t0)} ms`;
+}
+
+console.log(`xcl-web smoke: ok (${xcl.version()}, ${wasm.length} B; ${ran})`);

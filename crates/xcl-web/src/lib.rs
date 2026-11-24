@@ -93,3 +93,34 @@ pub unsafe extern "C" fn xcl_disasm(name: *const u8, name_len: usize, data: *con
     }
     answer(xcl::disasm::render(&name, bytes(data, data_len), &args))
 }
+
+/// Run a title (a PE file's bytes) on the x86-64 guest: at most `max_instructions` (0: two
+/// billion). The answer is what the title wrote to its standard output and error, then a line
+/// starting with `--- ` that says why it stopped; functions the host does not implement answer 0
+/// and are listed before that line.
+///
+/// # Safety
+/// `name` (UTF-8), `data` and `command_line` (UTF-8; empty: the name): blocks from `xcl_alloc`.
+#[no_mangle]
+pub unsafe extern "C" fn xcl_run(name: *const u8, name_len: usize, data: *const u8, data_len: usize, command_line: *const u8, command_line_len: usize, max_instructions: u64) -> u32 {
+    let name = String::from_utf8_lossy(bytes(name, name_len)).into_owned();
+    let command_line = String::from_utf8_lossy(bytes(command_line, command_line_len)).into_owned();
+    let mut g = xcl_guest::Guest::new();
+    g.command_line = if command_line.is_empty() { name.clone() } else { command_line };
+    let started = g.map_image(&name, bytes(data, data_len)).and_then(|exe| g.start(exe, 1 << 20));
+    if let Err(e) = started {
+        return answer(Err(e));
+    }
+    let stop = g.run(if max_instructions == 0 { 2_000_000_000 } else { max_instructions });
+    let mut text = String::from_utf8_lossy(&g.output).into_owned();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    for line in &g.log {
+        text.push_str(line);
+        text.push('\n');
+    }
+    let instructions: u64 = g.cpu.icount;
+    text.push_str(&format!("--- stopped: {stop:x?} ({instructions} instructions on the last thread, {} threads)\n", g.threads.len()));
+    answer(Ok(text))
+}
