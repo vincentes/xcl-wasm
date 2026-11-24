@@ -172,37 +172,120 @@ fn fr(e: String) -> String {
     format!("bitcast<u32>({e})")
 }
 
-/// The value a vector instruction writes, from its sources `a` `b` `c` (`u32` expressions).
-fn vector_value(name: &str, a: &str, b: &str, c: &str) -> Option<String> {
-    let (fa, fb, fc, ia, ib) = (f(a), f(b), f(c), i(a), i(b));
+/// Operand modifiers of a float instruction (VOP3): |x| and −x on sources, a scale and a
+/// clamp to 0..1 on the result.
+#[derive(Default)]
+struct Mods {
+    abs: u64,
+    neg: u64,
+    omod: u64,
+    clamp: bool,
+}
+
+impl Mods {
+    fn any(&self) -> bool {
+        self.abs != 0 || self.neg != 0 || self.omod != 0 || self.clamp
+    }
+
+    /// Source `n` (a `u32` expression) as a float.
+    fn src(&self, n: usize, e: &str) -> String {
+        let mut s = f(e);
+        if self.abs >> n & 1 == 1 {
+            s = format!("abs({s})");
+        }
+        if self.neg >> n & 1 == 1 {
+            s = format!("(-{s})");
+        }
+        s
+    }
+
+    /// A float result as the register's bits.
+    fn res(&self, e: String) -> String {
+        let e = match self.omod {
+            1 => format!("(({e}) * 2.0)"),
+            2 => format!("(({e}) * 4.0)"),
+            3 => format!("(({e}) * 0.5)"),
+            _ => e,
+        };
+        fr(if self.clamp { format!("clamp({e}, 0.0, 1.0)") } else { e })
+    }
+}
+
+/// The value a vector instruction writes, from its sources `a` `b` `c` (`u32` expressions),
+/// what the destination holds (`cur`) and the instruction's constant (`k`).
+fn vector_value(name: &str, a: &str, b: &str, c: &str, m: &Mods, cur: &str, k: &str) -> Option<String> {
+    let (fa, fb, fc, ia, ib, ic) = (m.src(0, a), m.src(1, b), m.src(2, c), i(a), i(b), i(c));
+    let (fcur, fk) = (f(cur), f(k));
+    let fr = |e: String| m.res(e);
     Some(match name {
         "v_mov_b32" => a.to_string(),
         "v_not_b32" => format!("~{a}"),
+        "v_bfrev_b32" => format!("reverseBits({a})"),
+        "v_ffbh_u32" => format!("ffbh({a})"),
+        "v_ffbl_b32" => format!("ffbl({a})"),
+        "v_ffbh_i32" => format!("ffbh_i({a})"),
         "v_add_f32" => fr(format!("{fa} + {fb}")),
         "v_sub_f32" => fr(format!("{fa} - {fb}")),
         "v_subrev_f32" => fr(format!("{fb} - {fa}")),
         "v_mul_f32" => fr(format!("{fa} * {fb}")),
+        "v_mul_legacy_f32" => fr(format!("mul_legacy({fa}, {fb})")),
         "v_min_f32" => fr(format!("min({fa}, {fb})")),
         "v_max_f32" => fr(format!("max({fa}, {fb})")),
+        "v_fmac_f32" => fr(format!("fma({fa}, {fb}, {fcur})")),
+        "v_mac_f32" => fr(format!("mad_nf({fa}, {fb}, {fcur})")),
         "v_fma_f32" => fr(format!("fma({fa}, {fb}, {fc})")),
+        "v_mad_f32" => fr(format!("mad_nf({fa}, {fb}, {fc})")),
+        "v_fma_legacy_f32" => fr(format!("fma_legacy({fa}, {fb}, {fc})")),
+        // (the constant is the second or the third operand; the register is VSRC1)
+        "v_fmamk_f32" => fr(format!("fma({fa}, {fk}, {fb})")),
+        "v_fmaak_f32" => fr(format!("fma({fa}, {fb}, {fk})")),
+        "v_madmk_f32" => fr(format!("mad_nf({fa}, {fk}, {fb})")),
+        "v_madak_f32" => fr(format!("mad_nf({fa}, {fb}, {fk})")),
+        "v_min3_f32" => fr(format!("min(min({fa}, {fb}), {fc})")),
+        "v_max3_f32" => fr(format!("max(max({fa}, {fb}), {fc})")),
+        "v_med3_f32" => fr(format!("med3f({fa}, {fb}, {fc})")),
+        "v_cubeid_f32" => fr(format!("cube_id({fa}, {fb}, {fc})")),
+        "v_cubesc_f32" => fr(format!("cube_sc({fa}, {fb}, {fc})")),
+        "v_cubetc_f32" => fr(format!("cube_tc({fa}, {fb}, {fc})")),
+        "v_cubema_f32" => fr(format!("cube_ma({fa}, {fb}, {fc})")),
         "v_floor_f32" => fr(format!("floor({fa})")),
         "v_ceil_f32" => fr(format!("ceil({fa})")),
         "v_trunc_f32" => fr(format!("trunc({fa})")),
         "v_rndne_f32" => fr(format!("round({fa})")),
-        "v_fract_f32" => fr(format!("fract({fa})")),
+        "v_fract_f32" => fr(format!("fract_f({fa})")),
         "v_sqrt_f32" => fr(format!("sqrt({fa})")),
-        "v_rcp_f32" => fr(format!("1.0 / {fa}")),
+        "v_rcp_f32" | "v_rcp_iflag_f32" => fr(format!("1.0 / {fa}")),
         "v_rsq_f32" => fr(format!("inverseSqrt({fa})")),
+        "v_exp_f32" => fr(format!("exp2({fa})")),
+        "v_log_f32" => fr(format!("log2({fa})")),
+        // the angle is in revolutions
+        "v_sin_f32" => fr(format!("sin({fa} * 6.2831853)")),
+        "v_cos_f32" => fr(format!("cos({fa} * 6.2831853)")),
         "v_cvt_f32_i32" => fr(format!("f32({ia})")),
         "v_cvt_f32_u32" => fr(format!("f32({a})")),
-        "v_cvt_i32_f32" => fr(format!("i32({fa})")),
-        "v_cvt_u32_f32" => format!("u32({fa})"),
+        "v_cvt_i32_f32" => format!("cvt_i32({fa})"),
+        "v_cvt_u32_f32" => format!("cvt_u32({fa})"),
+        "v_cvt_rpi_i32_f32" => format!("cvt_i32(floor({fa} + 0.5))"),
+        "v_cvt_flr_i32_f32" => format!("cvt_i32(floor({fa}))"),
+        "v_cvt_f32_ubyte0" => fr(format!("f32({a} & 0xffu)")),
+        "v_cvt_f32_ubyte1" => fr(format!("f32(({a} >> 8u) & 0xffu)")),
+        "v_cvt_f32_ubyte2" => fr(format!("f32(({a} >> 16u) & 0xffu)")),
+        "v_cvt_f32_ubyte3" => fr(format!("f32({a} >> 24u)")),
+        "v_cvt_f32_f16" => fr(format!("unpack2x16float({a} & 0xffffu).x")),
         "v_cvt_pkrtz_f16_f32" => format!("f16_rtz({fa}) | (f16_rtz({fb}) << 16u)"),
-        "v_add_nc_u32" => format!("{a} + {b}"),
-        "v_sub_nc_u32" => format!("{a} - {b}"),
+        "v_cvt_pk_u16_u32" => format!("min({a}, 0xffffu) | (min({b}, 0xffffu) << 16u)"),
+        "v_cvt_pk_i16_i32" => format!("(bitcast<u32>(clamp({ia}, -32768, 32767)) & 0xffffu) | ((bitcast<u32>(clamp({ib}, -32768, 32767)) & 0xffffu) << 16u)"),
+        "v_add_nc_u32" | "v_add_nc_i32" => format!("{a} + {b}"),
+        "v_sub_nc_u32" | "v_sub_nc_i32" => format!("{a} - {b}"),
         "v_subrev_nc_u32" => format!("{b} - {a}"),
         "v_mul_lo_u32" => format!("{a} * {b}"),
         "v_mul_hi_u32" => format!("mul_hi({a}, {b})"),
+        "v_mul_hi_i32" => format!("mul_hi_i({a}, {b})"),
+        "v_mul_u32_u24" => format!("({a} & 0xffffffu) * ({b} & 0xffffffu)"),
+        "v_mul_hi_u32_u24" => format!("mul_hi({a} & 0xffffffu, {b} & 0xffffffu)"),
+        "v_mul_i32_i24" => fr(format!("i24({a}) * i24({b})")),
+        "v_mad_u32_u24" => format!("({a} & 0xffffffu) * ({b} & 0xffffffu) + {c}"),
+        "v_mad_i32_i24" => fr(format!("i24({a}) * i24({b}) + {ic}")),
         "v_and_b32" => format!("{a} & {b}"),
         "v_or_b32" => format!("{a} | {b}"),
         "v_xor_b32" => format!("{a} ^ {b}"),
@@ -210,14 +293,134 @@ fn vector_value(name: &str, a: &str, b: &str, c: &str) -> Option<String> {
         "v_lshlrev_b32" => format!("{b} << ({a} & 31u)"),
         "v_lshrrev_b32" => format!("{b} >> ({a} & 31u)"),
         "v_ashrrev_i32" => fr(format!("{ib} >> ({a} & 31u)")),
+        "v_lshl_add_u32" => format!("({a} << ({b} & 31u)) + {c}"),
+        "v_add_lshl_u32" => format!("({a} + {b}) << ({c} & 31u)"),
+        "v_lshl_or_b32" => format!("({a} << ({b} & 31u)) | {c}"),
+        "v_and_or_b32" => format!("({a} & {b}) | {c}"),
+        "v_or3_b32" => format!("{a} | {b} | {c}"),
+        "v_xor3_b32" => format!("{a} ^ {b} ^ {c}"),
+        "v_add3_u32" => format!("{a} + {b} + {c}"),
+        "v_xad_u32" => format!("({a} ^ {b}) + {c}"),
+        "v_bfe_u32" => format!("bfe_u({a}, {b}, {c})"),
+        "v_bfe_i32" => format!("bfe_i({a}, {b}, {c})"),
+        "v_bfi_b32" => format!("({a} & {b}) | (~{a} & {c})"),
+        "v_bfm_b32" => format!("bfm({a}, {b})"),
+        "v_bcnt_u32_b32" => format!("countOneBits({a}) + {b}"),
+        "v_alignbit_b32" => format!("alignbit({a}, {b}, {c})"),
+        "v_alignbyte_b32" => format!("alignbit({a}, {b}, ({c} & 3u) * 8u)"),
         "v_min_u32" => format!("min({a}, {b})"),
         "v_max_u32" => format!("max({a}, {b})"),
         "v_min_i32" => fr(format!("min({ia}, {ib})")),
         "v_max_i32" => fr(format!("max({ia}, {ib})")),
+        "v_min3_u32" => format!("min(min({a}, {b}), {c})"),
+        "v_max3_u32" => format!("max(max({a}, {b}), {c})"),
+        "v_med3_u32" => format!("max(min({a}, {b}), min(max({a}, {b}), {c}))"),
+        "v_min3_i32" => fr(format!("min(min({ia}, {ib}), {ic})")),
+        "v_max3_i32" => fr(format!("max(max({ia}, {ib}), {ic})")),
+        "v_med3_i32" => fr(format!("max(min({ia}, {ib}), min(max({ia}, {ib}), {ic}))")),
+        "v_sad_u32" => format!("(max({a}, {b}) - min({a}, {b})) + {c}"),
         "v_cndmask_b32" => format!("select({a}, {b}, on(vcc, l))"),
         _ => return None,
     })
 }
+
+/// A 32-bit scalar instruction: the result and SCC (None: left alone) as expressions over the
+/// sources `a` `b`, the result `r` and what the destination holds (`cur`).
+fn scalar_value(name: &str) -> Option<(String, Option<&'static str>)> {
+    let nz = Some("r != 0u");
+    let (res, scc): (&str, Option<&'static str>) = match name {
+        "s_mov_b32" => ("a", None),
+        "s_cmov_b32" => ("select(cur, a, scc)", None),
+        "s_not_b32" => ("~a", nz),
+        "s_brev_b32" => ("reverseBits(a)", None),
+        "s_bcnt0_i32_b32" => ("32u - countOneBits(a)", nz),
+        "s_bcnt1_i32_b32" => ("countOneBits(a)", nz),
+        "s_ff0_i32_b32" => ("ffbl(~a)", None),
+        "s_ff1_i32_b32" => ("ffbl(a)", None),
+        "s_flbit_i32_b32" => ("ffbh(a)", None),
+        "s_flbit_i32" => ("ffbh_i(a)", None),
+        "s_abs_i32" => ("bitcast<u32>(abs(bitcast<i32>(a)))", nz),
+        "s_sext_i32_i8" => ("bitcast<u32>(bitcast<i32>(a << 24u) >> 24u)", None),
+        "s_sext_i32_i16" => ("bitcast<u32>(bitcast<i32>(a << 16u) >> 16u)", None),
+        "s_and_b32" => ("a & b", nz),
+        "s_or_b32" => ("a | b", nz),
+        "s_xor_b32" => ("a ^ b", nz),
+        "s_andn2_b32" => ("a & ~b", nz),
+        "s_orn2_b32" => ("a | ~b", nz),
+        "s_nand_b32" => ("~(a & b)", nz),
+        "s_nor_b32" => ("~(a | b)", nz),
+        "s_xnor_b32" => ("~(a ^ b)", nz),
+        "s_add_u32" => ("a + b", Some("r < a")),
+        "s_sub_u32" => ("a - b", Some("b > a")),
+        "s_addc_u32" => ("a + b + u32(scc)", Some("(a + b < a) || (r < a + b)")),
+        "s_subb_u32" => ("a - b - u32(scc)", Some("(b > a) || (scc && b == a)")),
+        "s_add_i32" => ("a + b", Some("(((a ^ r) & (b ^ r)) >> 31u) != 0u")),
+        "s_sub_i32" => ("a - b", Some("(((a ^ b) & (a ^ r)) >> 31u) != 0u")),
+        "s_mul_i32" => ("a * b", None),
+        "s_mul_hi_u32" => ("mul_hi(a, b)", None),
+        "s_mul_hi_i32" => ("mul_hi_i(a, b)", None),
+        "s_lshl_b32" => ("a << (b & 31u)", nz),
+        "s_lshr_b32" => ("a >> (b & 31u)", nz),
+        "s_ashr_i32" => ("bitcast<u32>(bitcast<i32>(a) >> (b & 31u))", nz),
+        "s_lshl1_add_u32" => ("(a << 1u) + b", Some("(a >> 31u) != 0u || r < b")),
+        "s_lshl2_add_u32" => ("(a << 2u) + b", Some("(a >> 30u) != 0u || r < b")),
+        "s_lshl3_add_u32" => ("(a << 3u) + b", Some("(a >> 29u) != 0u || r < b")),
+        "s_lshl4_add_u32" => ("(a << 4u) + b", Some("(a >> 28u) != 0u || r < b")),
+        "s_bfm_b32" => ("bfm(a, b)", None),
+        "s_bfe_u32" => ("sbfe_u(a, b)", nz),
+        "s_bfe_i32" => ("sbfe_i(a, b)", nz),
+        "s_min_u32" => ("min(a, b)", Some("a < b")),
+        "s_max_u32" => ("max(a, b)", Some("a > b")),
+        "s_min_i32" => ("bitcast<u32>(min(bitcast<i32>(a), bitcast<i32>(b)))", Some("bitcast<i32>(a) < bitcast<i32>(b)")),
+        "s_max_i32" => ("bitcast<u32>(max(bitcast<i32>(a), bitcast<i32>(b)))", Some("bitcast<i32>(a) > bitcast<i32>(b)")),
+        "s_cselect_b32" => ("select(b, a, scc)", None),
+        "s_bitset0_b32" => ("cur & ~(1u << (a & 31u))", None),
+        "s_bitset1_b32" => ("cur | (1u << (a & 31u))", None),
+        "s_absdiff_i32" => ("bitcast<u32>(abs(bitcast<i32>(a) - bitcast<i32>(b)))", nz),
+        "s_pack_ll_b32_b16" => ("(a & 0xffffu) | (b << 16u)", None),
+        "s_pack_lh_b32_b16" => ("(a & 0xffffu) | (b & 0xffff0000u)", None),
+        "s_pack_hh_b32_b16" => ("(a >> 16u) | (b & 0xffff0000u)", None),
+        _ => return None,
+    };
+    Some((res.to_string(), scc))
+}
+
+/// The helper functions every program gets. (A float out of an integer's range is converted
+/// by hand: WGSL's own conversion stops at the nearest float inside the range, 2^31 − 128.)
+const HELPERS: &str = "\
+fn on(m: vec2<u32>, l: u32) -> bool { if (l < 32u) { return ((m.x >> l) & 1u) != 0u; } return ((m.y >> (l - 32u)) & 1u) != 0u; }
+fn put(m: vec2<u32>, l: u32) -> vec2<u32> { if (l < 32u) { return vec2<u32>(m.x | (1u << l), m.y); } return vec2<u32>(m.x, m.y | (1u << (l - 32u))); }
+fn first(m: vec2<u32>) -> u32 { if (m.x != 0u) { return countTrailingZeros(m.x); } if (m.y != 0u) { return 32u + countTrailingZeros(m.y); } return 0u; }
+fn ff1_64(m: vec2<u32>) -> u32 { if (all(m == vec2<u32>(0u))) { return 0xffffffffu; } return first(m); }
+fn shl64(v: vec2<u32>, k: u32) -> vec2<u32> { let n = k & 63u; if (n == 0u) { return v; } if (n >= 32u) { return vec2<u32>(0u, v.x << (n - 32u)); } return vec2<u32>(v.x << n, (v.y << n) | (v.x >> (32u - n))); }
+fn shr64(v: vec2<u32>, k: u32) -> vec2<u32> { let n = k & 63u; if (n == 0u) { return v; } if (n >= 32u) { return vec2<u32>(v.y >> (n - 32u), 0u); } return vec2<u32>((v.x >> n) | (v.y << (32u - n)), v.y >> n); }
+fn mul_hi(a: u32, b: u32) -> u32 { let al = a & 0xffffu; let ah = a >> 16u; let bl = b & 0xffffu; let bh = b >> 16u; let mid = ah * bl + ((al * bl) >> 16u); let mid2 = al * bh + (mid & 0xffffu); return ah * bh + (mid >> 16u) + (mid2 >> 16u); }
+fn mul_hi_i(a: u32, b: u32) -> u32 { return mul_hi(a, b) - select(0u, b, bitcast<i32>(a) < 0) - select(0u, a, bitcast<i32>(b) < 0); }
+fn i24(v: u32) -> i32 { return bitcast<i32>(v << 8u) >> 8u; }
+fn ffbh(v: u32) -> u32 { if (v == 0u) { return 0xffffffffu; } return countLeadingZeros(v); }
+fn ffbl(v: u32) -> u32 { if (v == 0u) { return 0xffffffffu; } return countTrailingZeros(v); }
+fn ffbh_i(v: u32) -> u32 { return ffbh(select(v, ~v, bitcast<i32>(v) < 0)); }
+fn low_bits(w: u32) -> u32 { if (w == 0u) { return 0u; } return 0xffffffffu >> (32u - w); }
+fn bfm(a: u32, b: u32) -> u32 { return low_bits(a & 31u) << (b & 31u); }
+fn bfe_u(v: u32, o: u32, w: u32) -> u32 { return (v >> (o & 31u)) & low_bits(w & 31u); }
+fn bfe_i(v: u32, o: u32, w0: u32) -> u32 { let w = w0 & 31u; if (w == 0u) { return 0u; } let sh = 32u - w; return bitcast<u32>(bitcast<i32>(bitcast<u32>(bitcast<i32>(v) >> (o & 31u)) << sh) >> sh); }
+fn sbfe_u(v: u32, c: u32) -> u32 { let o = c & 31u; let w = (c >> 16u) & 0x7fu; if (w >= 32u) { return v >> o; } return (v >> o) & low_bits(w); }
+fn sbfe_i(v: u32, c: u32) -> u32 { let o = c & 31u; let w = (c >> 16u) & 0x7fu; if (w == 0u) { return 0u; } if (w >= 32u) { return bitcast<u32>(bitcast<i32>(v) >> o); } return bfe_i(v, o, w); }
+fn alignbit(s0: u32, s1: u32, k: u32) -> u32 { let n = k & 31u; if (n == 0u) { return s1; } return (s1 >> n) | (s0 << (32u - n)); }
+fn is_nan(x: f32) -> bool { return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u; }
+fn cvt_u32(x: f32) -> u32 { if (is_nan(x) || x <= 0.0) { return 0u; } if (x >= 4294967296.0) { return 0xffffffffu; } return u32(x); }
+fn cvt_i32(x: f32) -> u32 { if (is_nan(x)) { return 0u; } if (x >= 2147483648.0) { return 0x7fffffffu; } if (x <= -2147483648.0) { return 0x80000000u; } return bitcast<u32>(i32(x)); }
+fn mul_legacy(a: f32, b: f32) -> f32 { if (a == 0.0 || b == 0.0) { return 0.0; } return a * b; }
+fn fma_legacy(a: f32, b: f32, c: f32) -> f32 { if (a == 0.0 || b == 0.0) { return c; } return fma(a, b, c); }
+fn mad_nf(a: f32, b: f32, c: f32) -> f32 { let p = a * b; return p + c; }
+fn med3f(a: f32, b: f32, c: f32) -> f32 { return max(min(a, b), min(max(a, b), c)); }
+fn fract_f(x: f32) -> f32 { let r = x - floor(x); if (r >= 1.0) { return bitcast<f32>(0x3f7fffffu); } return r; }
+fn cube_id(x: f32, y: f32, z: f32) -> f32 { if (abs(z) >= abs(x) && abs(z) >= abs(y)) { return select(4.0, 5.0, z < 0.0); } if (abs(y) >= abs(x)) { return select(2.0, 3.0, y < 0.0); } return select(0.0, 1.0, x < 0.0); }
+fn cube_sc(x: f32, y: f32, z: f32) -> f32 { if (abs(z) >= abs(x) && abs(z) >= abs(y)) { return select(x, -x, z < 0.0); } if (abs(y) >= abs(x)) { return x; } return select(-z, z, x < 0.0); }
+fn cube_tc(x: f32, y: f32, z: f32) -> f32 { if (abs(z) >= abs(x) && abs(z) >= abs(y)) { return -y; } if (abs(y) >= abs(x)) { return select(z, -z, y < 0.0); } return -y; }
+fn cube_ma(x: f32, y: f32, z: f32) -> f32 { if (abs(z) >= abs(x) && abs(z) >= abs(y)) { return 2.0 * z; } if (abs(y) >= abs(x)) { return 2.0 * y; } return 2.0 * x; }
+fn f16_rtz(f: f32) -> u32 { let b = bitcast<u32>(f); let sign = (b >> 16u) & 0x8000u; let u = b & 0x7fffffffu; let e = i32(u >> 23u) - 127; if (u > 0x7f800000u) { return sign | 0x7e00u; } if (u == 0x7f800000u) { return sign | 0x7c00u; } if (e > 15) { return sign | 0x7bffu; } if (e < -25) { return sign; } if (e < -14) { return sign | (((u & 0x7fffffu) | 0x800000u) >> u32(-1 - e)); } return sign | (u32(e + 15) << 10u) | ((u & 0x7fffffu) >> 13u); }
+";
 
 /// One instruction as WGSL statements (branches are the caller's).
 fn statement(d: &Decoded, stage: Stage) -> Result<String, String> {
@@ -324,7 +527,12 @@ fn statement(d: &Decoded, stage: Stage) -> Result<String, String> {
         if enc.contains("SDWA") || enc.contains("DPP") {
             return Err(format!("{name} ({enc})"));
         }
-        if ["ABS", "NEG", "OMOD", "CLAMP"].iter().any(|m| field(d, m).unwrap_or(0) != 0) {
+        if name == "v_nop" {
+            return Ok(String::new());
+        }
+        let get = |n: &str| field(d, n).unwrap_or(0);
+        let m = Mods { abs: get("ABS"), neg: get("NEG"), omod: get("OMOD"), clamp: get("CLAMP") != 0 };
+        if m.any() && !name.contains("f32") {
             return Err(format!("{name} with operand modifiers"));
         }
         let a = source(field(d, "SRC0").ok_or("SRC0")?, lit)?;
@@ -337,20 +545,29 @@ fn statement(d: &Decoded, stage: Stage) -> Result<String, String> {
         let cmpx = name.starts_with("v_cmpx_");
         if let Some(rest) = name.strip_prefix("v_cmpx_").or_else(|| name.strip_prefix("v_cmp_")) {
             let (op, ty) = rest.rsplit_once('_').ok_or(&name)?;
-            let cast = |e: &str| match ty {
-                "f32" => Ok(f(e)),
+            let cast = |n: usize, e: &str| match ty {
+                "f32" => Ok(m.src(n, e)),
                 "i32" => Ok(i(e)),
                 "u32" => Ok(e.to_string()),
                 _ => Err(format!("{name}")),
             };
-            let test = condition(op, &cast(&a)?, &cast(&b)?, ty == "f32").ok_or(&name)?;
+            let test = condition(op, &cast(0, &a)?, &cast(1, &b)?, ty == "f32").ok_or(&name)?;
             // the mask goes to VCC, or to the register pair the VOP3 form names
             // (v_cmpx: to EXEC, so lanes that fail are off from here)
             let to = store64(if cmpx { 126 } else if enc.contains("VOP3") { field(d, "VDST").ok_or("VDST")? } else { 106 }, "m")?;
             return Ok(format!("{{ var m = vec2<u32>(0u); for (var l = 0u; l < LANES; l++) {{ if (on(exec, l) && {test}) {{ m = put(m, l); }} }} {to} }}"));
         }
-        let value = vector_value(&name, &a, &b, &c).ok_or(&name)?;
         let dst = field(d, "VDST").ok_or("VDST")?;
+        // lanes: the first one that is on to a scalar register, one by number
+        match name.as_str() {
+            "v_readfirstlane_b32" => return Ok(format!("{{ let l = first(exec); {} }}", store(dst, &a)?)),
+            "v_readlane_b32" if stage == Stage::Kernel => return Ok(format!("{{ let l = {b} & 63u; {} }}", store(dst, &a)?)),
+            // (whatever EXEC is)
+            "v_writelane_b32" if stage == Stage::Kernel => return Ok(format!("v{dst}[{b} & 63u] = {a};")),
+            _ => {}
+        }
+        let k = format!("{}u", lit.unwrap_or(0));
+        let value = vector_value(&name, &a, &b, &c, &m, &format!("v{dst}[l]"), &k).ok_or(&name)?;
         return Ok(format!("for (var l = 0u; l < LANES; l++) {{ if (on(exec, l)) {{ v{dst}[l] = {value}; }} }}"));
     }
     // --- the scalar unit
@@ -363,59 +580,48 @@ fn statement(d: &Decoded, stage: Stage) -> Result<String, String> {
     let to64 = |value: &str| store64(dst.ok_or("SDST")?, value);
     Ok(match name.as_str() {
         "s_nop" | "s_waitcnt" => String::new(),
-        "s_mov_b32" => to(&x(s0)?)?,
         "s_mov_b64" => to64(&x64(s0)?)?,
         "s_movk_i32" => to(&format!("{}u", field(d, "SIMM16").ok_or("SIMM16")? as u16 as i16 as i32 as u32))?,
-        "s_not_b32" => format!("{{ let r = ~{}; scc = r != 0u; {} }}", x(s0)?, to("r")?),
         "s_not_b64" => format!("{{ let r = ~{}; scc = any(r != vec2<u32>(0u)); {} }}", x64(s0)?, to64("r")?),
-        "s_add_u32" => format!("{{ let a = {}; let r = a + {}; scc = r < a; {} }}", x(s0)?, x(s1)?, to("r")?),
-        "s_sub_u32" => format!("{{ let a = {}; let b = {}; scc = b > a; {} }}", x(s0)?, x(s1)?, to("a - b")?),
-        "s_add_i32" => format!("{{ let a = {}; let b = {}; let r = a + b; scc = ((~(a ^ b)) & (a ^ r)) >> 31u != 0u; {} }}", x(s0)?, x(s1)?, to("r")?),
-        "s_sub_i32" => format!("{{ let a = {}; let b = {}; let r = a - b; scc = ((a ^ b) & (a ^ r)) >> 31u != 0u; {} }}", x(s0)?, x(s1)?, to("r")?),
-        "s_mul_i32" => to(&format!("{} * {}", x(s0)?, x(s1)?))?,
-        "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_andn2_b32" | "s_orn2_b32" => {
-            let (a, b) = (x(s0)?, x(s1)?);
-            let r = match name.as_str() {
-                "s_and_b32" => format!("{a} & {b}"),
-                "s_or_b32" => format!("{a} | {b}"),
-                "s_xor_b32" => format!("{a} ^ {b}"),
-                "s_andn2_b32" => format!("{a} & ~{b}"),
-                _ => format!("{a} | ~{b}"),
-            };
-            format!("{{ let r = {r}; scc = r != 0u; {} }}", to("r")?)
-        }
-        "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64" => {
+        "s_cselect_b64" => to64(&format!("select({}, {}, scc)", x64(s1)?, x64(s0)?))?,
+        "s_lshl_b64" => format!("{{ let r = shl64({}, {}); scc = any(r != vec2<u32>(0u)); {} }}", x64(s0)?, x(s1)?, to64("r")?),
+        "s_lshr_b64" => format!("{{ let r = shr64({}, {}); scc = any(r != vec2<u32>(0u)); {} }}", x64(s0)?, x(s1)?, to64("r")?),
+        "s_bcnt1_i32_b64" => format!("{{ let a = {}; let r = countOneBits(a.x) + countOneBits(a.y); scc = r != 0u; {} }}", x64(s0)?, to("r")?),
+        "s_ff1_i32_b64" => to(&format!("ff1_64({})", x64(s0)?))?,
+        "s_cmp_eq_u64" => format!("scc = all({} == {});", x64(s0)?, x64(s1)?),
+        "s_cmp_lg_u64" => format!("scc = any({} != {});", x64(s0)?, x64(s1)?),
+        "s_bitcmp0_b32" => format!("scc = (({} >> ({} & 31u)) & 1u) == 0u;", x(s0)?, x(s1)?),
+        "s_bitcmp1_b32" => format!("scc = (({} >> ({} & 31u)) & 1u) != 0u;", x(s0)?, x(s1)?),
+        "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64" | "s_nand_b64" | "s_nor_b64" | "s_xnor_b64" => {
             let (a, b) = (x64(s0)?, x64(s1)?);
             let r = match name.as_str() {
                 "s_and_b64" => format!("{a} & {b}"),
                 "s_or_b64" => format!("{a} | {b}"),
                 "s_xor_b64" => format!("{a} ^ {b}"),
                 "s_andn2_b64" => format!("{a} & ~{b}"),
+                "s_nand_b64" => format!("~({a} & {b})"),
+                "s_nor_b64" => format!("~({a} | {b})"),
+                "s_xnor_b64" => format!("~({a} ^ {b})"),
                 _ => format!("{a} | ~{b}"),
             };
             format!("{{ let r = {r}; scc = any(r != vec2<u32>(0u)); {} }}", to64("r")?)
         }
-        "s_lshl_b32" => format!("{{ let r = {} << ({} & 31u); scc = r != 0u; {} }}", x(s0)?, x(s1)?, to("r")?),
-        "s_lshr_b32" => format!("{{ let r = {} >> ({} & 31u); scc = r != 0u; {} }}", x(s0)?, x(s1)?, to("r")?),
-        "s_ashr_i32" => format!("{{ let r = bitcast<u32>({} >> ({} & 31u)); scc = r != 0u; {} }}", i(&x(s0)?), x(s1)?, to("r")?),
-        "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
-            let (a, b) = (x(s0)?, x(s1)?);
-            let signed = name.ends_with("i32");
-            let less = if signed { format!("{} < {}", i("a"), i("b")) } else { "a < b".to_string() };
-            let first = if name.starts_with("s_min") { less } else { if signed { format!("{} > {}", i("a"), i("b")) } else { "a > b".to_string() } };
-            format!("{{ let a = {a}; let b = {b}; scc = {first}; {} }}", to("select(b, a, scc)")?)
-        }
-        "s_cselect_b32" => to(&format!("select({}, {}, scc)", x(s1)?, x(s0)?))?,
         // EXEC is saved, then masked with the source; SCC: lanes are left
-        "s_and_saveexec_b64" | "s_or_saveexec_b64" | "s_andn2_saveexec_b64" | "s_andn1_saveexec_b64" => {
-            let a = x64(s0)?;
-            let r = match name.as_str() {
-                "s_and_saveexec_b64" => "a & exec",
-                "s_or_saveexec_b64" => "a | exec",
-                "s_andn2_saveexec_b64" => "a & ~exec",
-                _ => "~a & exec",
+        _ if name.ends_with("_saveexec_b64") => {
+            let r = match name.trim_end_matches("_saveexec_b64") {
+                "s_and" => "a & exec",
+                "s_or" => "a | exec",
+                "s_xor" => "a ^ exec",
+                "s_andn2" => "a & ~exec",
+                "s_orn2" => "a | ~exec",
+                "s_nand" => "~(a & exec)",
+                "s_nor" => "~(a | exec)",
+                "s_xnor" => "~(a ^ exec)",
+                "s_andn1" => "~a & exec",
+                "s_orn1" => "~a | exec",
+                _ => return Err(name),
             };
-            format!("{{ let a = {a}; let saved = exec; exec = {r}; scc = any(exec != vec2<u32>(0u)); {} }}", to64("saved")?)
+            format!("{{ let a = {}; let saved = exec; exec = {r}; scc = any(exec != vec2<u32>(0u)); {} }}", x64(s0)?, to64("saved")?)
         }
         _ => {
             if let Some(rest) = name.strip_prefix("s_cmp_") {
@@ -423,6 +629,34 @@ fn statement(d: &Decoded, stage: Stage) -> Result<String, String> {
                 let (a, b) = (x(s0)?, x(s1)?);
                 let (a, b) = if ty == "i32" { (i(&a), i(&b)) } else { (a, b) };
                 return Ok(format!("scc = {};", condition(op, &a, &b, false).ok_or(&name)?));
+            }
+            // SOPK: the register with a 16-bit constant
+            if let Some(k) = field(d, "SIMM16") {
+                let (signed, zero) = (format!("{}u", k as u16 as i16 as i32 as u32), format!("{}u", k as u16));
+                let cur = x(dst)?;
+                if let Some(rest) = name.strip_prefix("s_cmpk_") {
+                    let (op, ty) = rest.rsplit_once('_').ok_or(&name)?;
+                    let (a, b) = if ty == "i32" { (i(&cur), i(&signed)) } else { (cur, zero) };
+                    return Ok(format!("scc = {};", condition(op, &a, &b, false).ok_or(&name)?));
+                }
+                return Ok(match name.as_str() {
+                    "s_cmovk_i32" => to(&format!("select({cur}, {signed}, scc)"))?,
+                    "s_addk_i32" => format!("{{ let a = {cur}; let b = {signed}; let r = a + b; scc = (((a ^ r) & (b ^ r)) >> 31u) != 0u; {} }}", to("r")?),
+                    "s_mulk_i32" => to(&format!("{cur} * {signed}"))?,
+                    _ => return Err(name),
+                });
+            }
+            if let Some((res, scc)) = scalar_value(&name) {
+                let (a, b) = (s0.map(|c| source(c, lit)).transpose()?, s1.map(|c| source(c, lit)).transpose()?);
+                let cur = dst.filter(|&c| c != 125).map(|c| source(c, lit)).transpose()?;
+                let scc = scc.map(|e| format!("scc = {e}; ")).unwrap_or_default();
+                return Ok(format!(
+                    "{{ let a = {}; let b = {}; let cur = {}; let r = {res}; {scc}{} }}",
+                    a.unwrap_or("0u".into()),
+                    b.unwrap_or("0u".into()),
+                    cur.unwrap_or("0u".into()),
+                    to("r")?
+                ));
             }
             return Err(name);
         }
@@ -586,12 +820,7 @@ pub fn translate(code: &[u8], stage: Stage) -> Result<Translation, String> {
     for v in &vgprs {
         let _ = writeln!(w, "var<private> v{v}: array<u32, {lanes}>;");
     }
-    // helpers: a lane's bit in a mask, the mask with a lane's bit, the high half of a product
-    let _ = writeln!(w, "fn on(m: vec2<u32>, l: u32) -> bool {{ if (l < 32u) {{ return ((m.x >> l) & 1u) != 0u; }} return ((m.y >> (l - 32u)) & 1u) != 0u; }}");
-    let _ = writeln!(w, "fn put(m: vec2<u32>, l: u32) -> vec2<u32> {{ if (l < 32u) {{ return vec2<u32>(m.x | (1u << l), m.y); }} return vec2<u32>(m.x, m.y | (1u << (l - 32u))); }}");
-    let _ = writeln!(w, "fn mul_hi(a: u32, b: u32) -> u32 {{ let al = a & 0xffffu; let ah = a >> 16u; let bl = b & 0xffffu; let bh = b >> 16u; let mid = ah * bl + ((al * bl) >> 16u); let mid2 = al * bh + (mid & 0xffffu); return ah * bh + (mid >> 16u) + (mid2 >> 16u); }}");
-    // a float as a half, rounded toward zero (from the bits: WGSL's pack leaves the rounding open)
-    let _ = writeln!(w, "fn f16_rtz(f: f32) -> u32 {{ let b = bitcast<u32>(f); let sign = (b >> 16u) & 0x8000u; let u = b & 0x7fffffffu; let e = i32(u >> 23u) - 127; if (u > 0x7f800000u) {{ return sign | 0x7e00u; }} if (u == 0x7f800000u) {{ return sign | 0x7c00u; }} if (e > 15) {{ return sign | 0x7bffu; }} if (e < -25) {{ return sign; }} if (e < -14) {{ return sign | (((u & 0x7fffffu) | 0x800000u) >> u32(-1 - e)); }} return sign | (u32(e + 15) << 10u) | ((u & 0x7fffffu) >> 13u); }}");
+    w.push_str(HELPERS);
     match stage {
         Stage::Kernel => {
             let _ = writeln!(w, "@compute @workgroup_size(1) fn main() {{");
@@ -756,9 +985,34 @@ mod tests {
 
     #[test]
     fn what_is_missing_is_named() {
-        // v_sin_f32 v0, v1 is not in this back end
-        let code = asm(&[("V_SIN_F32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 257)], None), ("S_ENDPGM", "ENC_SOPP", &[], None)]);
+        // v_cvt_f16_f32 v0, v1 is not in this back end; an integer instruction has no modifiers
+        let code = asm(&[
+            ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 257)], None),
+            ("V_OR3_B32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 257), ("SRC1", 257), ("SRC2", 257), ("CLAMP", 1)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]);
         let e = translate_kernel(&code).err().unwrap();
-        assert!(e.contains("v_sin_f32 ×1"), "{e}");
+        assert!(e.contains("v_cvt_f16_f32 ×1") && e.contains("v_or3_b32 with operand modifiers ×1"), "{e}");
+    }
+
+    #[test]
+    fn modifiers_constants_and_the_scalar_table() {
+        let code = asm(&[
+            // v0 = clamp((|v1| + −v2) · 2)
+            ("V_ADD_F32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 257), ("SRC1", 258), ("ABS", 1), ("NEG", 2), ("OMOD", 1), ("CLAMP", 1)], None),
+            // v3 = v1 · k + v2 ; v3 += v1 · v2
+            ("V_MADMK_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 257), ("VSRC1", 2)], Some(3.0f32.to_bits())),
+            ("V_FMAC_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 257), ("VSRC1", 2)], None),
+            ("S_BFE_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 0), ("SSRC1", 1)], None),
+            ("S_CMPK_GT_I32", "ENC_SOPK", &[("SDST", 4), ("SIMM16", 0xFFFF)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]);
+        let t = translate_kernel(&code).unwrap();
+        assert!(t.wgsl.contains("v0[l] = bitcast<u32>(clamp(((abs(bitcast<f32>(v1[l])) + (-bitcast<f32>(v2[l]))) * 2.0), 0.0, 1.0));"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("v3[l] = bitcast<u32>(mad_nf(bitcast<f32>(v1[l]), bitcast<f32>(1077936128u), bitcast<f32>(v2[l])));"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("v3[l] = bitcast<u32>(fma(bitcast<f32>(v1[l]), bitcast<f32>(v2[l]), bitcast<f32>(v3[l])));"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("{ let a = s[0]; let b = s[1]; let cur = s[4]; let r = sbfe_u(a, b); scc = r != 0u; s[4] = r; }"), "{}", t.wgsl);
+        // the constant of a signed compare is sign-extended
+        assert!(t.wgsl.contains("scc = (bitcast<i32>(s[4]) > bitcast<i32>(4294967295u));"), "{}", t.wgsl);
     }
 }

@@ -172,6 +172,202 @@ test("if / else on lanes: s_and_saveexec_b64, a masked write, EXEC restored", [
   assert.deepEqual([res[126], res[127], res[10], res[11]], [0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff]);
 });
 
+// --- more of the vector unit: one instruction each, against the same operation done here
+const Z = (l) => mix(l, 3);
+const u = (x) => x >>> 0;
+const i24 = (x) => (x << 8) >> 8;
+const big = (x) => BigInt(x >>> 0), sbig = (x) => BigInt(x | 0);
+const lowBits = (w) => (w === 0 ? 0 : 0xffffffff >>> (32 - w));
+const med3 = (a, b, c) => Math.max(Math.min(a, b), Math.min(Math.max(a, b), c));
+const clz = (x) => (x === 0 ? 0xffffffff : Math.clz32(x));
+const ctz = (x) => (x === 0 ? 0xffffffff : 31 - Math.clz32(x & -x));
+const bfeI = (v, o, w) => (w === 0 ? 0 : u((((v | 0) >> o) << (32 - w)) >> (32 - w)));
+for (const [op, expect] of [
+  ["V_LSHL_ADD_U32", (a, b, c) => u((a << (b & 31)) + c)],
+  ["V_ADD_LSHL_U32", (a, b, c) => u((a + b) << (c & 31))],
+  ["V_LSHL_OR_B32", (a, b, c) => u((a << (b & 31)) | c)],
+  ["V_AND_OR_B32", (a, b, c) => u((a & b) | c)],
+  ["V_OR3_B32", (a, b, c) => u(a | b | c)],
+  ["V_XOR3_B32", (a, b, c) => u(a ^ b ^ c)],
+  ["V_ADD3_U32", (a, b, c) => u(a + b + c)],
+  ["V_XAD_U32", (a, b, c) => u((a ^ b) + c)],
+  ["V_BFE_U32", (a, b, c) => u((a >>> (b & 31)) & lowBits(c & 31))],
+  ["V_BFE_I32", (a, b, c) => bfeI(a, b & 31, c & 31)],
+  ["V_BFI_B32", (a, b, c) => u((a & b) | (~a & c))],
+  ["V_ALIGNBIT_B32", (a, b, c) => (c & 31 ? u((b >>> (c & 31)) | (a << (32 - (c & 31)))) : b)],
+  ["V_MIN3_U32", (a, b, c) => Math.min(a, b, c)],
+  ["V_MAX3_U32", (a, b, c) => Math.max(a, b, c)],
+  ["V_MED3_U32", (a, b, c) => med3(a, b, c)],
+  ["V_MIN3_I32", (a, b, c) => u(Math.min(a | 0, b | 0, c | 0))],
+  ["V_MED3_I32", (a, b, c) => u(med3(a | 0, b | 0, c | 0))],
+  ["V_MAD_U32_U24", (a, b, c) => Number((big(a & 0xffffff) * big(b & 0xffffff) + big(c)) & 0xffffffffn)],
+  ["V_MAD_I32_I24", (a, b, c) => Number(BigInt.asUintN(32, BigInt(i24(a)) * BigInt(i24(b)) + sbig(c)))],
+  ["V_SAD_U32", (a, b, c) => u(Math.max(a, b) - Math.min(a, b) + c)],
+  ["V_MUL_HI_I32", (a, b) => Number(BigInt.asUintN(32, (sbig(a) * sbig(b)) >> 32n))],
+  ["V_BFM_B32", (a, b) => u(lowBits(a & 31) << (b & 31))],
+  ["V_BCNT_U32_B32", (a, b) => u(a.toString(2).replaceAll("0", "").length + b)],
+  ["V_MUL_U32_U24", (a, b) => Number((big(a & 0xffffff) * big(b & 0xffffff)) & 0xffffffffn)],
+  ["V_MUL_HI_U32_U24", (a, b) => Number((big(a & 0xffffff) * big(b & 0xffffff)) >> 32n)],
+  ["V_MUL_I32_I24", (a, b) => Number(BigInt.asUintN(32, BigInt(i24(a)) * BigInt(i24(b))))],
+]) {
+  const three = expect.length === 3;
+  test(op.toLowerCase(), [`${op} ENC_VOP3 VDST=5 SRC0=${V(1)} SRC1=${V(2)}${three ? ` SRC2=${V(3)}` : ""}`, "S_ENDPGM ENC_SOPP"], registers({ v: { 1: X, 2: Y, 3: Z } }), (res) =>
+    assert.deepEqual(vreg(res, 5), Array.from({ length: LANES }, (_, l) => expect(X(l), Y(l), Z(l)))));
+}
+// one source; lanes 0 and 1 are 0 and all ones
+const W = (l) => (l === 0 ? 0 : l === 1 ? 0xffffffff : mix(l, 4) >>> (l % 29));
+for (const [op, expect] of [
+  ["V_BFREV_B32", (a) => parseInt(a.toString(2).padStart(32, "0").split("").reverse().join(""), 2)],
+  ["V_FFBH_U32", (a) => clz(a)],
+  ["V_FFBL_B32", (a) => ctz(a)],
+  ["V_FFBH_I32", (a) => clz(u((a | 0) < 0 ? ~a : a))],
+  ["V_NOT_B32", (a) => u(~a)],
+  ["V_CVT_F32_UBYTE1", (a) => bits((a >>> 8) & 0xff)],
+  ["V_CVT_F32_UBYTE3", (a) => bits(a >>> 24)],
+  ["V_CVT_F32_U32", (a) => bits(a)],
+]) {
+  test(op.toLowerCase(), [`${op} ENC_VOP1 VDST=5 SRC0=${V(1)}`, "S_ENDPGM ENC_SOPP"], registers({ v: { 1: W } }), (res) =>
+    assert.deepEqual(vreg(res, 5), Array.from({ length: LANES }, (_, l) => expect(W(l)))));
+}
+// float to integer: out of range saturates, a NaN is 0
+const FI = [0, -0, 0.5, -0.5, 1.5, -1.5, 2.5, 1e10, -1e10, NaN, Infinity, -Infinity, 2147483648, -2147483649, 4294967296, 7.99];
+const F = (l) => bits(FI[l % FI.length] * (l < FI.length ? 1 : l));
+const sat = (x, lo, hi) => (Number.isNaN(x) ? 0 : u(Math.min(hi, Math.max(lo, Math.trunc(x)))));
+for (const [op, expect] of [
+  ["V_CVT_I32_F32", (x) => sat(x, -2147483648, 2147483647)],
+  ["V_CVT_U32_F32", (x) => sat(x, 0, 4294967295)],
+  ["V_CVT_FLR_I32_F32", (x) => sat(Math.floor(x), -2147483648, 2147483647)],
+  ["V_CVT_RPI_I32_F32", (x) => sat(Math.floor(f32(x + 0.5)), -2147483648, 2147483647)],
+]) {
+  test(op.toLowerCase(), [`${op} ENC_VOP1 VDST=5 SRC0=${V(1)}`, "S_ENDPGM ENC_SOPP"], registers({ v: { 1: F } }), (res) =>
+    vreg(res, 5).forEach((got, l) => assert.equal(got, expect(float(F(l))), `${op} lane ${l}: ${float(F(l))}`)));
+}
+test("legacy multiply, multiply-adds with a constant and into the destination", [
+  `V_MUL_LEGACY_F32 ENC_VOP2 VDST=5 SRC0=${V(1)} VSRC1=2`,
+  `V_MADMK_F32 ENC_VOP2 VDST=6 SRC0=${V(3)} VSRC1=4 LIT=${bits(3)}`, // v3 · 3 + v4
+  `V_MADAK_F32 ENC_VOP2 VDST=7 SRC0=${V(3)} VSRC1=4 LIT=${bits(3)}`, // v3 · v4 + 3
+  `V_MOV_B32 ENC_VOP1 VDST=8 SRC0=${V(4)}`,
+  `V_FMAC_F32 ENC_VOP2 VDST=8 SRC0=${V(3)} VSRC1=3`, // v8 += v3 · v3
+  `V_MED3_F32 ENC_VOP3 VDST=9 SRC0=${V(3)} SRC1=${V(4)} SRC2=242`,
+  `V_FRACT_F32 ENC_VOP1 VDST=10 SRC0=${V(3)}`,
+  "S_ENDPGM ENC_SOPP",
+  // 0 · ∞ and 0 · NaN are 0 in the legacy multiply
+], registers({ v: { 1: (l) => (l < 2 ? 0 : bits(l)), 2: (l) => (l === 0 ? 0x7f800000 : l === 1 ? 0x7fc00000 : bits(0.5)), 3: (l) => bits(l * 0.25 - 4), 4: (l) => bits(l % 7) } }), (res) => {
+  const [a, b] = [(l) => l * 0.25 - 4, (l) => l % 7];
+  assert.deepEqual(vreg(res, 5), Array.from({ length: LANES }, (_, l) => (l < 2 ? 0 : bits(l * 0.5))));
+  assert.deepEqual(vreg(res, 6), Array.from({ length: LANES }, (_, l) => bits(a(l) * 3 + b(l))));
+  assert.deepEqual(vreg(res, 7), Array.from({ length: LANES }, (_, l) => bits(a(l) * b(l) + 3)));
+  assert.deepEqual(vreg(res, 8), Array.from({ length: LANES }, (_, l) => bits(b(l) + a(l) * a(l))));
+  assert.deepEqual(vreg(res, 9), Array.from({ length: LANES }, (_, l) => bits(med3(a(l), b(l), 1))));
+  assert.deepEqual(vreg(res, 10), Array.from({ length: LANES }, (_, l) => bits(a(l) - Math.floor(a(l)))));
+});
+test("operand modifiers: |x|, −x, a scale, a clamp", [
+  `V_ADD_F32 ENC_VOP3 VDST=5 SRC0=${V(1)} SRC1=${V(2)} ABS=1 NEG=2`, // |v1| − v2
+  `V_MUL_F32 ENC_VOP3 VDST=6 SRC0=${V(1)} SRC1=${V(2)} OMOD=1`, // · 2
+  `V_ADD_F32 ENC_VOP3 VDST=7 SRC0=${V(1)} SRC1=${V(2)} OMOD=3 CLAMP=1`, // clamp((v1 + v2) / 2)
+  `V_CMP_LT_F32 ENC_VOP3 VDST=10 SRC0=${V(1)} SRC1=${V(2)} ABS=1 NEG=1`, // −|v1| < v2
+  "S_ENDPGM ENC_SOPP",
+], registers({ v: { 1: (l) => bits(l - 31.5), 2: (l) => bits((l % 4) - 2) } }), (res) => {
+  const [a, b] = [(l) => l - 31.5, (l) => (l % 4) - 2];
+  assert.deepEqual(vreg(res, 5), Array.from({ length: LANES }, (_, l) => bits(Math.abs(a(l)) - b(l))));
+  assert.deepEqual(vreg(res, 6), Array.from({ length: LANES }, (_, l) => bits(a(l) * b(l) * 2)));
+  assert.deepEqual(vreg(res, 7), Array.from({ length: LANES }, (_, l) => bits(Math.min(1, Math.max(0, (a(l) + b(l)) / 2)))));
+  let m = 0n;
+  for (let l = 0; l < LANES; l++) if (-Math.abs(a(l)) < b(l)) m |= 1n << BigInt(l);
+  assert.deepEqual([res[10], res[11]], [Number(m & 0xffffffffn), Number(m >> 32n)]);
+});
+test("exp, log, sin and cos (to a few units in the last places)", [
+  `V_EXP_F32 ENC_VOP1 VDST=5 SRC0=${V(1)}`,
+  `V_LOG_F32 ENC_VOP1 VDST=6 SRC0=${V(2)}`,
+  `V_SIN_F32 ENC_VOP1 VDST=7 SRC0=${V(3)}`,
+  `V_COS_F32 ENC_VOP1 VDST=8 SRC0=${V(3)}`,
+  "S_ENDPGM ENC_SOPP",
+], registers({ v: { 1: (l) => bits(l * 0.25 - 8), 2: (l) => bits(0.01 + l * 3.7), 3: (l) => bits(l / 64) } }), (res) => {
+  const near = (r, want, what, by = 2e-5) => vreg(res, r).forEach((got, l) => assert.ok(Math.abs(float(got) - want(l)) <= by * Math.max(1, Math.abs(want(l))), `${what} lane ${l}: ${float(got)} for ${want(l)}`));
+  near(5, (l) => 2 ** (l * 0.25 - 8), "exp");
+  near(6, (l) => Math.log2(f32(0.01 + l * 3.7)), "log");
+  // the angle is in revolutions; a GPU's sine is an approximation (SwiftShader's is off by
+  // up to 1.5e-4 here)
+  near(7, (l) => Math.sin((l / 64) * 2 * Math.PI), "sin", 1e-3);
+  near(8, (l) => Math.cos((l / 64) * 2 * Math.PI), "cos", 1e-3);
+});
+test("lanes by number: the first one on, a read, a write", [
+  `V_READFIRSTLANE_B32 ENC_VOP1 VDST=4 SRC0=${V(1)}`,
+  `V_READLANE_B32 ENC_VOP3 VDST=5 SRC0=${V(1)} SRC1=${S(0)}`,
+  `V_WRITELANE_B32 ENC_VOP3 VDST=2 SRC0=${S(1)} SRC1=${S(0)}`, // off in EXEC, written all the same
+  "S_ENDPGM ENC_SOPP",
+], registers({ exec: [0xffffff00, 0], s: { 0: 40, 1: 0xabcdef }, v: { 1: (l) => 1000 + l, 2: (l) => l } }), (res) => {
+  assert.deepEqual([res[4], res[5]], [1008, 1040]);
+  assert.deepEqual(vreg(res, 2), Array.from({ length: LANES }, (_, l) => (l === 40 ? 0xabcdef : l)));
+});
+
+// --- more of the scalar unit: s10 = op(s0, s1) with SCC set before, then SCC into s12
+const [SA, SB] = [0xf0001234, 0x00050009];
+const scalar = (name, line, expect, a = SA, b = SB) =>
+  test(name, [line, "S_CSELECT_B32 ENC_SOP2 SDST=12 SSRC0=129 SSRC1=128", "S_ENDPGM ENC_SOPP"], registers({ scc: 1, s: { 0: a, 1: b, 2: 0x80000001, 3: 0x3, 10: 0x00ff00ff, 11: 0x5 } }), (res) => {
+    const want = expect(a, b);
+    assert.deepEqual([res[10], res[11], res[12]].map((x, k) => (want[k] === null ? null : x)), want.map((x) => (x === null ? null : u(x))), name);
+  });
+// [result, s11 (5: untouched), scc (null: not this instruction's)]
+for (const [op, expect] of [
+  ["S_AND_B32", (a, b) => [a & b, 5, (a & b) !== 0]],
+  ["S_NAND_B32", (a, b) => [~(a & b), 5, 1]],
+  ["S_NOR_B32", (a, b) => [~(a | b), 5, 1]],
+  ["S_XNOR_B32", (a, b) => [~(a ^ b), 5, 1]],
+  ["S_ORN2_B32", (a, b) => [a | ~b, 5, 1]],
+  ["S_ADDC_U32", (a, b) => [a + b + 1, 5, 0]],
+  ["S_SUBB_U32", (a, b) => [a - b - 1, 5, 0]],
+  ["S_MUL_HI_U32", (a, b) => [Number((big(a) * big(b)) >> 32n), 5, 1]],
+  ["S_MUL_HI_I32", (a, b) => [Number(BigInt.asUintN(32, (sbig(a) * sbig(b)) >> 32n)), 5, 1]],
+  ["S_LSHR_B32", (a, b) => [a >>> (b & 31), 5, 1]],
+  ["S_LSHL2_ADD_U32", (a, b) => [(a << 2) + b, 5, 1]], // the shift carries out
+  ["S_BFM_B32", (a, b) => [lowBits(a & 31) << (b & 31), 5, 1]],
+  ["S_BFE_U32", (a, b) => [(a >>> 9) & 31, 5, 1]], // offset 9, 5 bits: 0b01001
+  ["S_BFE_I32", (a, b) => [bfeI(a, 9, 5), 5, 1]],
+  ["S_MAX_I32", (a, b) => [b, 5, 0]],
+  ["S_MIN_U32", (a, b) => [b, 5, 0]],
+  ["S_ABSDIFF_I32", (a, b) => [Math.abs((a | 0) - (b | 0)), 5, 1]],
+  ["S_PACK_LH_B32_B16", (a, b) => [(a & 0xffff) | (b & 0xffff0000), 5, 1]],
+]) scalar(op.toLowerCase(), `${op} ENC_SOP2 SDST=10 SSRC0=${S(0)} SSRC1=${S(1)}`, (a, b) => expect(a, b).map((x) => Number(x)));
+for (const [op, expect] of [
+  ["S_BREV_B32", (a) => [parseInt(a.toString(2).padStart(32, "0").split("").reverse().join(""), 2), 5, 1]],
+  ["S_BCNT1_I32_B32", (a) => [10, 5, 1]], // f, 1, 2, 3, c
+  ["S_BCNT0_I32_B32", (a) => [22, 5, 1]],
+  ["S_FF1_I32_B32", (a) => [ctz(a), 5, 1]],
+  ["S_FF0_I32_B32", (a) => [ctz(u(~a)), 5, 1]],
+  ["S_FLBIT_I32_B32", (a) => [clz(a), 5, 1]],
+  ["S_FLBIT_I32", (a) => [clz(u(~a)), 5, 1]],
+  ["S_ABS_I32", (a) => [Math.abs(a | 0), 5, 1]],
+  ["S_SEXT_I32_I8", (a) => [(a << 24) >> 24, 5, 1]],
+  ["S_SEXT_I32_I16", (a) => [(a << 16) >> 16, 5, 1]],
+  ["S_CMOV_B32", (a) => [a, 5, 1]],
+  ["S_BITSET1_B32", (a) => [0x00ff00ff | (1 << (a & 31)), 5, 1]],
+  ["S_BITSET0_B32", (a) => [0x00ff00ff & ~(1 << (a & 31)), 5, 1]],
+]) scalar(op.toLowerCase(), `${op} ENC_SOP1 SDST=10 SSRC0=${S(0)}`, expect, 0xf000123c);
+scalar("s_cmpk_gt_i32", "S_CMPK_GT_I32 ENC_SOPK SDST=0 SIMM16=0xffff", () => [0x00ff00ff, 5, 0]); // negative > −1: no
+scalar("s_cmpk_gt_u32", "S_CMPK_GT_U32 ENC_SOPK SDST=0 SIMM16=0xffff", () => [0x00ff00ff, 5, 1]);
+scalar("s_addk_i32", "S_ADDK_I32 ENC_SOPK SDST=10 SIMM16=0xfff0", () => [0x00ff00ef, 5, 0]);
+scalar("s_mulk_i32", "S_MULK_I32 ENC_SOPK SDST=10 SIMM16=0xfffe", () => [Math.imul(0x00ff00ff, -2), 5, 1]);
+scalar("s_cmovk_i32", "S_CMOVK_I32 ENC_SOPK SDST=10 SIMM16=0x8000", () => [0xffff8000, 5, 1]);
+scalar("s_bitcmp1_b32", `S_BITCMP1_B32 ENC_SOPC SSRC0=${S(0)} SSRC1=132`, () => [0x00ff00ff, 5, 1]); // bit 4 of …34
+// 64 bits: s0:s1 and s2:s3 (0x00000003_80000001)
+const wide = (a, b) => (big(b) << 32n) | big(a);
+const halves = (x) => [Number(x & 0xffffffffn), Number((x >> 32n) & 0xffffffffn)];
+scalar("s_lshl_b64", `S_LSHL_B64 ENC_SOP2 SDST=10 SSRC0=${S(0)} SSRC1=${S(3)}`, (a, b) => [...halves(wide(a, b) << 3n), 1]);
+scalar("s_lshl_b64 by 36", `S_LSHL_B64 ENC_SOP2 SDST=10 SSRC0=${S(0)} SSRC1=164`, (a, b) => [...halves(wide(a, b) << 36n), 1]);
+scalar("s_lshr_b64", `S_LSHR_B64 ENC_SOP2 SDST=10 SSRC0=${S(0)} SSRC1=${S(3)}`, (a, b) => [...halves(wide(a, b) >> 3n), 1]);
+scalar("s_lshr_b64 by 36", `S_LSHR_B64 ENC_SOP2 SDST=10 SSRC0=${S(0)} SSRC1=164`, (a, b) => [...halves(wide(a, b) >> 36n), 1]);
+scalar("s_nand_b64", `S_NAND_B64 ENC_SOP2 SDST=10 SSRC0=${S(0)} SSRC1=${S(2)}`, (a, b) => [~(a & 0x80000001), ~(b & 3), 1]);
+scalar("s_cselect_b64", `S_CSELECT_B64 ENC_SOP2 SDST=10 SSRC0=${S(0)} SSRC1=${S(2)}`, (a, b) => [a, b, 1]);
+scalar("s_bcnt1_i32_b64", `S_BCNT1_I32_B64 ENC_SOP1 SDST=10 SSRC0=${S(2)}`, () => [4, 5, 1]);
+scalar("s_ff1_i32_b64", `S_FF1_I32_B64 ENC_SOP1 SDST=10 SSRC0=${S(0)}`, () => [36, 5, 1], 0, 0x10);
+scalar("s_cmp_eq_u64", `S_CMP_EQ_U64 ENC_SOPC SSRC0=${S(0)} SSRC1=${S(2)}`, () => [0x00ff00ff, 5, 0]);
+scalar("s_cmp_lg_u64", `S_CMP_LG_U64 ENC_SOPC SSRC0=${S(0)} SSRC1=${S(2)}`, () => [0x00ff00ff, 5, 1]);
+test("s_andn1_saveexec_b64: EXEC saved, then the lanes the source does not have", [
+  `S_ANDN1_SAVEEXEC_B64 ENC_SOP1 SDST=10 SSRC0=${S(0)}`,
+  "S_ENDPGM ENC_SOPP",
+], registers({ exec: [0xffff0000, 0xff], s: { 0: 0x0ff00000, 1: 0xf } }), (res) => assert.deepEqual([res[10], res[11], res[126], res[127], res[125]], [0xffff0000, 0xff, 0xf00f0000, 0xf0, 1]));
+
 // --- memory and exports (the HLSL back end's gpu_memory_and_exports)
 const MEM = Array.from({ length: 256 }, (_, i) => 0x1000 + i);
 test("loads through a pointer and a descriptor, exports", [
@@ -285,7 +481,7 @@ const draws = [draw, draw2].map(({ expect, ...d }) => d);
 
 // --- run them
 const programs = cases.map((c) => ({ name: c.name, wgsl: xcl.wgslKernel(xcl.assemble(c.program)), io: [...c.io], mem: c.mem }));
-assert.throws(() => xcl.wgslKernel(xcl.assemble([`V_SIN_F32 ENC_VOP1 VDST=0 SRC0=${V(1)}`])), /v_sin_f32/, "what is missing is named");
+assert.throws(() => xcl.wgslKernel(xcl.assemble([`V_CVT_F16_F32 ENC_VOP1 VDST=0 SRC0=${V(1)}`])), /v_cvt_f16_f32/, "what is missing is named");
 
 const server = createServer((req, res) => res.writeHead(200, { "content-type": "text/html" }).end("<!doctype html><title>wgsl</title>"));
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
