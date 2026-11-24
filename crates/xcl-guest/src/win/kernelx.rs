@@ -202,6 +202,38 @@ fn XMemAllocatePhysicalPages(g: &mut Guest) -> H {
     Ok(1)
 }
 
+/// Read (or, with `write`, write) `buffer` at `offset` of the physical page `page`, wherever
+/// the page is: mapped into the address space, or away with its contents. `false`: the title
+/// has no such page, or the range leaves it.
+pub(super) fn page_io(g: &mut Guest, page: u64, offset: u64, buffer: &mut [u8], write: bool) -> bool {
+    if offset + buffer.len() as u64 > GRAIN {
+        return false;
+    }
+    match g.win.xmem.pages.get_mut(&page) {
+        Some(Page::Mapped(at)) => {
+            let at = *at + offset;
+            if write { g.mem.write(at, buffer).is_ok() } else { g.mem.read(at, buffer).is_ok() }
+        }
+        Some(Page::Away(data)) => {
+            let from = offset as usize;
+            if write {
+                data.get_or_insert_with(|| vec![0; GRAIN as usize])[from..from + buffer.len()].copy_from_slice(buffer);
+            } else {
+                match data {
+                    Some(data) => buffer.copy_from_slice(&data[from..from + buffer.len()]),
+                    // never written: zeros
+                    None => buffer.fill(0),
+                }
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// The size of a physical page.
+pub(super) const PAGE: u64 = GRAIN;
+
 /// Take the physical page at `address` out of the address space; its contents stay with it.
 fn unmap_page(g: &mut Guest, address: u64) {
     if let Some(page) = g.win.xmem.mapped.remove(&address) {

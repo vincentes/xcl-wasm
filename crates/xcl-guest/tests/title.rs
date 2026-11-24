@@ -36,7 +36,7 @@ const FAILS: &[&str] = &[
 ];
 
 /// Checks of areas that are being worked on: they may pass or fail.
-const EITHER: &[&str] = &["DirectStorage"];
+const EITHER: &[&str] = &[];
 
 #[test]
 fn the_test_title_passes_its_checks_up_to_where_the_guest_gets() {

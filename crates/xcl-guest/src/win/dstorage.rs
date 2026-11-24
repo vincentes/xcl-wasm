@@ -11,10 +11,15 @@
 //! - request (0x48 bytes): options @0, destination @8, its size u32 @0x18, source @0x20 (a
 //!   file object, or memory), file offset @0x28, source size u32 @0x30
 //!
-//! A request is carried out when it is enqueued, on the calling thread: a file read through the
-//! title's file system (a range of the file, whatever its size) or a copy of memory. A status
-//! entry gets the first failure of the requests since the previous one. Requests that ask for
-//! decompression or the console's texture formats are refused: there is no decoder yet.
+//! Requests, status entries and signals wait in their queue, in order, until Submit (or until
+//! the queue is half full, when it submits by itself); a request cancelled by its tag before
+//! that is not carried out, and is no failure. They are carried out on the thread that submits:
+//! a file read through the
+//! title's file system (a range of the file, whatever its size) or a copy of memory; either
+//! end of a copy may be given as physical pages (an array of page numbers and an offset in the
+//! first), mapped or not. A status entry gets the first failure of the requests since the
+//! previous one. Requests that ask for decompression or the console's texture formats are
+//! refused: there is no decoder yet.
 
 #![allow(non_snake_case)]
 
@@ -36,8 +41,11 @@ const E_FILE_HANDLE: u32 = 0x8924_0017;
 
 /// request options: bit 0 zlib, bits 1..=4 BCPack, bits 5..=20 swizzle, bit 21 the destination
 /// is physical pages, bit 22 the source is memory, bit 23 the source is physical pages
+const DESTINATION_PAGES: u64 = 1 << 21;
 const SOURCE_MEMORY: u64 = 1 << 22;
-const NOT_A_PLAIN_COPY: u64 = ((1 << 24) - 1) & !SOURCE_MEMORY;
+const SOURCE_PAGES: u64 = 1 << 23;
+/// zlib, BCPack and swizzling
+const NOT_A_PLAIN_COPY: u64 = (1 << 21) - 1;
 
 const FACTORY: [&str; 11] = [
     "IDStorage_QueryInterface",
@@ -70,14 +78,25 @@ const FILE: [&str; 8] =
     ["IDStorage_QueryInterface", "IDStorage_AddRef", "IDStorage_Release", "IDStorageFileX_Close", "IDStorageFileX_GetHandle", "IDStorageFileX_#5", "IDStorageFileX_#6", "IDStorageFileX_GetId"];
 const STATUS_ARRAY: [&str; 5] = ["IDStorage_QueryInterface", "IDStorage_AddRef", "IDStorage_Release", "IDStorageStatusArrayX_IsComplete", "IDStorageStatusArrayX_GetHResult"];
 
+/// What waits in a queue.
+#[derive(Debug)]
+enum Command {
+    /// a request (its 0x48 bytes, as they were when it was enqueued)
+    Request([u8; 0x48]),
+    /// a request cancelled before it ran
+    Cancelled,
+    Status { array: u64, index: u32 },
+    Signal { fence: u64, value: u64 },
+}
+
 #[derive(Debug, Default)]
 struct Queue {
     /// the queue's description, as the title gave it (Query hands it back)
     desc: Vec<u8>,
     /// the first failure of the requests since the last status entry (0: none)
     failure: u32,
-    requests: u64,
     error_event: u64,
+    pending: Vec<Command>,
 }
 
 #[derive(Debug, Default)]
@@ -131,7 +150,7 @@ fn create_queue(g: &mut Guest, desc_len: usize) -> H {
     g.mem.read(desc_at, &mut desc)?;
     let queue = object(g, "IDStorageQueueX", &QUEUE, 18, 0)?;
     let error_event = g.win.new_handle(Object::Event { signaled: false, manual: true });
-    g.win.dstorage.queues.insert(queue, Queue { desc, failure: 0, requests: 0, error_event });
+    g.win.dstorage.queues.insert(queue, Queue { desc, failure: 0, error_event, pending: Vec::new() });
     g.mem.write_u64(out, queue)?;
     Ok(0)
 }
@@ -205,23 +224,58 @@ fn IDStorageFileX_GetId(g: &mut Guest) -> H {
     Ok(file_handle(g, this).map_or(0, |h| h & 0xFFFF_FFFF))
 }
 
+/// Memory a request names: an address, or physical pages (the array of their numbers and the
+/// offset in the first one).
+#[derive(Clone, Copy)]
+enum Place {
+    Address(u64),
+    Pages { array: u64, offset: u64 },
+}
+
+/// Read (or write) `buffer` at byte `position` of `place`. `false`: not the title's memory.
+fn place_io(g: &mut Guest, place: Place, position: u64, buffer: &mut [u8], write: bool) -> bool {
+    match place {
+        Place::Address(at) if write => g.mem.write(at + position, buffer).is_ok(),
+        Place::Address(at) => g.mem.read(at + position, buffer).is_ok(),
+        Place::Pages { array, offset } => {
+            let mut done = 0;
+            while done < buffer.len() {
+                let at = offset + position + done as u64;
+                let Ok(page) = g.mem.read_u64(array + 8 * (at / kernelx::PAGE)) else { return false };
+                let in_page = at % kernelx::PAGE;
+                let n = (buffer.len() - done).min((kernelx::PAGE - in_page) as usize);
+                if !kernelx::page_io(g, page, in_page, &mut buffer[done..done + n], write) {
+                    return false;
+                }
+                done += n;
+            }
+            true
+        }
+    }
+}
+
 /// Carry out the request at `request`: 0, or why not.
-fn run_request(g: &mut Guest, request: u64) -> Result<u32, Stop> {
-    let options = g.mem.read_u64(request)?;
-    let (destination, destination_size) = (g.mem.read_u64(request + 8)?, g.mem.read_u32(request + 0x18)?);
-    let (source, offset, size) = (g.mem.read_u64(request + 0x20)?, g.mem.read_u64(request + 0x28)?, g.mem.read_u32(request + 0x30)?);
+fn run_request(g: &mut Guest, request: &[u8; 0x48]) -> Result<u32, Stop> {
+    let u64_at = |at: usize| u64::from_le_bytes(request[at..at + 8].try_into().unwrap());
+    let u32_at = |at: usize| u32::from_le_bytes(request[at..at + 4].try_into().unwrap());
+    let options = u64_at(0);
+    let (destination, destination_size) = (u64_at(8), u32_at(0x18));
+    let (source, offset, size) = (u64_at(0x20), u64_at(0x28), u32_at(0x30));
     if options & NOT_A_PLAIN_COPY != 0 {
         let kind = options & NOT_A_PLAIN_COPY;
         if !g.win.dstorage.refused.contains(&kind) {
             g.win.dstorage.refused.push(kind);
-            g.log.push(format!("DirectStorage: a request with options {options:#x} (decompression, texture formats or physical pages) is refused"));
+            g.log.push(format!("DirectStorage: a request with options {options:#x} (decompression or texture formats) is refused"));
         }
         return Ok(E_NOTIMPL);
     }
     if size > destination_size {
         return Ok(E_DESTINATION_SIZE);
     }
-    let path = if options & SOURCE_MEMORY != 0 {
+    let to = if options & DESTINATION_PAGES != 0 { Place::Pages { array: destination, offset: u64_at(0x10) & 0xFFFF } } else { Place::Address(destination) };
+    // (a source in physical pages has its offset where a file's would be)
+    let from = if options & SOURCE_PAGES != 0 { Place::Pages { array: source, offset: offset & 0xFFFF } } else { Place::Address(source) };
+    let path = if options & (SOURCE_MEMORY | SOURCE_PAGES) != 0 {
         None
     } else {
         let Some(handle) = file_handle(g, source) else { return Ok(E_FILE_HANDLE) };
@@ -242,12 +296,12 @@ fn run_request(g: &mut Guest, request: u64) -> Result<u32, Stop> {
                 None => return Ok(E_FILE_HANDLE),
             },
             None => {
-                if g.mem.read(source + done, &mut buffer[..n]).is_err() {
+                if !place_io(g, from, done, &mut buffer[..n], false) {
                     return Ok(E_ACCESS_VIOLATION);
                 }
             }
         }
-        if g.mem.write(destination + done, &buffer[..n]).is_err() {
+        if !place_io(g, to, done, &mut buffer[..n], true) {
             return Ok(E_ACCESS_VIOLATION);
         }
         done += n as u64;
@@ -255,41 +309,88 @@ fn run_request(g: &mut Guest, request: u64) -> Result<u32, Stop> {
     Ok(0)
 }
 
+/// Put `command` into the queue; a queue that is half full submits by itself.
+fn enqueue(g: &mut Guest, queue: u64, command: Command) -> H {
+    let Some(q) = g.win.dstorage.queues.get_mut(&queue) else { return Ok(0) };
+    q.pending.push(command);
+    let capacity = u16::from_le_bytes([q.desc[8], q.desc[9]]) as usize;
+    if capacity != 0 && q.pending.len() >= capacity.div_ceil(2) {
+        submit(g, queue)?;
+    }
+    Ok(0)
+}
+
 /// EnqueueRequest(this, request)
 fn IDStorageQueueX_EnqueueRequest(g: &mut Guest) -> H {
     let (this, request) = (g.arg(0)?, g.arg(1)?);
-    let result = if request == 0 { E_INVALIDARG } else { run_request(g, request)? };
-    if let Some(q) = g.win.dstorage.queues.get_mut(&this) {
-        q.requests += 1;
-        if result != 0 && q.failure == 0 {
-            q.failure = result;
-            let event = q.error_event;
-            g.win.handles.insert(event, Object::Event { signaled: true, manual: true });
-        }
-    }
-    Ok(0)
+    let bytes: [u8; 0x48] = g.mem.read_n(request)?;
+    enqueue(g, this, Command::Request(bytes))
 }
 
 /// EnqueueStatus(this, array, index): the entry gets the result of the requests before it.
 fn IDStorageQueueX_EnqueueStatus(g: &mut Guest) -> H {
     let (this, array, index) = (g.arg(0)?, g.arg(1)?, g.arg(2)? as u32);
-    let failure = g.win.dstorage.queues.get_mut(&this).map_or(0, |q| std::mem::take(&mut q.failure));
+    // pending again, if the entry was used before
     if let Some(entry) = g.win.dstorage.status_arrays.get_mut(&array).and_then(|a| a.get_mut(index as usize)) {
-        *entry = failure;
+        *entry = E_PENDING;
     }
+    enqueue(g, this, Command::Status { array, index })
+}
+
+/// EnqueueSignal(this, fence, value): the fence is signaled once the requests before it are done.
+fn IDStorageQueueX_EnqueueSignal(g: &mut Guest) -> H {
+    let (this, fence, value) = (g.arg(0)?, g.arg(1)?, g.arg(2)?);
+    enqueue(g, this, Command::Signal { fence, value })
+}
+
+/// Carry out what waits in the queue, in order.
+fn submit(g: &mut Guest, queue: u64) -> Result<(), Stop> {
+    let Some(pending) = g.win.dstorage.queues.get_mut(&queue).map(|q| std::mem::take(&mut q.pending)) else { return Ok(()) };
+    for command in pending {
+        match command {
+            Command::Cancelled => {}
+            Command::Request(bytes) => {
+                let result = run_request(g, &bytes)?;
+                if let Some(q) = g.win.dstorage.queues.get_mut(&queue).filter(|q| result != 0 && q.failure == 0) {
+                    q.failure = result;
+                    let event = q.error_event;
+                    g.win.handles.insert(event, Object::Event { signaled: true, manual: true });
+                }
+            }
+            Command::Status { array, index } => {
+                let failure = g.win.dstorage.queues.get_mut(&queue).map_or(0, |q| std::mem::take(&mut q.failure));
+                if let Some(entry) = g.win.dstorage.status_arrays.get_mut(&array).and_then(|a| a.get_mut(index as usize)) {
+                    *entry = failure;
+                }
+            }
+            // ID3D12Fence::Signal, slot 10 of the fence's vtable
+            Command::Signal { fence, value } => {
+                let signal = if fence == 0 { 0 } else { g.mem.read_u64(fence).and_then(|vtable| g.mem.read_u64(vtable + 8 * 10)).unwrap_or(0) };
+                if signal != 0 {
+                    g.call(signal, &[fence, value])?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn IDStorageQueueX_Submit(g: &mut Guest) -> H {
+    let this = g.arg(0)?;
+    submit(g, this)?;
     Ok(0)
 }
 
-/// EnqueueSignal(this, fence, value): the requests before it are done, so the fence is
-/// signaled now (ID3D12Fence::Signal, slot 10 of its vtable).
-fn IDStorageQueueX_EnqueueSignal(g: &mut Guest) -> H {
-    let (fence, value) = (g.arg(1)?, g.arg(2)?);
-    if fence == 0 {
-        return Ok(0);
-    }
-    let Ok(signal) = g.mem.read_u64(fence).and_then(|vtable| g.mem.read_u64(vtable + 8 * 10)) else { return Ok(0) };
-    if signal != 0 {
-        g.call(signal, &[fence, value])?;
+/// CancelRequestsWithTag(this, mask, value): the waiting requests whose tag (at 0x38) has that
+/// value under the mask are not carried out.
+fn IDStorageQueueX_CancelRequestsWithTag(g: &mut Guest) -> H {
+    let (this, mask, value) = (g.arg(0)?, g.arg(1)?, g.arg(2)?);
+    if let Some(q) = g.win.dstorage.queues.get_mut(&this) {
+        for command in q.pending.iter_mut() {
+            if matches!(command, Command::Request(r) if u64::from_le_bytes(r[0x38..0x40].try_into().unwrap()) & mask == value) {
+                *command = Command::Cancelled;
+            }
+        }
     }
     Ok(0)
 }
@@ -309,21 +410,24 @@ fn IDStorageQueueX_RetrieveErrorRecord(g: &mut Guest) -> H {
 }
 
 /// Query(this, info out): the description, then the empty slots (u16 @0x18) and the requests
-/// until the queue submits by itself (u16 @0x1A). Nothing is ever waiting here.
+/// until the queue submits by itself (u16 @0x1A).
 fn IDStorageQueueX_Query(g: &mut Guest) -> H {
     let (this, out) = (g.arg(0)?, g.arg(1)?);
     let Some(q) = g.win.dstorage.queues.get(&this) else { return Ok(0) };
     let mut info = [0u8; 0x1C];
     info[..0x18].copy_from_slice(&q.desc[..0x18]);
-    let capacity = [q.desc[8], q.desc[9]];
-    info[0x18..0x1A].copy_from_slice(&capacity);
-    info[0x1A..0x1C].copy_from_slice(&capacity);
+    let capacity = u16::from_le_bytes([q.desc[8], q.desc[9]]);
+    let waiting = q.pending.len() as u16;
+    info[0x18..0x1A].copy_from_slice(&capacity.saturating_sub(waiting).to_le_bytes());
+    info[0x1A..0x1C].copy_from_slice(&capacity.div_ceil(2).saturating_sub(waiting).to_le_bytes());
     g.mem.write(out, &info)?;
     Ok(0)
 }
 
+/// Close(this): what waits is carried out first.
 fn IDStorageQueueX_Close(g: &mut Guest) -> H {
     let this = g.arg(0)?;
+    submit(g, this)?;
     g.win.dstorage.queues.remove(&this);
     Ok(0)
 }
@@ -352,13 +456,13 @@ pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
     register!(map; DStorageGetFactory, IDStorage_QueryInterface, IDStorageFactoryX_CreateQueue, IDStorageFactoryX_CreateQueue1, IDStorageFactoryX_OpenFile, IDStorageFactoryX_CreateStatusArray);
     register!(map; IDStorageFileX_Close, IDStorageFileX_GetHandle, IDStorageFileX_GetId);
     register!(map; IDStorageQueueX_EnqueueRequest, IDStorageQueueX_EnqueueStatus, IDStorageQueueX_EnqueueSignal, IDStorageQueueX_GetErrorEvent, IDStorageQueueX_RetrieveErrorRecord);
+    register!(map; IDStorageQueueX_Submit, IDStorageQueueX_CancelRequestsWithTag);
     register!(map; IDStorageQueueX_Query, IDStorageQueueX_Close, IDStorageStatusArrayX_IsComplete, IDStorageStatusArrayX_GetHResult);
-    // the objects live as long as the title; requests are done when enqueued, so there is
-    // nothing to submit or to cancel
+    // the objects live as long as the title
     for name in ["IDStorage_AddRef", "IDStorage_Release"] {
         map.insert(name, one as Handler);
     }
-    for name in ["IDStorageFactoryX_SetCpuAffinity", "IDStorageFactoryX_SetDebugFlags", "IDStorageFactoryX_SetStagingBufferSize", "IDStorageFactoryX_#9", "IDStorageQueueX_Submit", "IDStorageQueueX_CancelRequestsWithTag"] {
+    for name in ["IDStorageFactoryX_SetCpuAffinity", "IDStorageFactoryX_SetDebugFlags", "IDStorageFactoryX_SetStagingBufferSize", "IDStorageFactoryX_#9"] {
         map.insert(name, ok as Handler);
     }
 }
@@ -439,8 +543,10 @@ mod tests {
         assert_eq!(call(&mut g, IDStorageStatusArrayX_IsComplete, &[array, 0]), 0);
         call(&mut g, IDStorageQueueX_EnqueueRequest, &[queue, req]);
         call(&mut g, IDStorageQueueX_EnqueueStatus, &[queue, array, 0]);
-        // Submit: nothing is left to do
-        call(&mut g, ok, &[queue]);
+        // nothing happens before Submit
+        assert_eq!(call(&mut g, IDStorageStatusArrayX_IsComplete, &[array, 0]), 0);
+        assert_eq!(g.mem.read_u64(to).unwrap(), 0);
+        call(&mut g, IDStorageQueueX_Submit, &[queue]);
         assert_eq!(call(&mut g, IDStorageStatusArrayX_IsComplete, &[array, 0]), 1);
         assert_eq!(call(&mut g, IDStorageStatusArrayX_GetHResult, &[array, 0]), 0);
         let got: [u8; 0x100] = g.mem.read_n(to).unwrap();
@@ -463,27 +569,33 @@ mod tests {
         request(&mut g, req, 0, (to, 16), file, 0, 16);
         call(&mut g, IDStorageQueueX_EnqueueRequest, &[queue, req]);
         call(&mut g, IDStorageQueueX_EnqueueStatus, &[queue, array, 2]);
+        call(&mut g, IDStorageQueueX_Submit, &[queue]);
         assert_eq!(call(&mut g, IDStorageStatusArrayX_GetHResult, &[array, 2]), E_END_OF_FILE as u64);
         let event = call(&mut g, IDStorageQueueX_GetErrorEvent, &[queue]);
         assert!(matches!(g.win.handles.get(&event), Some(Object::Event { signaled: true, .. })));
         // … and the next entry starts clean
         call(&mut g, IDStorageQueueX_EnqueueRequest, &[queue, req]);
         call(&mut g, IDStorageQueueX_EnqueueStatus, &[queue, array, 3]);
+        call(&mut g, IDStorageQueueX_Submit, &[queue]);
         assert_eq!(call(&mut g, IDStorageStatusArrayX_GetHResult, &[array, 3]), 0);
         // a destination outside the title's memory, a closed file, a compressed request
         request(&mut g, req, 0, (0x10, 16), file, 0, 16);
         call(&mut g, IDStorageQueueX_EnqueueRequest, &[queue, req]);
         call(&mut g, IDStorageQueueX_EnqueueStatus, &[queue, array, 0]);
+        call(&mut g, IDStorageQueueX_Submit, &[queue]);
         assert_eq!(call(&mut g, IDStorageStatusArrayX_GetHResult, &[array, 0]), E_ACCESS_VIOLATION as u64);
+        // (zlib)
         request(&mut g, req, 1, (to, 16), file, 0, 16);
         call(&mut g, IDStorageQueueX_EnqueueRequest, &[queue, req]);
         call(&mut g, IDStorageQueueX_EnqueueStatus, &[queue, array, 0]);
+        call(&mut g, IDStorageQueueX_Submit, &[queue]);
         assert_eq!(call(&mut g, IDStorageStatusArrayX_GetHResult, &[array, 0]), E_NOTIMPL as u64);
         assert_eq!(g.log.iter().filter(|l| l.contains("is refused")).count(), 1);
         call(&mut g, IDStorageFileX_Close, &[file]);
         request(&mut g, req, 0, (to, 16), file, 0, 16);
         call(&mut g, IDStorageQueueX_EnqueueRequest, &[queue, req]);
         call(&mut g, IDStorageQueueX_EnqueueStatus, &[queue, array, 0]);
+        call(&mut g, IDStorageQueueX_Submit, &[queue]);
         assert_eq!(call(&mut g, IDStorageStatusArrayX_GetHResult, &[array, 0]), E_FILE_HANDLE as u64);
     }
 
@@ -496,6 +608,7 @@ mod tests {
         request(&mut g, req, SOURCE_MEMORY, (to, 11), from, 0, 11);
         call(&mut g, IDStorageQueueX_EnqueueRequest, &[queue, req]);
         call(&mut g, IDStorageQueueX_EnqueueStatus, &[queue, array, 0]);
+        call(&mut g, IDStorageQueueX_Submit, &[queue]);
         assert_eq!(call(&mut g, IDStorageStatusArrayX_GetHResult, &[array, 0]), 0);
         assert_eq!(&g.mem.read_n::<11>(to).unwrap(), b"from memory");
         let factory = call(&mut g, DStorageGetFactory, &[0, page]);
@@ -510,5 +623,51 @@ mod tests {
         let info = page + 0x600;
         call(&mut g, IDStorageQueueX_Query, &[queue, info]);
         assert_eq!((g.mem.read_u16(info + 8).unwrap(), g.mem.read_u16(info + 0x18).unwrap()), (64, 64));
+    }
+
+    #[test]
+    fn a_cancelled_request_writes_nothing_and_pages_take_a_request() {
+        let (mut g, page) = guest();
+        let (queue, array, file) = set_up(&mut g, page);
+        let (req, to) = (page + 0x400, page + 0x1000);
+        // two requests, tags 0x11 and 0x12; the first is cancelled before Submit
+        for (tag, at) in [(0x11u64, to), (0x12, to + 0x100)] {
+            request(&mut g, req, 0, (at, 16), file, 300, 16);
+            g.mem.write_u64(req + 0x38, tag).unwrap();
+            call(&mut g, IDStorageQueueX_EnqueueRequest, &[queue, req]);
+        }
+        call(&mut g, IDStorageQueueX_CancelRequestsWithTag, &[queue, 0xFF, 0x11]);
+        call(&mut g, IDStorageQueueX_EnqueueStatus, &[queue, array, 0]);
+        // Query: 3 of the 64 slots are taken
+        call(&mut g, IDStorageQueueX_Query, &[queue, page + 0x600]);
+        assert_eq!(g.mem.read_u16(page + 0x618).unwrap(), 61);
+        call(&mut g, IDStorageQueueX_Submit, &[queue]);
+        // the cancelled one wrote nothing, and is no failure of the status entry
+        assert_eq!(call(&mut g, IDStorageStatusArrayX_GetHResult, &[array, 0]), 0);
+        assert_eq!(g.mem.read_u64(to).unwrap(), 0);
+        assert_eq!(g.mem.read_u8(to + 0x100).unwrap(), (300 % 251) as u8);
+        // into two physical pages that are mapped nowhere, across their boundary, and back out
+        let pages = page + 0x800;
+        g.mem.write_u32(page + 0x700, 2).unwrap();
+        (g.cpu.r[RCX], g.cpu.r[RDX], g.cpu.r[8]) = (0, page + 0x700, pages);
+        let allocate = g.handlers["XMemAllocatePhysicalPages"];
+        assert_ne!(allocate(&mut g), Ok(0));
+        request(&mut g, req, DESTINATION_PAGES, (pages, 32), file, 1000, 32);
+        g.mem.write_u16(req + 0x10, 0xFFF0).unwrap();
+        call(&mut g, IDStorageQueueX_EnqueueRequest, &[queue, req]);
+        request(&mut g, req, SOURCE_PAGES, (to + 0x200, 32), pages, 0xFFF0, 32);
+        call(&mut g, IDStorageQueueX_EnqueueRequest, &[queue, req]);
+        call(&mut g, IDStorageQueueX_EnqueueStatus, &[queue, array, 1]);
+        call(&mut g, IDStorageQueueX_Submit, &[queue]);
+        assert_eq!(call(&mut g, IDStorageStatusArrayX_GetHResult, &[array, 1]), 0);
+        let back: [u8; 32] = g.mem.read_n(to + 0x200).unwrap();
+        assert!(back.iter().enumerate().all(|(i, &b)| b == ((1000 + i as u64) % 251) as u8));
+        // a page number the title does not have
+        g.mem.write_u64(pages, 0xDEAD).unwrap();
+        request(&mut g, req, DESTINATION_PAGES, (pages, 32), file, 0, 32);
+        call(&mut g, IDStorageQueueX_EnqueueRequest, &[queue, req]);
+        call(&mut g, IDStorageQueueX_EnqueueStatus, &[queue, array, 2]);
+        call(&mut g, IDStorageQueueX_Submit, &[queue]);
+        assert_eq!(call(&mut g, IDStorageStatusArrayX_GetHResult, &[array, 2]), E_ACCESS_VIOLATION as u64);
     }
 }
