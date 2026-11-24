@@ -85,6 +85,7 @@ if (titlePath) {
   const t0 = performance.now();
   // its game folder: the repository's test data and its DLL (built next to it)
   const data = new URL("../../../tests/data/testgame/data/", import.meta.url);
+  xcl.gameFile("MicrosoftGame.config", readFileSync(new URL("../MicrosoftGame.config", data)));
   for (const f of ["hello.txt", "delete_me.txt", "sub/nested.bin"]) xcl.gameFile("data\\" + f.replace("/", "\\"), readFileSync(new URL(f, data)));
   xcl.gameFile("testgame_mw.dll", readFileSync(titlePath.replace(/[^\\/]+$/, "testgame_mw.dll")));
   const out = xcl.run("xcl_testtitle.exe", readFileSync(titlePath), "xcl_testtitle.exe --hello");
@@ -94,11 +95,11 @@ if (titlePath) {
   const fails = lines.filter((l) => l.startsWith("[FAIL] ")).length;
   assert.match(out, /^xcl_testtitle: start\n/);
   // it runs to its end (functions the host lacks answer 0, so later checks fail), and the
-  // checks up to XGameRuntime pass
+  // checks up to the graphics ones pass
   assert.match(out, /\nxcl_testtitle: done, failures: \d+\n/);
   assert.match(out, /--- stopped: Exit\(/);
-  assert.ok(lines.slice(1, 26).every((l) => l.startsWith("[PASS] ")), `the first 25 checks:\n${lines.slice(0, 28).join("\n")}`);
-  assert.ok(passes >= 25, `only ${passes} checks passed`);
+  assert.ok(lines.slice(1, 32).every((l) => l.startsWith("[PASS] ")), `the first 31 checks:\n${lines.slice(0, 34).join("\n")}`);
+  assert.ok(passes >= 31, `only ${passes} checks passed`);
   ran = `test title ran to its end: ${passes} checks passed, ${fails} failed, in ${Math.round(performance.now() - t0)} ms`;
 }
 

@@ -24,10 +24,10 @@ counterpart:
 **State of the browser port:** the part of XCL that needs no Windows builds for `wasm64`, and
 `xcl inspect` / `xcl disasm` run on a file picked in a page
 ([In the browser](#in-the-browser-webassembly)). An x64 interpreter (`crates/xcl-emu`) and the
-guest around it (`crates/xcl-guest`: PE loader, threads, exceptions, title memory, files) run XCL's own
-test title to its end inside the WebAssembly module: 26 of its 50 checks pass (files with the
-overlay and its game DLL among them), the others wait for XGameRuntime, D3D12.X, DirectStorage
-and audio. **No retail game runs in the
+guest around it (`crates/xcl-guest`: PE loader, threads, exceptions, title memory, files, XGameRuntime) run XCL's own
+test title to its end inside the WebAssembly module: all 31 of its checks that need no graphics
+or audio pass (files with the overlay, its game DLL and XGameRuntime among them); the other 19
+wait for D3D12.X, DirectStorage, Media Foundation and XAudio2. **No retail game runs in the
 browser yet**: there is no graphics, and the interpreter is not a JIT. Everything below describes the Windows
 runtime this fork starts from; the port is meant to leave it unchanged, which has not been
 re-verified on Windows since the port's first changes.

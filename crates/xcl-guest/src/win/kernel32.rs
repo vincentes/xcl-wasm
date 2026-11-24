@@ -117,7 +117,7 @@ fn CreateThread(g: &mut Guest) -> H {
 
 /// The wait of the running thread: `ready` says whether what it waits for has happened. `Ok`:
 /// it has (true) or the timeout passed (false); `Err(Stop::Wait)`: ask again at the next turn.
-fn wait(g: &mut Guest, ready: bool, timeout_ms: u32) -> Result<bool, Stop> {
+pub(super) fn wait(g: &mut Guest, ready: bool, timeout_ms: u32) -> Result<bool, Stop> {
     let now = g.now_ns();
     if ready {
         g.thread_mut().wait = None;
@@ -587,7 +587,7 @@ fn module_handle(g: &mut Guest, name: Option<String>) -> u64 {
         return base;
     }
     let file = name.rsplit(['\\', '/']).next().unwrap_or(&name).to_ascii_lowercase();
-    let known = ["kernel32", "kernelbase", "ntdll", "kernelx", "api-ms-win-", "ext-ms-win-", "xgameruntime", "ucrtbase", "msvcrt", "user32", "minuserx", "gameinput"];
+    let known = ["kernel32", "kernelbase", "ntdll", "kernelx", "api-ms-win-", "ext-ms-win-", "xgameruntime", "ucrtbase", "msvcrt", "user32", "minuserx", "gameinput", "advapi32"];
     if known.iter().any(|k| file.starts_with(k)) {
         return SYSTEM_MODULE;
     }

@@ -52,6 +52,12 @@ const PASSES: &[&str] = &[
     "files: directory listing merges overlay and hides deleted files",
     "files: T:\\ title scratch storage",
     "files: T:\\ free space (the host volume behind the mount)",
+    "XGameRuntime: initialize + package identity",
+    "XTaskQueue: manual, delayed and thread-pool dispatch",
+    "XUser: silent sign-in, device association, and no XSTS token offline",
+    "XTaskQueue composite + XNetworking + advapi32legacy LSA fallback",
+    "storage: save folder + persistent local storage",
+    "XPersistentLocalStorage: a drive root, as on the console",
 ];
 
 #[test]
@@ -67,6 +73,7 @@ fn the_test_title_passes_its_checks_up_to_where_the_guest_gets() {
     // the game folder: the repository's test data and the title's DLL, built next to the title
     let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/testgame");
     add_folder(&mut g, &folder, "");
+    assert!(g.vfs.game_file("MicrosoftGame.config").is_some());
     g.vfs.add_game_file("testgame_mw.dll", std::fs::read(path.with_file_name("testgame_mw.dll")).expect("testgame_mw.dll next to the title"));
     let exe = g.map_image("xcl_testtitle.exe", &data).unwrap();
     g.start(exe, 1 << 20).unwrap();
@@ -81,10 +88,15 @@ fn the_test_title_passes_its_checks_up_to_where_the_guest_gets() {
     println!("{output}--- stopped: {stop:x?} after {} instructions of the main thread", g.cpu.icount);
     let lines: Vec<&str> = output.lines().collect();
     assert_eq!(lines.first(), Some(&"xcl_testtitle: start"));
-    assert!(!output.contains("[FAIL]"), "a check failed");
-    let passed: Vec<&str> = lines.iter().filter_map(|l| l.strip_prefix("[PASS] ")).collect();
-    assert!(passed.len() >= PASSES.len(), "only {} checks passed", passed.len());
-    assert_eq!(&passed[..PASSES.len()], PASSES);
+    // every check up to the graphics ones passes (those fail: there is no D3D12.X yet)
+    let checks: Vec<&str> = lines.iter().skip(1).copied().filter(|l| l.starts_with("[PASS] ") || l.starts_with("[FAIL] ")).collect();
+    assert!(checks.len() >= PASSES.len(), "only {} checks ran", checks.len());
+    for (line, name) in checks.iter().zip(PASSES) {
+        assert_eq!(*line, format!("[PASS] {name}"));
+    }
+    for line in &checks[PASSES.len()..] {
+        assert!(line.starts_with("[FAIL] D3D12.X: "), "{line}");
+    }
     // it has not crashed: it either ran to its end or reached a function that is not there yet
     assert!(matches!(stop, Stop::Exit(_) | Stop::Unimplemented { .. }), "{stop:x?}");
     // the game folder is as it was: what the title changed is in the overlay

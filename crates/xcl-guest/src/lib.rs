@@ -26,7 +26,9 @@ pub const SLOT_ENTRY_RETURN: u32 = 0;
 pub const SLOT_CALL_RETURN: u32 = 1;
 /// where a thread's start function returns
 pub const SLOT_THREAD_RETURN: u32 = 2;
-pub const FIRST_IMPORT_SLOT: u32 = 3;
+/// where a thread the host drives is between two callbacks (`Guest::add_host_thread`)
+pub const SLOT_HOST_THREAD: u32 = 3;
+pub const FIRST_IMPORT_SLOT: u32 = 4;
 
 /// Instructions a thread runs before the next one gets its turn.
 const SLICE: u64 = 20_000;
@@ -110,6 +112,8 @@ pub struct Thread {
     pub wait: Option<Wait>,
     /// set once its start function returned (or it called ExitThread)
     pub exit_code: Option<u32>,
+    /// the top of its stack
+    pub stack_top: u64,
     /// handler calls in progress, innermost last (see `win::seh`)
     pub seh: Vec<win::seh::Boundary>,
 }
@@ -219,8 +223,23 @@ impl Guest {
         cpu.r[xcl_emu::cpu::RSP] = top - 0x40;
         let ret = cpu.trap_address(return_slot);
         abi::call(&mut cpu, &mut self.mem, entry, &[argument], ret)?;
-        self.threads.push(Thread { id, name: String::new(), cpu, teb, last_error: 0, tls_slots: Vec::new(), wait: None, exit_code: None, seh: Vec::new() });
+        self.threads.push(Thread { id, name: String::new(), cpu, teb, last_error: 0, tls_slots: Vec::new(), wait: None, exit_code: None, stack_top: top, seh: Vec::new() });
         Ok(self.threads.len() - 1)
+    }
+
+    /// A thread that runs guest functions the host hands it, one after the other
+    /// (`host_thread_call` at its turns): it rests at `SLOT_HOST_THREAD`.
+    pub fn add_host_thread(&mut self, stack: u64, top: u64) -> Result<usize, Fault> {
+        let index = self.add_thread(stack, top, 0, 0, SLOT_HOST_THREAD)?;
+        self.threads[index].cpu.rip = self.cpu.trap_address(SLOT_HOST_THREAD);
+        Ok(index)
+    }
+
+    /// On a host thread at its slot: call `entry(args)`; it comes back to the slot.
+    pub(crate) fn host_thread_call(&mut self, entry: u64, args: &[u64]) -> Result<(), Fault> {
+        self.cpu.r[xcl_emu::cpu::RSP] = self.thread().stack_top - 0x40;
+        let ret = self.cpu.trap_address(SLOT_HOST_THREAD);
+        abi::call(&mut self.cpu, &mut self.mem, entry, args, ret)
     }
 
     /// Make thread `to` the running one.
@@ -292,13 +311,21 @@ impl Guest {
                 // a host call of another thread ended, inside this one's: it goes on once this
                 // one's has returned
                 Exit::Import(SLOT_CALL_RETURN) | Exit::Import(SLOT_ENTRY_RETURN) => true,
+                Exit::Import(SLOT_HOST_THREAD) => match self.worker_turn() {
+                    Ok(true) => {
+                        idle = 0;
+                        continue;
+                    }
+                    Ok(false) => true,
+                    Err(stop) => return stop,
+                },
                 Exit::Import(SLOT_THREAD_RETURN) => {
                     let code = self.cpu.r[xcl_emu::cpu::RAX] as u32;
                     self.thread_mut().exit_code = Some(code);
                     idle = 0;
                     false
                 }
-                Exit::Import(slot) if ((slot - FIRST_IMPORT_SLOT) as usize) < self.imports.len() => match self.import_call((slot - FIRST_IMPORT_SLOT) as usize) {
+                Exit::Import(slot) if slot >= FIRST_IMPORT_SLOT && ((slot - FIRST_IMPORT_SLOT) as usize) < self.imports.len() => match self.import_call((slot - FIRST_IMPORT_SLOT) as usize) {
                     Ok(()) => {
                         idle = 0;
                         // keep the slice: a thread is not switched out at every call

@@ -4,7 +4,8 @@
 //! (`Vfs::add_game_file`) and can take the overlay out (`Vfs::overlay`).
 //!
 //! Console paths: `G:\`, `GAME:\` and `D:\` are the game folder (so is a relative path), `T:\`
-//! the title's scratch storage, `S:\` its persistent local storage.
+//! the title's scratch storage, `S:\` its persistent local storage, `U:\` the user's data
+//! (game saves).
 
 use std::collections::BTreeMap;
 
@@ -30,7 +31,7 @@ pub struct Vfs {
     over: BTreeMap<String, (String, Node)>,
 }
 
-const ROOTS: [&str; 3] = ["g:\\", "t:\\", "s:\\"];
+const ROOTS: [&str; 4] = ["g:\\", "t:\\", "s:\\", "u:\\"];
 
 /// The full path a title's path names: `G:\data\hello.txt` for `GAME:/data/./hello.txt`,
 /// `\\?\G:\data\hello.txt` or `data\hello.txt`. `None`: not a path of the title's drives.
@@ -45,6 +46,7 @@ pub fn resolve(path: &str) -> Option<String> {
         "G" | "GAME" | "D" => 'G',
         "T" => 'T',
         "S" => 'S',
+        "U" => 'U',
         _ => return None,
     };
     let mut parts: Vec<&str> = Vec::new();
