@@ -1,29 +1,50 @@
-//! RDNA2 → WGSL: the recompiler's back end for WebGPU. **A beginning**: kernel mode only (the
-//! program runs on a register file, as the HLSL back end's instruction tests do) and a first
-//! set of instructions – 32-bit float and integer arithmetic, compares, selects, the scalar
-//! unit, branches. No memory, no textures, no exports, no graphics stages yet.
+//! RDNA2 → WGSL: the recompiler's back end for WebGPU. **A beginning**: a first set of
+//! instructions – 32-bit float and integer arithmetic, compares, selects, the scalar unit,
+//! branches, exports and attribute interpolation – as a kernel (the program runs on a register
+//! file, as the HLSL back end's instruction tests do), a vertex stage or a pixel stage. No
+//! memory and no textures yet.
 //!
 //! WGSL has no wave of 64 lanes to rely on (the HLSL back end pins one with `WaveSize(64)` and
-//! uses wave intrinsics), so here **one invocation runs the whole wave**: a vector register is
-//! an array of 64 values and a vector instruction a loop over the lanes EXEC has on. That makes
-//! lane masks exact without any subgroup feature: VCC and EXEC are two 32-bit halves, a compare
-//! sets the bits of its lanes.
+//! uses wave intrinsics). A program is written for a wave of `LANES` lanes: a vector register
+//! is an array of `LANES` values and a vector instruction a loop over the lanes EXEC has on;
+//! VCC and EXEC are two 32-bit halves and a compare sets the bits of its lanes. In a kernel
+//! **one invocation runs the whole wave** (`LANES` = 64), which makes lane masks exact without
+//! any subgroup feature. A vertex or a pixel is a wave of one lane (`LANES` = 1): the same
+//! text, with EXEC's bit 0 for "this vertex / pixel is live". (What a pixel needs from its
+//! neighbours – derivatives – will come from WGSL's own, not from lanes.)
 //!
 //! Control flow is the dispatcher loop (`switch pc` over basic blocks), exact for any branch.
 //!
 //! Kernel ABI (the HLSL back end's): `io` holds 128 SGPR slots (106 / 107 VCC, 126 / 127 EXEC,
 //! 125 SCC) and then, per lane, 256 VGPRs; `res` gets the same back.
+//!
+//! Stage ABI: the SGPRs come from a uniform buffer (`sg`, group 0 binding 0: 32 × `vec4<u32>`).
+//! A vertex stage gets attribute `k` at `@location(k)` (`vec4<f32>`, in four VGPRs from
+//! `attr_base + 4k`), writes `exp pos0` to the position and `exp param N` to `@location(N)`.
+//! A pixel stage reads attribute `N` at `@location(N)`, gets the system values
+//! SPI_PS_INPUT_ENA names in its first VGPRs, writes `exp mrt N` to `@location(N)` and is
+//! discarded when no export ran for it (it was killed).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::{KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS};
+use super::{ps_input_vgpr, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS};
 use crate::gpu::rdna2::{self, Decoded};
 
 pub struct Translation {
     pub wgsl: String,
-    /// dwords of the `io` and `res` buffers
+    /// dwords of the `io` and `res` buffers (a kernel)
     pub dwords: usize,
+}
+
+/// What a program is translated as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Kernel,
+    /// `attributes` vertex attributes, four VGPRs each from `attr_base`
+    Vertex { attr_base: u64, attributes: u32 },
+    /// SPI_PS_INPUT_ENA: the system values in the first VGPRs
+    Pixel { input_ena: u32 },
 }
 
 fn field(d: &Decoded, name: &str) -> Option<u64> {
@@ -173,10 +194,38 @@ fn vector_value(name: &str, a: &str, b: &str, c: &str) -> Option<String> {
 }
 
 /// One instruction as WGSL statements (branches are the caller's).
-fn statement(d: &Decoded) -> Result<String, String> {
+fn statement(d: &Decoded, stage: Stage) -> Result<String, String> {
     let name = d.inst.name.to_ascii_lowercase();
     let lit = d.literal;
     let enc = d.enc.name;
+    if name == "exp" {
+        let get = |n: &str| field(d, n).unwrap_or(0);
+        if get("COMPR") != 0 {
+            return Err("exp of packed halves".into());
+        }
+        let value: Vec<String> = (0..4).map(|c| if get("EN") >> c & 1 == 1 { format!("bitcast<f32>(v{}[l])", get(&format!("VSRC{c}"))) } else { "0.0".into() }).collect();
+        let value = format!("vec4<f32>({})", value.join(", "));
+        let to = match (stage, get("TGT")) {
+            (Stage::Vertex { .. }, 12) => format!("o_pos = {value};"),
+            (Stage::Vertex { .. }, t @ 32..=63) => format!("o_p{} = {value};", t - 32),
+            (Stage::Pixel { .. }, t @ 0..=7) => format!("o_t{t} = {value}; live = true;"),
+            (Stage::Pixel { .. }, 9) => "live = true;".into(),
+            (_, t) => return Err(format!("exp to target {t} of this stage")),
+        };
+        return Ok(format!("for (var l = 0u; l < LANES; l++) {{ if (on(exec, l)) {{ {to} }} }}"));
+    }
+    if name.starts_with("v_interp_") {
+        if !matches!(stage, Stage::Pixel { .. }) || enc != "ENC_VINTRP" {
+            return Err(name);
+        }
+        let get = |n: &str| field(d, n).unwrap_or(0);
+        return Ok(match name.as_str() {
+            // the attribute comes interpolated from the rasteriser: the second half has the value
+            "v_interp_p1_f32" => String::new(),
+            "v_interp_p2_f32" => format!("for (var l = 0u; l < LANES; l++) {{ if (on(exec, l)) {{ v{}[l] = bitcast<u32>(xi.a{}[{}]); }} }}", get("VDST"), get("ATTR"), get("ATTRCHAN")),
+            _ => return Err(name),
+        });
+    }
     // --- the vector unit
     if name.starts_with("v_") {
         if enc.contains("SDWA") || enc.contains("DPP") {
@@ -192,7 +241,8 @@ fn statement(d: &Decoded) -> Result<String, String> {
             (None, None) => "0u".into(),
         };
         let c = field(d, "SRC2").map(|c| source(c, lit)).transpose()?.unwrap_or_else(|| "0u".into());
-        if let Some(rest) = name.strip_prefix("v_cmp_") {
+        let cmpx = name.starts_with("v_cmpx_");
+        if let Some(rest) = name.strip_prefix("v_cmpx_").or_else(|| name.strip_prefix("v_cmp_")) {
             let (op, ty) = rest.rsplit_once('_').ok_or(&name)?;
             let cast = |e: &str| match ty {
                 "f32" => Ok(f(e)),
@@ -202,12 +252,13 @@ fn statement(d: &Decoded) -> Result<String, String> {
             };
             let test = condition(op, &cast(&a)?, &cast(&b)?, ty == "f32").ok_or(&name)?;
             // the mask goes to VCC, or to the register pair the VOP3 form names
-            let to = store64(if enc.contains("VOP3") { field(d, "VDST").ok_or("VDST")? } else { 106 }, "m")?;
-            return Ok(format!("{{ var m = vec2<u32>(0u); for (var l = 0u; l < 64u; l++) {{ if (on(exec, l) && {test}) {{ m = put(m, l); }} }} {to} }}"));
+            // (v_cmpx: to EXEC, so lanes that fail are off from here)
+            let to = store64(if cmpx { 126 } else if enc.contains("VOP3") { field(d, "VDST").ok_or("VDST")? } else { 106 }, "m")?;
+            return Ok(format!("{{ var m = vec2<u32>(0u); for (var l = 0u; l < LANES; l++) {{ if (on(exec, l) && {test}) {{ m = put(m, l); }} }} {to} }}"));
         }
         let value = vector_value(&name, &a, &b, &c).ok_or(&name)?;
         let dst = field(d, "VDST").ok_or("VDST")?;
-        return Ok(format!("for (var l = 0u; l < 64u; l++) {{ if (on(exec, l)) {{ v{dst}[l] = {value}; }} }}"));
+        return Ok(format!("for (var l = 0u; l < LANES; l++) {{ if (on(exec, l)) {{ v{dst}[l] = {value}; }} }}"));
     }
     // --- the scalar unit
     let s0 = field(d, "SSRC0");
@@ -288,6 +339,11 @@ fn statement(d: &Decoded) -> Result<String, String> {
 /// Translate a program into a WGSL compute shader of the kernel ABI. `Err`: the instructions
 /// this back end does not have yet, or a program it cannot decode.
 pub fn translate_kernel(code: &[u8]) -> Result<Translation, String> {
+    translate(code, Stage::Kernel)
+}
+
+/// Translate a program into a WGSL shader of `stage`'s ABI (see the module's text).
+pub fn translate(code: &[u8], stage: Stage) -> Result<Translation, String> {
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
@@ -311,12 +367,44 @@ pub fn translate_kernel(code: &[u8]) -> Result<Translation, String> {
     }
     let mut vgprs: BTreeSet<u64> = BTreeSet::new();
     let mut written: BTreeSet<u64> = BTreeSet::new();
+    // what the stage's interface has: exp param N / mrt N, interpolated attributes
+    let (mut params, mut targets, mut attrs) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
     for d in &insts {
         let (r, w) = rdna2::vgpr_uses(d);
         vgprs.extend(r.iter().copied());
         vgprs.extend(w.iter().copied());
         written.extend(w);
+        let get = |n: &str| field(d, n).unwrap_or(0);
+        if d.inst.name == "EXP" {
+            vgprs.extend((0..4).filter(|c| get("EN") >> c & 1 == 1).map(|c| get(&format!("VSRC{c}"))));
+            match get("TGT") {
+                t @ 0..=7 => targets.insert(t),
+                t @ 32..=63 => params.insert(t - 32),
+                _ => false,
+            };
+        }
+        if d.enc.name == "ENC_VINTRP" {
+            vgprs.insert(get("VDST"));
+            attrs.insert(get("ATTR"));
+        }
     }
+    // registers the stage fills before the program runs
+    let mut inputs: Vec<(u64, String)> = Vec::new();
+    match stage {
+        Stage::Kernel => {}
+        Stage::Vertex { attr_base, attributes } => {
+            for k in 0..attributes as u64 {
+                inputs.extend((0..4).map(|c| (attr_base + 4 * k + c, format!("bitcast<u32>(a{k}[{c}])"))));
+            }
+        }
+        Stage::Pixel { input_ena } => {
+            for (bit, c) in [(8, "x"), (9, "y"), (10, "z"), (11, "w")] {
+                inputs.extend(ps_input_vgpr(input_ena, bit).map(|v| (v, format!("bitcast<u32>(xi.pos.{c})"))));
+            }
+            inputs.extend(ps_input_vgpr(input_ena, 12).map(|v| (v, "bitcast<u32>(select(0.0, 1.0, xi.front))".to_string())));
+        }
+    }
+    inputs.retain(|(v, _)| vgprs.contains(v));
     let mut unsupported: BTreeMap<String, usize> = BTreeMap::new();
     let mut body = String::new();
     const END: u32 = 0xFFFF_FFFF;
@@ -359,7 +447,7 @@ pub fn translate_kernel(code: &[u8]) -> Result<Translation, String> {
             open = false;
             continue;
         }
-        match statement(d) {
+        match statement(d, stage) {
             Ok(text) if text.is_empty() => {}
             Ok(text) => {
                 let _ = writeln!(body, "        {text}");
@@ -375,11 +463,17 @@ pub fn translate_kernel(code: &[u8]) -> Result<Translation, String> {
         let list: Vec<String> = unsupported.iter().map(|(n, c)| format!("{n} ×{c}")).collect();
         return Err(format!("not in the WGSL back end yet: {}", list.join(", ")));
     }
-    let lanes = KERNEL_LANES;
+    let kernel = stage == Stage::Kernel;
+    let lanes = if kernel { KERNEL_LANES } else { 1 };
     let mut w = String::new();
-    let _ = writeln!(w, "// RDNA2 program in kernel mode, made by XCL (gpu::recomp::wgsl): one invocation runs the wave.");
-    let _ = writeln!(w, "@group(0) @binding(0) var<storage, read> io: array<u32>;");
-    let _ = writeln!(w, "@group(0) @binding(1) var<storage, read_write> res: array<u32>;");
+    let _ = writeln!(w, "// RDNA2 program ({stage:?}), made by XCL (gpu::recomp::wgsl).");
+    let _ = writeln!(w, "const LANES = {lanes}u;");
+    if kernel {
+        let _ = writeln!(w, "@group(0) @binding(0) var<storage, read> io: array<u32>;");
+        let _ = writeln!(w, "@group(0) @binding(1) var<storage, read_write> res: array<u32>;");
+    } else {
+        let _ = writeln!(w, "@group(0) @binding(0) var<uniform> sg: array<vec4<u32>, {}>;", KERNEL_SGPRS / 4);
+    }
     let _ = writeln!(w, "var<private> s: array<u32, {KERNEL_SGPRS}>;");
     let _ = writeln!(w, "var<private> exec: vec2<u32>;\nvar<private> vcc: vec2<u32>;\nvar<private> scc: bool;");
     for v in &vgprs {
@@ -389,21 +483,83 @@ pub fn translate_kernel(code: &[u8]) -> Result<Translation, String> {
     let _ = writeln!(w, "fn on(m: vec2<u32>, l: u32) -> bool {{ if (l < 32u) {{ return ((m.x >> l) & 1u) != 0u; }} return ((m.y >> (l - 32u)) & 1u) != 0u; }}");
     let _ = writeln!(w, "fn put(m: vec2<u32>, l: u32) -> vec2<u32> {{ if (l < 32u) {{ return vec2<u32>(m.x | (1u << l), m.y); }} return vec2<u32>(m.x, m.y | (1u << (l - 32u))); }}");
     let _ = writeln!(w, "fn mul_hi(a: u32, b: u32) -> u32 {{ let al = a & 0xffffu; let ah = a >> 16u; let bl = b & 0xffffu; let bh = b >> 16u; let mid = ah * bl + ((al * bl) >> 16u); let mid2 = al * bh + (mid & 0xffffu); return ah * bh + (mid >> 16u) + (mid2 >> 16u); }}");
-    let _ = writeln!(w, "@compute @workgroup_size(1) fn main() {{");
-    let _ = writeln!(w, "  for (var i = 0u; i < {KERNEL_SGPRS}u; i++) {{ s[i] = io[i]; }}");
-    let _ = writeln!(w, "  exec = vec2<u32>(io[126], io[127]);\n  vcc = vec2<u32>(io[106], io[107]);\n  scc = io[{KERNEL_SCC_SLOT}] != 0u;");
-    for v in &vgprs {
-        let _ = writeln!(w, "  for (var l = 0u; l < {lanes}u; l++) {{ v{v}[l] = io[{KERNEL_SGPRS}u + l * {KERNEL_VGPRS}u + {v}u]; }}");
+    match stage {
+        Stage::Kernel => {
+            let _ = writeln!(w, "@compute @workgroup_size(1) fn main() {{");
+            let _ = writeln!(w, "  for (var i = 0u; i < {KERNEL_SGPRS}u; i++) {{ s[i] = io[i]; }}");
+            let _ = writeln!(w, "  exec = vec2<u32>(io[126], io[127]);\n  vcc = vec2<u32>(io[106], io[107]);\n  scc = io[{KERNEL_SCC_SLOT}] != 0u;");
+            for v in &vgprs {
+                let _ = writeln!(w, "  for (var l = 0u; l < LANES; l++) {{ v{v}[l] = io[{KERNEL_SGPRS}u + l * {KERNEL_VGPRS}u + {v}u]; }}");
+            }
+        }
+        Stage::Vertex { attributes, .. } => {
+            let _ = writeln!(w, "var<private> o_pos: vec4<f32>;");
+            let _ = writeln!(w, "struct VsOut {{\n  @builtin(position) pos: vec4<f32>,");
+            for n in &params {
+                let _ = writeln!(w, "  @location({n}) p{n}: vec4<f32>,");
+            }
+            let _ = writeln!(w, "}}");
+            for n in &params {
+                let _ = writeln!(w, "var<private> o_p{n}: vec4<f32>;");
+            }
+            let list: Vec<String> = (0..attributes).map(|k| format!("@location({k}) a{k}: vec4<f32>")).collect();
+            let _ = writeln!(w, "@vertex fn main({}) -> VsOut {{", list.join(", "));
+        }
+        Stage::Pixel { input_ena } => {
+            let _ = writeln!(w, "var<private> live: bool;");
+            let _ = writeln!(w, "struct PsIn {{\n  @builtin(position) pos: vec4<f32>,");
+            if input_ena >> 12 & 1 == 1 {
+                let _ = writeln!(w, "  @builtin(front_facing) front: bool,");
+            }
+            for n in &attrs {
+                let _ = writeln!(w, "  @location({n}) a{n}: vec4<f32>,");
+            }
+            let _ = writeln!(w, "}}");
+            if !targets.is_empty() {
+                let _ = writeln!(w, "struct PsOut {{");
+                for t in &targets {
+                    let _ = writeln!(w, "  @location({t}) t{t}: vec4<f32>,");
+                }
+                let _ = writeln!(w, "}}");
+            }
+            for t in &targets {
+                let _ = writeln!(w, "var<private> o_t{t}: vec4<f32>;");
+            }
+            let _ = writeln!(w, "@fragment fn main(xi: PsIn){} {{", if targets.is_empty() { "" } else { " -> PsOut" });
+        }
+    }
+    if !kernel {
+        let _ = writeln!(w, "  for (var i = 0u; i < {KERNEL_SGPRS}u; i++) {{ s[i] = sg[i / 4u][i % 4u]; }}");
+        // the one lane is on; the mask registers are the wave's, not the title's
+        let _ = writeln!(w, "  exec = vec2<u32>(1u, 0u);\n  vcc = vec2<u32>(0u);\n  scc = false;");
+        for (v, value) in &inputs {
+            let _ = writeln!(w, "  v{v}[0] = {value};");
+        }
     }
     let _ = writeln!(w, "  var pc = 0u;\n  // a program that never ends is cut off\n  for (var steps = 0u; steps < 1000000u; steps++) {{\n    switch pc {{");
     w.push_str(&body);
     let _ = writeln!(w, "      default {{ pc = {END}u; }}\n    }}\n    if (pc == {END}u) {{ break; }}\n  }}");
     let total = KERNEL_SGPRS + KERNEL_LANES * KERNEL_VGPRS;
-    let _ = writeln!(w, "  for (var i = 0u; i < {total}u; i++) {{ res[i] = io[i]; }}");
-    let _ = writeln!(w, "  for (var i = 0u; i < {KERNEL_SGPRS}u; i++) {{ res[i] = s[i]; }}");
-    let _ = writeln!(w, "  res[106] = vcc.x; res[107] = vcc.y; res[126] = exec.x; res[127] = exec.y; res[{KERNEL_SCC_SLOT}] = u32(scc);");
-    for v in &written {
-        let _ = writeln!(w, "  for (var l = 0u; l < {lanes}u; l++) {{ res[{KERNEL_SGPRS}u + l * {KERNEL_VGPRS}u + {v}u] = v{v}[l]; }}");
+    match stage {
+        Stage::Kernel => {
+            let _ = writeln!(w, "  for (var i = 0u; i < {total}u; i++) {{ res[i] = io[i]; }}");
+            let _ = writeln!(w, "  for (var i = 0u; i < {KERNEL_SGPRS}u; i++) {{ res[i] = s[i]; }}");
+            let _ = writeln!(w, "  res[106] = vcc.x; res[107] = vcc.y; res[126] = exec.x; res[127] = exec.y; res[{KERNEL_SCC_SLOT}] = u32(scc);");
+            for v in &written {
+                let _ = writeln!(w, "  for (var l = 0u; l < LANES; l++) {{ res[{KERNEL_SGPRS}u + l * {KERNEL_VGPRS}u + {v}u] = v{v}[l]; }}");
+            }
+        }
+        Stage::Vertex { .. } => {
+            let list: Vec<String> = std::iter::once("o_pos".to_string()).chain(params.iter().map(|n| format!("o_p{n}"))).collect();
+            let _ = writeln!(w, "  return VsOut({});", list.join(", "));
+        }
+        Stage::Pixel { .. } => {
+            let _ = writeln!(w, "  if (!live) {{ discard; }}");
+            if !targets.is_empty() {
+                let list: Vec<String> = targets.iter().map(|t| format!("o_t{t}")).collect();
+                let _ = writeln!(w, "  return PsOut({});", list.join(", "));
+            }
+        }
     }
     let _ = writeln!(w, "}}");
     Ok(Translation { wgsl: w, dwords: total })
@@ -436,6 +592,33 @@ mod tests {
         assert!(t.wgsl.contains("var<private> v1: array<u32, 64>;") && !t.wgsl.contains("var<private> v3:"));
         assert!(t.wgsl.contains("+ 5u] = v5[l];") && !t.wgsl.contains("+ 1u] = v1[l];"));
         assert_eq!(t.dwords, 128 + 64 * 256);
+    }
+
+    #[test]
+    fn a_vertex_and_a_pixel_stage_have_their_interfaces() {
+        // v0..v3 = attribute 0 ; exp pos0 ; exp param0 = attribute 1
+        let vs = asm(&[
+            ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0x7), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+        ]);
+        let t = translate(&vs, Stage::Vertex { attr_base: 4, attributes: 2 }).unwrap();
+        assert!(t.wgsl.contains("const LANES = 1u;") && t.wgsl.contains("@vertex fn main(@location(0) a0: vec4<f32>, @location(1) a1: vec4<f32>) -> VsOut"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("v9[0] = bitcast<u32>(a1[1]);") && t.wgsl.contains("@location(0) p0: vec4<f32>,"), "{}", t.wgsl);
+        // a component the export leaves out is 0
+        assert!(t.wgsl.contains("o_p0 = vec4<f32>(bitcast<f32>(v8[l]), bitcast<f32>(v9[l]), bitcast<f32>(v10[l]), 0.0);"), "{}", t.wgsl);
+        // v_cmpx kills ; attribute 1 channel 2 ; exp mrt0
+        let ps = asm(&[
+            ("V_CMPX_LT_F32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 2)], Some(8.0f32.to_bits())),
+            ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 1), ("ATTRCHAN", 2)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0x1), ("VSRC0", 4), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let t = translate(&ps, Stage::Pixel { input_ena: 0x302 }).unwrap();
+        // persp center is v0 v1, so the position's x is v2
+        assert!(t.wgsl.contains("v2[0] = bitcast<u32>(xi.pos.x);") && t.wgsl.contains("exec = m;"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("v4[l] = bitcast<u32>(xi.a1[2]);") && t.wgsl.contains("@location(1) a1: vec4<f32>,"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("if (!live) { discard; }") && t.wgsl.contains("return PsOut(o_t0);"), "{}", t.wgsl);
+        // an export a stage does not have is refused
+        assert!(translate(&ps, Stage::Kernel).is_err() && translate(&vs, Stage::Pixel { input_ena: 0 }).is_err());
     }
 
     #[test]

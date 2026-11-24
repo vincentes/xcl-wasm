@@ -50,3 +50,20 @@ pub unsafe extern "C" fn xcl_rdna2_assemble(text: *const u8, text_len: usize) ->
 pub unsafe extern "C" fn xcl_wgsl_kernel(code: *const u8, code_len: usize) -> u32 {
     answer(xcl::gpu::recomp::wgsl::translate_kernel(bytes(code, code_len)).map(|t| t.wgsl))
 }
+
+/// Translate an RDNA2 program to a WGSL vertex stage (`stage` 1: `a` the first attribute VGPR,
+/// `b` the number of attributes, each `@location(k)` in four VGPRs) or pixel stage (`stage` 2:
+/// `a` SPI_PS_INPUT_ENA). The SGPRs are a uniform buffer at group 0 binding 0.
+///
+/// # Safety
+/// `code`: a block from `xcl_alloc`.
+#[no_mangle]
+pub unsafe extern "C" fn xcl_wgsl_stage(code: *const u8, code_len: usize, stage: u32, a: u32, b: u32) -> u32 {
+    use xcl::gpu::recomp::wgsl::{translate, Stage};
+    let stage = match stage {
+        1 => Stage::Vertex { attr_base: a as u64, attributes: b },
+        2 => Stage::Pixel { input_ena: a },
+        _ => return answer(Err(format!("stage {stage}"))),
+    };
+    answer(translate(bytes(code, code_len), stage).map(|t| t.wgsl))
+}

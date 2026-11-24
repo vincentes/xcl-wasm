@@ -50,6 +50,10 @@ export async function load(source) {
     assemble: (lines) => Uint8Array.from(call(x.xcl_rdna2_assemble, lines.join("\n")).match(/../g) ?? [], (h) => parseInt(h, 16)),
     /** An RDNA2 program as a WGSL compute shader in kernel mode (throws what is missing). */
     wgslKernel: (code) => call(x.xcl_wgsl_kernel, code),
+    /** An RDNA2 vertex program as a WGSL vertex stage: `attributes` at `@location(k)`, four VGPRs each from `attrBase`. */
+    wgslVertex: (code, attrBase, attributes) => call(x.xcl_wgsl_stage, code, 1, attrBase, attributes),
+    /** An RDNA2 pixel program as a WGSL fragment stage (`inputEna`: SPI_PS_INPUT_ENA). */
+    wgslPixel: (code, inputEna) => call(x.xcl_wgsl_stage, code, 2, inputEna, 0),
     /** Start a title that keeps running (`step`); the game folder is `gameFile`'s. */
     start: (name, data, commandLine = "") => call(x.xcl_session_start, name, data, commandLine),
     /**

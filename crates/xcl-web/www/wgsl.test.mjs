@@ -1,7 +1,8 @@
 // The WGSL back end of the shader recompiler, on a real WebGPU: RDNA2 programs are assembled
 // and translated by the module, run as compute shaders in headless Chromium, and what they
 // leave in the register file is compared with what the instructions are specified to do
-// (computed here in JavaScript).
+// (computed here in JavaScript). A vertex and a pixel program then draw a triangle, and the
+// pixels are read back.
 //   node crates/xcl-web/www/wgsl.test.mjs target/wasm64-unknown-unknown/release/xcl_web.wasm
 // Needs Playwright's Chromium; WebGPU there is SwiftShader (software) unless a GPU is exposed.
 import assert from "node:assert/strict";
@@ -168,6 +169,35 @@ test("if / else on lanes: s_and_saveexec_b64, a masked write, EXEC restored", [
   assert.deepEqual([res[126], res[127], res[10], res[11]], [0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff]);
 });
 
+// --- a draw: a vertex and a pixel program (the HLSL back end's gpu_graphics_vs_ps_draw)
+const draw = {
+  // position (attribute 0, v4 v5) to pos0 with z 0 and w 1; the colour (attribute 1) to param 0
+  vertex: xcl.wgslVertex(xcl.assemble([
+    `V_MOV_B32 ENC_VOP1 VDST=0 SRC0=${V(4)}`,
+    `V_MOV_B32 ENC_VOP1 VDST=1 SRC0=${V(5)}`,
+    "V_MOV_B32 ENC_VOP1 VDST=2 SRC0=128",
+    "V_MOV_B32 ENC_VOP1 VDST=3 SRC0=242",
+    "EXP ENC_EXP TGT=12 EN=15 VSRC0=0 VSRC1=1 VSRC2=2 VSRC3=3 DONE=1",
+    "EXP ENC_EXP TGT=32 EN=15 VSRC0=8 VSRC1=9 VSRC2=10 VSRC3=11",
+  ]), 4, 2),
+  // pixels left of x = 8 are killed; the others get the colour with red × s4 (0.5, a uniform)
+  pixel: xcl.wgslPixel(xcl.assemble([
+    `V_CMPX_LT_F32 ENC_VOPC SRC0=255 VSRC1=2 LIT=${bits(8)}`,
+    "V_INTERP_P1_F32 ENC_VINTRP VDST=4 VSRC=0 ATTR=0 ATTRCHAN=0",
+    "V_INTERP_P2_F32 ENC_VINTRP VDST=4 VSRC=1 ATTR=0 ATTRCHAN=0",
+    "V_INTERP_P2_F32 ENC_VINTRP VDST=5 VSRC=1 ATTR=0 ATTRCHAN=1",
+    "V_INTERP_P2_F32 ENC_VINTRP VDST=6 VSRC=1 ATTR=0 ATTRCHAN=2",
+    "V_MOV_B32 ENC_VOP1 VDST=7 SRC0=242",
+    `V_MUL_F32 ENC_VOP2 VDST=4 SRC0=${S(4)} VSRC1=4`,
+    "EXP ENC_EXP TGT=0 EN=15 VSRC0=4 VSRC1=5 VSRC2=6 VSRC3=7 DONE=1 VM=1",
+  ]), 0x302),
+  sgprs: Object.assign(new Array(128).fill(0), { 4: bits(0.5) }),
+  // a triangle over the whole target: x y, r g b a
+  vertices: [[-1, -1], [-1, 3], [3, -1]].flatMap((p) => [...p, 0.8, 0.6, 0.4, 1]),
+  clear: [0, 0, 1, 1],
+  size: 16,
+};
+
 // --- run them
 const programs = cases.map((c) => ({ name: c.name, wgsl: xcl.wgslKernel(xcl.assemble(c.program)), io: [...c.io] }));
 assert.throws(() => xcl.wgslKernel(xcl.assemble([`V_SIN_F32 ENC_VOP1 VDST=0 SRC0=${V(1)}`])), /v_sin_f32/, "what is missing is named");
@@ -178,7 +208,7 @@ const browser = await chromium.launch({ headless: true, args: ["--enable-unsafe-
 try {
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
-  const { adapter, results } = await page.evaluate(async (programs) => {
+  const { adapter, results, drawn } = await page.evaluate(async ({ programs, draw }) => {
     const gpuAdapter = await navigator.gpu?.requestAdapter();
     if (!gpuAdapter) return { adapter: null, results: [] };
     const device = await gpuAdapter.requestDevice();
@@ -215,9 +245,53 @@ try {
       await read.mapAsync(GPUMapMode.READ);
       results.push({ res: [...new Uint32Array(read.getMappedRange())] });
     }
+    // the draw: both stages in one pipeline, the SGPRs as a uniform buffer, a float target read back
+    let drawn;
+    {
+      device.pushErrorScope("validation");
+      const errors = [];
+      const stage = async (code) => {
+        const module = device.createShaderModule({ code });
+        errors.push(...(await module.getCompilationInfo()).messages.filter((m) => m.type === "error").map((m) => `${m.lineNum}:${m.linePos} ${m.message}`));
+        return module;
+      };
+      const [vs, ps] = [await stage(draw.vertex), await stage(draw.pixel)];
+      if (errors.length) {
+        await device.popErrorScope();
+        drawn = { error: errors.join("; ") };
+      } else {
+        const pipeline = device.createRenderPipeline({
+          layout: "auto",
+          vertex: { module: vs, entryPoint: "main", buffers: [{ arrayStride: 24, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }, { shaderLocation: 1, offset: 8, format: "float32x4" }] }] },
+          fragment: { module: ps, entryPoint: "main", targets: [{ format: "rgba32float" }] },
+        });
+        const vertices = device.createBuffer({ size: draw.vertices.length * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(vertices, 0, new Float32Array(draw.vertices));
+        const sgprs = device.createBuffer({ size: 512, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(sgprs, 0, new Uint32Array(draw.sgprs));
+        const n = draw.size;
+        const target = device.createTexture({ size: [n, n], format: "rgba32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+        const read = device.createBuffer({ size: n * n * 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginRenderPass({ colorAttachments: [{ view: target.createView(), clearValue: draw.clear, loadOp: "clear", storeOp: "store" }] });
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: sgprs } }] }));
+        pass.setVertexBuffer(0, vertices);
+        pass.draw(3);
+        pass.end();
+        encoder.copyTextureToBuffer({ texture: target }, { buffer: read, bytesPerRow: n * 16 }, [n, n]);
+        device.queue.submit([encoder.finish()]);
+        const error = await device.popErrorScope();
+        if (error) drawn = { error: error.message };
+        else {
+          await read.mapAsync(GPUMapMode.READ);
+          drawn = { pixels: [...new Float32Array(read.getMappedRange())] };
+        }
+      }
+    }
     const info = gpuAdapter.info ?? {};
-    return { adapter: `${info.vendor ?? "?"} ${info.architecture ?? ""} ${info.description ?? ""}`.trim(), results };
-  }, programs);
+    return { adapter: `${info.vendor ?? "?"} ${info.architecture ?? ""} ${info.description ?? ""}`.trim(), results, drawn };
+  }, { programs, draw });
   assert.ok(adapter, "no WebGPU adapter in this Chromium");
   let failed = 0;
   cases.forEach((c, i) => {
@@ -229,7 +303,21 @@ try {
       console.log(`FAIL ${c.name}: ${String(e.message).slice(0, 600)}`);
     }
   });
-  console.log(`wgsl kernel tests on WebGPU (${adapter}): ${cases.length - failed} passed, ${failed} failed`);
+  try {
+    assert.ok(!drawn.error, drawn.error);
+    for (let y = 0; y < draw.size; y++) {
+      for (let x = 0; x < draw.size; x++) {
+        const got = drawn.pixels.slice((y * draw.size + x) * 4, (y * draw.size + x) * 4 + 4);
+        const want = x >= 8 ? [0.4, 0.6, 0.4, 1] : draw.clear;
+        assert.ok(got.every((g, i) => Math.abs(g - want[i]) < 1e-5), `pixel (${x}, ${y}) = ${got}, expected ${want}`);
+      }
+    }
+  } catch (e) {
+    failed += 1;
+    console.log(`FAIL a draw with a vertex and a pixel program: ${String(e.message).slice(0, 600)}`);
+  }
+  const total = cases.length + 1;
+  console.log(`wgsl tests on WebGPU (${adapter}): ${total - failed} passed, ${failed} failed (${cases.length} kernels, 1 draw)`);
   process.exitCode = failed ? 1 : 0;
 } finally {
   await browser.close();
