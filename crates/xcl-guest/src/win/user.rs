@@ -98,10 +98,93 @@ fn IGameInput_GetCurrentTimestamp(g: &mut Guest) -> H {
     Ok(g.now_ns() / 1000 + 1)
 }
 
+const GAMEINPUT_E_DEVICE_NOT_FOUND: u64 = 0x838A_0002;
+const GAMEINPUT_E_READING_NOT_FOUND: u64 = 0x838A_0003;
+
+/// IGameInput's methods in vtable order. There are no devices: a reading or a device is not
+/// found, and a callback is registered and never called.
+const IGAMEINPUT: [&str; 22] = [
+    "IGameInput_QueryInterface",
+    "IGameInput_AddRef",
+    "IGameInput_Release",
+    "IGameInput_GetCurrentTimestamp",
+    "IGameInput_GetCurrentReading",
+    "IGameInput_GetNextReading",
+    "IGameInput_GetPreviousReading",
+    "IGameInput_GetTemporalReading",
+    "IGameInput_RegisterReadingCallback",
+    "IGameInput_RegisterDeviceCallback",
+    "IGameInput_RegisterSystemButtonCallback",
+    "IGameInput_RegisterKeyboardLayoutCallback",
+    "IGameInput_StopCallback",
+    "IGameInput_UnregisterCallback",
+    "IGameInput_CreateDispatcher",
+    "IGameInput_CreateAggregateDevice",
+    "IGameInput_FindDeviceFromId",
+    "IGameInput_FindDeviceFromObject",
+    "IGameInput_FindDeviceFromPlatformHandle",
+    "IGameInput_FindDeviceFromPlatformString",
+    "IGameInput_EnableOemDeviceSupport",
+    "IGameInput_SetFocusPolicy",
+];
+
+/// Write 0 to the result pointer that is argument `out` and answer `result`.
+fn com_nothing(g: &mut Guest, out: usize, result: u64) -> H {
+    let at = g.arg(out)?;
+    if at != 0 {
+        g.mem.write_u64(at, 0)?;
+    }
+    Ok(result)
+}
+
+/// GetCurrentReading(this, kind, device, reading out)
+fn IGameInput_GetCurrentReading(g: &mut Guest) -> H {
+    com_nothing(g, 3, GAMEINPUT_E_READING_NOT_FOUND)
+}
+
+/// GetNextReading / GetPreviousReading(this, reference reading, kind, device, reading out)
+fn IGameInput_GetNextReading(g: &mut Guest) -> H {
+    com_nothing(g, 4, GAMEINPUT_E_READING_NOT_FOUND)
+}
+
+/// The callback registrations: their token (the last argument) is 1.
+fn register_callback(g: &mut Guest, token: usize) -> H {
+    let at = g.arg(token)?;
+    if at != 0 {
+        g.mem.write_u64(at, 1)?;
+    }
+    Ok(0)
+}
+
+/// RegisterReadingCallback(this, device, kind, threshold, context, callback, token out)
+fn IGameInput_RegisterReadingCallback(g: &mut Guest) -> H {
+    register_callback(g, 6)
+}
+
+/// RegisterDeviceCallback(this, device, kind, status filter, enumeration, context, callback, token out)
+fn IGameInput_RegisterDeviceCallback(g: &mut Guest) -> H {
+    register_callback(g, 7)
+}
+
+/// RegisterSystemButtonCallback(this, device, buttons, context, callback, token out)
+fn IGameInput_RegisterSystemButtonCallback(g: &mut Guest) -> H {
+    register_callback(g, 5)
+}
+
+/// RegisterKeyboardLayoutCallback(this, device, context, callback, token out)
+fn IGameInput_RegisterKeyboardLayoutCallback(g: &mut Guest) -> H {
+    register_callback(g, 4)
+}
+
+/// FindDeviceFrom…(this, what, device out)
+fn IGameInput_FindDevice(g: &mut Guest) -> H {
+    com_nothing(g, 2, GAMEINPUT_E_DEVICE_NOT_FOUND)
+}
+
 /// GameInputCreate(out): IGameInput. Its timestamps advance; there are no devices yet.
 fn GameInputCreate(g: &mut Guest) -> H {
     let out = g.arg(0)?;
-    let object = g.com_object("IGameInput", &["IGameInput_QueryInterface", "IGameInput_AddRef", "IGameInput_Release", "IGameInput_GetCurrentTimestamp"])?;
+    let object = g.com_object("IGameInput", &IGAMEINPUT)?;
     g.mem.write_u64(out, object)?;
     Ok(0)
 }
@@ -113,4 +196,48 @@ pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
     map.insert("IGameInput_QueryInterface", com_no_interface as Handler);
     map.insert("IGameInput_AddRef", com_refcount as Handler);
     map.insert("IGameInput_Release", com_ok as Handler);
+    register!(map; IGameInput_GetCurrentReading, IGameInput_GetNextReading);
+    register!(map; IGameInput_RegisterReadingCallback, IGameInput_RegisterDeviceCallback, IGameInput_RegisterSystemButtonCallback, IGameInput_RegisterKeyboardLayoutCallback);
+    map.insert("IGameInput_GetPreviousReading", IGameInput_GetNextReading as Handler);
+    for name in ["IGameInput_FindDeviceFromId", "IGameInput_FindDeviceFromObject", "IGameInput_FindDeviceFromPlatformHandle", "IGameInput_FindDeviceFromPlatformString"] {
+        map.insert(name, IGameInput_FindDevice as Handler);
+    }
+    // nothing to stop: no callback is ever running (UnregisterCallback says so with `true`)
+    map.insert("IGameInput_StopCallback", com_ok as Handler);
+    map.insert("IGameInput_UnregisterCallback", com_refcount as Handler);
+    map.insert("IGameInput_SetFocusPolicy", com_ok as Handler);
+}
+
+#[cfg(test)]
+mod tests {
+    use xcl_emu::cpu::{RCX, RDX, RSP};
+    use xcl_emu::mem::{PROT_R, PROT_W};
+
+    use super::*;
+
+    #[test]
+    fn game_input_has_all_its_methods_and_no_devices() {
+        let mut g = Guest::new();
+        let stack = g.mem.alloc(0x4000, PROT_R | PROT_W).unwrap();
+        g.add_thread(stack, stack + 0x4000, 0, 0, crate::SLOT_THREAD_RETURN).unwrap();
+        g.cpu = g.threads[0].cpu.clone();
+        let page = g.mem.alloc(0x1000, PROT_R | PROT_W).unwrap();
+        g.cpu.r[RCX] = page;
+        assert_eq!(GameInputCreate(&mut g), Ok(0));
+        let object = g.mem.read_u64(page).unwrap();
+        let vtable = g.mem.read_u64(object).unwrap();
+        // every slot of the interface is a function: none is left 0 for a title to jump to
+        for slot in 0..IGAMEINPUT.len() as u64 {
+            assert_ne!(g.mem.read_u64(vtable + 8 * slot).unwrap(), 0, "slot {slot}");
+        }
+        // GetCurrentReading(this, kind, device, reading out)
+        g.mem.write_u64(page + 8, 7).unwrap();
+        (g.cpu.r[RCX], g.cpu.r[RDX], g.cpu.r[8], g.cpu.r[9]) = (object, 0xE, 0, page + 8);
+        assert_eq!(IGameInput_GetCurrentReading(&mut g), Ok(GAMEINPUT_E_READING_NOT_FOUND));
+        assert_eq!(g.mem.read_u64(page + 8).unwrap(), 0);
+        // RegisterDeviceCallback: the token is the eighth argument, on the stack
+        g.mem.write_u64(g.cpu.r[RSP] + 8 + 8 * 7, page + 16).unwrap();
+        assert_eq!(IGameInput_RegisterDeviceCallback(&mut g), Ok(0));
+        assert_eq!(g.mem.read_u64(page + 16).unwrap(), 1);
+    }
 }

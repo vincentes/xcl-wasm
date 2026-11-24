@@ -9,6 +9,14 @@ use crate::{Guest, Module, SLOT_ENTRY_RETURN};
 
 const IMAGE_REL_BASED_DIR64: u16 = 10;
 
+/// The name of a function a title imports by its number: the host finds its functions by name.
+fn ordinal_name(dll: &str, ordinal: u16) -> Option<&'static str> {
+    match (dll.to_ascii_lowercase().as_str(), ordinal) {
+        ("gameinput.dll", 1) => Some("GameInputCreate"),
+        _ => None,
+    }
+}
+
 impl Guest {
     /// Map the image `data` (a PE file) and bind its imports. Returns its index in `modules`.
     pub fn map_image(&mut self, name: &str, data: &[u8]) -> Result<usize, String> {
@@ -46,7 +54,7 @@ impl Guest {
             for e in &dll.entries {
                 let function = match &e.what {
                     ImportName::Name { name, .. } => name.clone(),
-                    ImportName::Ordinal(o) => format!("#{o}"),
+                    ImportName::Ordinal(o) => ordinal_name(&dll.dll, *o).map_or_else(|| format!("#{o}"), str::to_string),
                 };
                 let target = match game_dll.and_then(|m| self.modules[m].exports.get(&function).copied()) {
                     Some(address) => address,
@@ -137,5 +145,19 @@ impl Guest {
         }
         (self.cpu.r[RSP], self.cpu.rip) = entry_state;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_function_imported_by_number_has_its_name() {
+        assert_eq!(ordinal_name("GameInput.dll", 1), Some("GameInputCreate"));
+        assert_eq!(ordinal_name("GameInput.dll", 2), None);
+        // the number alone says nothing: another DLL's #1 is another function
+        assert_eq!(ordinal_name("xaudio2_9.dll", 1), None);
+        assert!(Guest::new().has_handler("GameInputCreate"));
     }
 }
