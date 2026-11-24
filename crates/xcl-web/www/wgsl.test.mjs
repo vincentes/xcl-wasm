@@ -477,7 +477,28 @@ const draw2 = {
 function halfValue(h) {
   return (h >> 10) === 0 ? (h & 0x3ff) * 2 ** -24 : (0x400 | (h & 0x3ff)) * 2 ** ((h >> 10) - 25);
 }
-const draws = [draw, draw2].map(({ expect, ...d }) => d);
+// a texture: the pixel program samples it at the attribute (a coordinate over the target, so
+// each pixel gets one texel with a nearest sampler) and loads the texel at the pixel's place
+const texel = (x, y) => [x * 16 + y, 255 - x * 8, y * 16, 255];
+const draw3 = {
+  ...draw,
+  pixel: xcl.wgslPixel(xcl.assemble([
+    "V_INTERP_P2_F32 ENC_VINTRP VDST=4 VSRC=1 ATTR=0 ATTRCHAN=0",
+    "V_INTERP_P2_F32 ENC_VINTRP VDST=5 VSRC=1 ATTR=0 ATTRCHAN=1",
+    "IMAGE_SAMPLE ENC_MIMG VDATA=8 VADDR=4 SRSRC=2 SSAMP=4 DMASK=7 DIM=1", // v8..10 = rgb
+    `V_CVT_I32_F32 ENC_VOP1 VDST=12 SRC0=${V(2)}`, // the pixel's x and y
+    `V_CVT_I32_F32 ENC_VOP1 VDST=13 SRC0=${V(3)}`,
+    "IMAGE_LOAD ENC_MIMG VDATA=11 VADDR=12 SRSRC=2 DMASK=1 DIM=1", // v11 = red
+    "EXP ENC_EXP TGT=0 EN=15 VSRC0=8 VSRC1=9 VSRC2=10 VSRC3=11 DONE=1 VM=1",
+  ]), 0x302),
+  vertices: [[-1, -1, 0, 0], [-1, 3, 0, 2], [3, -1, 2, 0]].flatMap((v) => [...v, 0, 0]),
+  textures: [{ size: 16, data: Array.from({ length: 256 }, (_, k) => texel(k % 16, k >> 4)).flat() }],
+  // slot 0: sampled; slot 1: the same texture loaded
+  images: [{ texture: 0, sampler: true }, { texture: 0 }],
+  // the target's rows go down, the coordinate up
+  expect: (x, y) => [...texel(x, 15 - y).slice(0, 3), texel(x, y)[0]].map((c) => c / 255),
+};
+const draws = [draw, draw2, draw3].map(({ expect, ...d }) => d);
 
 // --- run them
 const programs = cases.map((c) => ({ name: c.name, wgsl: xcl.wgslKernel(xcl.assemble(c.program)), io: [...c.io], mem: c.mem }));
@@ -569,6 +590,16 @@ try {
           entries.push({ binding: 1, resource: { buffer: memory } });
         }
         pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries }));
+        if (draw.images) {
+          const textures = draw.textures.map((t) => {
+            const texture = device.createTexture({ size: [t.size, t.size], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+            device.queue.writeTexture({ texture }, new Uint8Array(t.data), { bytesPerRow: t.size * 4 }, [t.size, t.size]);
+            return texture;
+          });
+          const sampler = device.createSampler({ magFilter: "nearest", minFilter: "nearest" });
+          const images = draw.images.flatMap((image, k) => [{ binding: 2 * k, resource: textures[image.texture].createView() }, ...(image.sampler ? [{ binding: 2 * k + 1, resource: sampler }] : [])]);
+          pass.setBindGroup(1, device.createBindGroup({ layout: pipeline.getBindGroupLayout(1), entries: images }));
+        }
         pass.setVertexBuffer(0, vertices);
         pass.draw(3);
         pass.end();
@@ -596,13 +627,13 @@ try {
       console.log(`FAIL ${c.name}: ${String(e.message).slice(0, 600)}`);
     }
   });
-  [draw, draw2].forEach((d, n) => {
+  [draw, draw2, draw3].forEach((d, n) => {
     try {
       assert.ok(!drawn[n].error, drawn[n].error);
       for (let y = 0; y < d.size; y++) {
         for (let x = 0; x < d.size; x++) {
           const got = drawn[n].pixels.slice((y * d.size + x) * 4, (y * d.size + x) * 4 + 4);
-          const want = d.expect(x);
+          const want = d.expect(x, y);
           assert.ok(got.every((g, i) => Math.abs(g - want[i]) < 1e-5), `pixel (${x}, ${y}) = ${got}, expected ${want}`);
         }
       }
@@ -611,8 +642,8 @@ try {
       console.log(`FAIL draw ${n + 1} with a vertex and a pixel program: ${String(e.message).slice(0, 600)}`);
     }
   });
-  const total = cases.length + 2;
-  console.log(`wgsl tests on WebGPU (${adapter}): ${total - failed} passed, ${failed} failed (${cases.length} kernels, 2 draws)`);
+  const total = cases.length + 3;
+  console.log(`wgsl tests on WebGPU (${adapter}): ${total - failed} passed, ${failed} failed (${cases.length} kernels, 3 draws)`);
   process.exitCode = failed ? 1 : 0;
 } finally {
   await browser.close();

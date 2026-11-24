@@ -2,7 +2,8 @@
 //! instructions – 32-bit float and integer arithmetic, compares, selects, the scalar unit,
 //! branches, exports and attribute interpolation – as a kernel (the program runs on a register
 //! file, as the HLSL back end's instruction tests do), a vertex stage or a pixel stage. Memory
-//! is read (dword loads through a pointer or a buffer descriptor), not written; no textures.
+//! is read (dword loads through a pointer or a buffer descriptor), not written. Textures: 2D
+//! samples and loads (see below).
 //!
 //! WGSL has no wave of 64 lanes to rely on (the HLSL back end pins one with `WaveSize(64)` and
 //! uses wave intrinsics). A program is written for a wave of `LANES` lanes: a vector register
@@ -18,6 +19,15 @@
 //! Kernel ABI (the HLSL back end's): `io` holds 128 SGPR slots (106 / 107 VCC, 126 / 127 EXEC,
 //! 125 SCC) and then, per lane, 256 VGPRs; `res` gets the same back, and after it the exports
 //! as raw dwords (`KERNEL_EXPORTS + (target · 64 + lane) · 4 + component`).
+//!
+//! Images. The HLSL back end takes a texture from the descriptor heap by the index its T#
+//! holds when the instruction runs; WebGPU has no heap to index, so a texture is a binding
+//! and whoever draws has to know **before the draw** which texture each one is. Every image
+//! instruction therefore gets a slot (`Translation::images`; texture at group 1 binding 2·slot,
+//! sampler at 2·slot + 1) with where its descriptors come from (`Origin`: registers the
+//! program starts with, or a chain of loads from a pointer in them), found by following the
+//! registers back through the program's loads. A descriptor the program computes any other
+//! way is refused.
 //!
 //! Memory is one read-only array of dwords (`mem`, declared when the program loads: binding 2
 //! of a kernel, 1 of a stage) addressed by the low half of a pointer; a load outside it is 0.
@@ -41,6 +51,96 @@ pub struct Translation {
     pub dwords: usize,
     /// the program reads memory: `mem` is declared
     pub memory: bool,
+    /// the textures and samplers the program uses, by slot
+    pub images: Vec<Image>,
+}
+
+/// Where a descriptor an image instruction uses comes from: with no `loads`, the registers
+/// from `sgpr` as the program starts; else the pointer in `sgpr` (and the next register), each
+/// offset but the last a pointer loaded from it, the last the descriptor's place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    pub sgpr: u64,
+    pub loads: Vec<u32>,
+}
+
+/// A texture (and the sampler it is read with) of a program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    pub texture: Origin,
+    /// None: only loaded (`image_load`)
+    pub sampler: Option<Origin>,
+}
+
+/// An image instruction this back end has, taken apart.
+struct ImageOp {
+    /// a sample (else a load of a texel)
+    sample: bool,
+    /// address registers: bias, the coordinates, lod / mip
+    bias: Option<u64>,
+    coords: [u64; 2],
+    lod: Option<u64>,
+    /// `_lz`: level 0
+    zero: bool,
+    vdata: u64,
+    dmask: u64,
+    srsrc: u64,
+    ssamp: u64,
+}
+
+fn image_op(d: &Decoded, name: &str) -> Result<ImageOp, String> {
+    let get = |n: &str| field(d, n).unwrap_or(0);
+    let (sample, bias, lod, zero) = match name {
+        "image_sample" => (true, false, false, false),
+        "image_sample_lz" => (true, false, false, true),
+        "image_sample_l" => (true, false, true, false),
+        "image_sample_b" => (true, true, false, false),
+        "image_load" => (false, false, false, false),
+        "image_load_mip" => (false, false, true, false),
+        _ => return Err(name.into()),
+    };
+    if get("DIM") != 1 {
+        return Err(format!("{name} of dimension {}", get("DIM")));
+    }
+    if ["TFE", "LWE", "A16", "D16"].iter().any(|f| get(f) != 0) {
+        return Err(format!("{name} tfe / lwe / a16 / d16"));
+    }
+    // non-sequential addresses: VADDR, then VADDRA, VADDRB … of the longer encoding
+    let nsa = get("NSA");
+    let wide = rdna2::encoding(&format!("MIMG_NSA{nsa}"));
+    let addr = |j: u64| match wide {
+        Some(e) if nsa > 0 && j > 0 => rdna2::field_value(e, &d.words, &format!("VADDR{}", (b'A' + (j - 1) as u8) as char)).unwrap_or(0),
+        _ => get("VADDR") + j,
+    };
+    let first = bias as u64;
+    Ok(ImageOp {
+        sample,
+        bias: bias.then(|| addr(0)),
+        coords: [addr(first), addr(first + 1)],
+        lod: lod.then(|| addr(first + 2)),
+        zero,
+        vdata: get("VDATA"),
+        dmask: get("DMASK"),
+        srsrc: register(d, "SRSRC")?,
+        ssamp: register(d, "SSAMP")?,
+    })
+}
+
+/// Where SGPR `reg` as the instruction `insts[at]` reads it comes from (see `Origin`).
+fn origin(insts: &[Decoded], at: usize, reg: u64) -> Result<Origin, String> {
+    let Some(def) = (0..at).rev().find(|&k| rdna2::sgpr_uses(&insts[k]).1.contains(&reg)) else {
+        return Ok(Origin { sgpr: reg, loads: Vec::new() });
+    };
+    let d = &insts[def];
+    let name = d.inst.name.to_ascii_lowercase();
+    let get = |n: &str| field(d, n).unwrap_or(0);
+    if !name.starts_with("s_load_dword") || get("SOFFSET") != 125 {
+        return Err(format!("a descriptor in s{reg}, which {name} at +{:#x} writes", d.pc));
+    }
+    let mut from = origin(insts, def, register(d, "SBASE")?)?;
+    let imm = (((get("OFFSET") as u32) << 11) as i32 >> 11) as u32;
+    from.loads.push(imm.wrapping_add(4 * (reg - get("SDATA")) as u32));
+    Ok(from)
 }
 
 /// Dwords a load instruction reads (None: not a dword load).
@@ -423,10 +523,33 @@ fn f16_rtz(f: f32) -> u32 { let b = bitcast<u32>(f); let sign = (b >> 16u) & 0x8
 ";
 
 /// One instruction as WGSL statements (branches are the caller's).
-fn statement(d: &Decoded, stage: Stage) -> Result<String, String> {
+fn statement(d: &Decoded, stage: Stage, slots: &BTreeMap<u64, usize>) -> Result<String, String> {
     let name = d.inst.name.to_ascii_lowercase();
     let lit = d.literal;
     let enc = d.enc.name;
+    if name.starts_with("image_") {
+        let op = image_op(d, &name)?;
+        let k = slots.get(&d.pc).ok_or(&name)?;
+        let value = if op.sample {
+            let uv = format!("vec2<f32>(bitcast<f32>(v{}[l]), bitcast<f32>(v{}[l]))", op.coords[0], op.coords[1]);
+            match (op.bias, op.lod, op.zero, stage) {
+                (Some(b), ..) if matches!(stage, Stage::Pixel { .. }) => format!("textureSampleBias(t{k}, p{k}, {uv}, bitcast<f32>(v{b}[l]))"),
+                (_, Some(lod), ..) => format!("textureSampleLevel(t{k}, p{k}, {uv}, bitcast<f32>(v{lod}[l]))"),
+                // the level a pixel's neighbours give; anything else has no neighbours: level 0
+                (None, None, false, Stage::Pixel { .. }) => format!("textureSample(t{k}, p{k}, {uv})"),
+                _ => format!("textureSampleLevel(t{k}, p{k}, {uv}, 0.0)"),
+            }
+        } else {
+            let level = op.lod.map(|r| format!("bitcast<i32>(v{r}[l])")).unwrap_or_else(|| "0".into());
+            format!("textureLoad(t{k}, vec2<i32>(bitcast<i32>(v{}[l]), bitcast<i32>(v{}[l])), {level})", op.coords[0], op.coords[1])
+        };
+        // the components DMASK names, in consecutive registers
+        let mut text = format!("let t = {value}; ");
+        for (n, c) in (0..4).filter(|c| op.dmask >> c & 1 == 1).enumerate() {
+            let _ = write!(text, "v{}[l] = bitcast<u32>(t[{c}]); ", op.vdata + n as u64);
+        }
+        return Ok(format!("for (var l = 0u; l < LANES; l++) {{ if (on(exec, l)) {{ {text}}} }}"));
+    }
     if name == "exp" {
         let get = |n: &str| field(d, n).unwrap_or(0);
         let compr = get("COMPR") != 0;
@@ -697,6 +820,33 @@ pub fn translate(code: &[u8], stage: Stage) -> Result<Translation, String> {
     // what the stage's interface has: exp param N / mrt N, interpolated attributes
     let (mut params, mut targets, mut attrs) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
     let mut memory = false;
+    let mut images: Vec<Image> = Vec::new();
+    let mut slots: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut refused: Vec<String> = Vec::new();
+    for (at, d) in insts.iter().enumerate() {
+        let name = d.inst.name.to_ascii_lowercase();
+        if let Ok(op) = image_op(d, &name) {
+            vgprs.extend(op.bias.iter().chain(&op.coords).chain(&op.lod).copied());
+            let data = op.vdata..op.vdata + op.dmask.count_ones() as u64;
+            vgprs.extend(data.clone());
+            written.extend(data);
+            let sampler = if op.sample { origin(&insts, at, op.ssamp).map(Some) } else { Ok(None) };
+            match (origin(&insts, at, op.srsrc), sampler) {
+                (Ok(texture), Ok(sampler)) => {
+                    let image = Image { texture, sampler };
+                    let slot = images.iter().position(|i| *i == image).unwrap_or_else(|| {
+                        images.push(image);
+                        images.len() - 1
+                    });
+                    slots.insert(d.pc, slot);
+                }
+                (Err(e), _) | (_, Err(e)) => refused.push(e),
+            }
+        }
+    }
+    if let Some(e) = refused.first() {
+        return Err(format!("+ {} more: {e}", refused.len() - 1).trim_start_matches("+ 0 more: ").to_string());
+    }
     for d in &insts {
         let (r, w) = rdna2::vgpr_uses(d);
         vgprs.extend(r.iter().copied());
@@ -784,7 +934,7 @@ pub fn translate(code: &[u8], stage: Stage) -> Result<Translation, String> {
             open = false;
             continue;
         }
-        match statement(d, stage) {
+        match statement(d, stage, &slots) {
             Ok(text) if text.is_empty() => {}
             Ok(text) => {
                 let _ = writeln!(body, "        {text}");
@@ -804,7 +954,18 @@ pub fn translate(code: &[u8], stage: Stage) -> Result<Translation, String> {
     let lanes = if kernel { KERNEL_LANES } else { 1 };
     let mut w = String::new();
     let _ = writeln!(w, "// RDNA2 program ({stage:?}), made by XCL (gpu::recomp::wgsl).");
+    if !images.is_empty() {
+        // the dispatcher is not uniform control flow, which a sample at an implicit level asks for
+        let _ = writeln!(w, "diagnostic(off, derivative_uniformity);");
+    }
     let _ = writeln!(w, "const LANES = {lanes}u;");
+    for (k, image) in images.iter().enumerate() {
+        let _ = writeln!(w, "// image {k}: texture {:?}, sampler {:?}", image.texture, image.sampler);
+        let _ = writeln!(w, "@group(1) @binding({}) var t{k}: texture_2d<f32>;", 2 * k);
+        if image.sampler.is_some() {
+            let _ = writeln!(w, "@group(1) @binding({}) var p{k}: sampler;", 2 * k + 1);
+        }
+    }
     if kernel {
         let _ = writeln!(w, "@group(0) @binding(0) var<storage, read> io: array<u32>;");
         let _ = writeln!(w, "@group(0) @binding(1) var<storage, read_write> res: array<u32>;");
@@ -901,7 +1062,7 @@ pub fn translate(code: &[u8], stage: Stage) -> Result<Translation, String> {
         }
     }
     let _ = writeln!(w, "}}");
-    Ok(Translation { wgsl: w, dwords: total, memory })
+    Ok(Translation { wgsl: w, dwords: total, memory, images })
 }
 
 #[cfg(test)]
@@ -981,6 +1142,47 @@ mod tests {
         // in a stage the array is binding 1
         let t = translate(&code, Stage::Vertex { attr_base: 4, attributes: 0 }).unwrap();
         assert!(t.wgsl.contains("@group(0) @binding(1) var<storage, read> mem") && t.wgsl.contains("unpack2x16float(((v3[l] >> 0u) & 0xffffu)).x"), "{}", t.wgsl);
+    }
+
+    #[test]
+    fn an_image_instruction_gets_a_slot_and_its_descriptors_origin() {
+        let ps = asm(&[
+            // s8.. = the T# at [s2 + 0x20]; s4:s5 = the pointer at [s2 + 8]; s16.. = the S# at [that + 0x40]
+            ("S_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 1), ("OFFSET", 0x20), ("SOFFSET", 125)], None),
+            ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 1), ("OFFSET", 8), ("SOFFSET", 125)], None),
+            ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 2), ("OFFSET", 0x40), ("SOFFSET", 125)], None),
+            ("IMAGE_SAMPLE", "ENC_MIMG", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 2), ("SSAMP", 4), ("DMASK", 0xB), ("DIM", 1)], None),
+            // the same texture and sampler again at level 0, and a texel of the texture in s24..
+            ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 8), ("VADDR", 0), ("SRSRC", 2), ("SSAMP", 4), ("DMASK", 0x1), ("DIM", 1)], None),
+            ("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", 9), ("VADDR", 2), ("SRSRC", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 8), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let t = translate(&ps, Stage::Pixel { input_ena: 0 }).unwrap();
+        assert_eq!(
+            t.images,
+            [
+                Image { texture: Origin { sgpr: 2, loads: vec![0x20] }, sampler: Some(Origin { sgpr: 2, loads: vec![8, 0x40] }) },
+                Image { texture: Origin { sgpr: 24, loads: vec![] }, sampler: None },
+            ]
+        );
+        assert!(t.wgsl.starts_with("// RDNA2 program") && t.wgsl.contains("diagnostic(off, derivative_uniformity);\nconst LANES"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("@group(1) @binding(0) var t0: texture_2d<f32>;") && t.wgsl.contains("@group(1) @binding(1) var p0: sampler;"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("@group(1) @binding(2) var t1: texture_2d<f32>;") && !t.wgsl.contains("var p1"), "{}", t.wgsl);
+        // DMASK 0xB: x, y and w into three registers
+        assert!(t.wgsl.contains("let t = textureSample(t0, p0, vec2<f32>(bitcast<f32>(v0[l]), bitcast<f32>(v1[l]))); v4[l] = bitcast<u32>(t[0]); v5[l] = bitcast<u32>(t[1]); v6[l] = bitcast<u32>(t[3]);"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("let t = textureSampleLevel(t0, p0, vec2<f32>(bitcast<f32>(v0[l]), bitcast<f32>(v1[l])), 0.0); v8[l]"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("let t = textureLoad(t1, vec2<i32>(bitcast<i32>(v2[l]), bitcast<i32>(v3[l])), 0);"), "{}", t.wgsl);
+        // a vertex has no neighbours: level 0
+        let t = translate(&ps[..ps.len() - 8], Stage::Vertex { attr_base: 4, attributes: 0 }).unwrap();
+        assert!(!t.wgsl.contains("textureSample(") && t.wgsl.matches("textureSampleLevel(").count() == 2, "{}", t.wgsl);
+        // a descriptor the program computes is refused; so is a cube for now
+        let made = asm(&[
+            ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 8), ("SIMM16", 5)], None),
+            ("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", 9), ("VADDR", 2), ("SRSRC", 2), ("DMASK", 0xF), ("DIM", 1)], None),
+        ]);
+        assert!(translate_kernel(&made).err().unwrap().contains("a descriptor in s8, which s_movk_i32 at +0x0 writes"));
+        let cube = asm(&[("IMAGE_SAMPLE", "ENC_MIMG", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 2), ("SSAMP", 4), ("DMASK", 0xF), ("DIM", 3)], None)]);
+        assert!(translate_kernel(&cube).err().unwrap().contains("image_sample of dimension 3"));
     }
 
     #[test]
