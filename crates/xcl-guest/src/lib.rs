@@ -17,6 +17,7 @@ use xcl_emu::cpu::{Cpu, Exit};
 use xcl_emu::mem::{Fault, Memory};
 
 pub mod loader;
+pub mod vfs;
 pub mod win;
 
 pub const TRAP_BASE: u64 = 0x0000_7FFE_0000_0000;
@@ -76,6 +77,9 @@ pub struct Module {
     pub base: u64,
     pub size: u64,
     pub entry: u64,
+    pub is_dll: bool,
+    /// its exported functions by name
+    pub exports: HashMap<String, u64>,
     /// its function table (`.pdata`): address and number of RUNTIME_FUNCTION entries
     pub pdata: u64,
     pub pdata_count: u32,
@@ -116,12 +120,18 @@ pub struct Guest {
     pub threads: Vec<Thread>,
     pub current: usize,
     pub mem: Memory,
+    /// the title's files: the game folder and what the title changed
+    pub vfs: vfs::Vfs,
     pub modules: Vec<Module>,
+    /// index of the executable in `modules` (game DLLs it imports are mapped before it)
+    pub exe: usize,
     pub imports: Vec<Import>,
     import_slots: HashMap<String, u32>,
     handlers: HashMap<&'static str, Handler>,
     /// what GetCommandLineW answers
     pub command_line: String,
+    /// game DLLs being mapped (they import each other?)
+    loading: Vec<String>,
     /// stop at a function the host does not implement (otherwise: log it once, return 0)
     pub strict: bool,
     /// what the title wrote to its standard output and error
@@ -149,11 +159,14 @@ impl Guest {
             threads: Vec::new(),
             current: 0,
             mem: Memory::new(),
+            vfs: vfs::Vfs::default(),
             modules: Vec::new(),
+            exe: 0,
             imports: Vec::new(),
             import_slots: HashMap::new(),
             handlers: win::handlers(),
             command_line: "title.exe".into(),
+            loading: Vec::new(),
             strict: false,
             output: Vec::new(),
             log: Vec::new(),
@@ -318,6 +331,12 @@ impl Guest {
                 None => return Stop::Deadlock,
             }
         }
+    }
+
+    /// After `Stop::Unimplemented`: answer the call the title is in with `value` (as the stub
+    /// of lenient mode does), so that `run` can go on.
+    pub fn answer_import(&mut self, value: u64) -> Result<(), Stop> {
+        Ok(abi::ret(&mut self.cpu, &self.mem, value)?)
     }
 
     fn import_call(&mut self, index: usize) -> Result<(), Stop> {

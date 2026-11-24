@@ -8,9 +8,10 @@ The part of XCL that needs no Windows, built as a WebAssembly module for the bro
 - `xcl disasm` – console shader blobs: containers and RDNA2 listing
 - **run** – a title's x64 code on the guest (`crates/xcl-emu`, `crates/xcl-guest`): the image is
   loaded into guest memory, an interpreter executes it and the host answers the functions it
-  imports. XCL's own test title runs to its end this way and passes 15 of its 50 checks (threads,
-  static TLS, exceptions, title memory); the rest need what the guest does not have yet: files,
-  XGameRuntime, game DLLs, D3D12.X, audio, input. **No retail game runs**: there is no graphics.
+  imports. XCL's own test title runs to its end this way and passes 26 of its 50 checks (threads,
+  static TLS, exceptions, title memory, files with the overlay, its game DLL, the console's
+  window); the rest need what the guest does not have yet: XGameRuntime, D3D12.X, DirectStorage,
+  audio. **No retail game runs**: there is no graphics.
 
 `inspect` here does not say whether XCL implements each imported function (the Windows build
 does): the function tables are part of the Windows-only code.

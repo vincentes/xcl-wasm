@@ -180,6 +180,8 @@ fn signaled(g: &mut Guest, handle: u64) -> Option<bool> {
             }
             fired
         }
+        // a file is always "signaled": its I/O is done when the call returns
+        Object::File(_) | Object::Find(_) | Object::Window => true,
     })
 }
 
@@ -536,37 +538,6 @@ fn WriteConsoleW(g: &mut Guest) -> H {
     Ok(1)
 }
 
-fn WriteFile(g: &mut Guest) -> H {
-    let (handle, at, len, written) = (g.arg(0)?, g.arg(1)?, g.arg(2)? as u32, g.arg(3)?);
-    if handle != STDOUT && handle != STDERR {
-        g.set_last_error(ERROR_INVALID_HANDLE);
-        return Ok(0);
-    }
-    let mut bytes = vec![0u8; len as usize];
-    g.mem.read(at, &mut bytes)?;
-    g.write_std(&bytes);
-    if written != 0 {
-        g.mem.write_u32(written, len)?;
-    }
-    Ok(1)
-}
-
-/// NtWriteFile(handle, event, apc, apc context, io status block, buffer, length, offset, key)
-fn NtWriteFile(g: &mut Guest) -> H {
-    let (handle, iosb, at, len) = (g.arg(0)?, g.arg(4)?, g.arg(5)?, g.arg(6)? as u32);
-    if handle != STDOUT && handle != STDERR {
-        return Ok(0xC000_0008); // STATUS_INVALID_HANDLE
-    }
-    let mut bytes = vec![0u8; len as usize];
-    g.mem.read(at, &mut bytes)?;
-    g.write_std(&bytes);
-    if iosb != 0 {
-        g.mem.write_u64(iosb, 0)?;
-        g.mem.write_u64(iosb + 8, len as u64)?;
-    }
-    Ok(0)
-}
-
 /// NtQueryVolumeInformationFile(handle, io status block, buffer, length, class): the standard
 /// handles are pipes (FileFsDeviceInformation), so a title writes them bytes, not console text.
 fn NtQueryVolumeInformationFile(g: &mut Guest) -> H {
@@ -600,7 +571,7 @@ fn RtlNtStatusToDosError(g: &mut Guest) -> H {
 fn module_base(g: &Guest, name: &str) -> u64 {
     let file = name.rsplit(['\\', '/']).next().unwrap_or(name).to_ascii_lowercase();
     if file.is_empty() {
-        return g.modules.first().map_or(0, |m| m.base);
+        return g.modules.get(g.exe).map_or(0, |m| m.base);
     }
     let with_ext = if file.contains('.') { file.clone() } else { format!("{file}.dll") };
     g.modules.iter().find(|m| m.name.eq_ignore_ascii_case(&with_ext)).map_or(0, |m| m.base)
@@ -616,7 +587,7 @@ fn module_handle(g: &mut Guest, name: Option<String>) -> u64 {
         return base;
     }
     let file = name.rsplit(['\\', '/']).next().unwrap_or(&name).to_ascii_lowercase();
-    let known = ["kernel32", "kernelbase", "ntdll", "kernelx", "api-ms-win-", "ext-ms-win-", "xgameruntime", "ucrtbase", "msvcrt"];
+    let known = ["kernel32", "kernelbase", "ntdll", "kernelx", "api-ms-win-", "ext-ms-win-", "xgameruntime", "ucrtbase", "msvcrt", "user32", "minuserx", "gameinput"];
     if known.iter().any(|k| file.starts_with(k)) {
         return SYSTEM_MODULE;
     }
@@ -654,12 +625,32 @@ fn GetModuleHandleExW(g: &mut Guest) -> H {
     Ok((base != 0) as u64)
 }
 
+/// LoadLibrary: a module that is there, a system DLL the host stands in for, or a DLL of the
+/// game folder, which is mapped and has its entry point called.
+fn load_library(g: &mut Guest, name: String) -> H {
+    let known = module_handle(g, Some(name.clone()));
+    if known != 0 {
+        return Ok(known);
+    }
+    let before = g.modules.len();
+    let Ok(Some(index)) = g.game_dll(&name) else { return Ok(0) };
+    for m in g.modules[before..].to_vec().into_iter().filter(|m| m.is_dll && m.entry != 0) {
+        g.call(m.entry, &[m.base, 1, 0])?;
+    }
+    g.set_last_error(0);
+    Ok(g.modules[index].base)
+}
+
 fn LoadLibraryW(g: &mut Guest) -> H {
-    GetModuleHandleW(g)
+    let at = g.arg(0)?;
+    let name = g.mem.wstr(at, 520)?;
+    load_library(g, name)
 }
 
 fn LoadLibraryExA(g: &mut Guest) -> H {
-    GetModuleHandleA(g)
+    let at = g.arg(0)?;
+    let name = g.mem.cstr(at, 520)?;
+    load_library(g, name)
 }
 
 /// GetProcAddress: a host function when the host has one by that name, else not found (a title
@@ -674,13 +665,16 @@ fn GetProcAddress(g: &mut Guest) -> H {
     if module == SYSTEM_MODULE && g.has_handler(&name) {
         return Ok(g.import_address("@GetProcAddress", &name));
     }
+    if let Some(&address) = g.modules.iter().find(|m| m.base == module).and_then(|m| m.exports.get(&name)) {
+        return Ok(address);
+    }
     g.set_last_error(ERROR_PROC_NOT_FOUND);
     Ok(0)
 }
 
 fn GetModuleFileNameW(g: &mut Guest) -> H {
     let (at, size) = (g.arg(1)?, g.arg(2)?);
-    let path: Vec<u16> = format!("G:\\{}", g.modules.first().map_or("title.exe", |m| m.name.as_str())).encode_utf16().collect();
+    let path: Vec<u16> = format!("G:\\{}", g.modules.get(g.exe).map_or("title.exe", |m| m.name.as_str())).encode_utf16().collect();
     if (path.len() as u64) >= size {
         g.set_last_error(ERROR_INSUFFICIENT_BUFFER);
         return Ok(size);
@@ -724,7 +718,7 @@ pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
     register!(map; QueryPerformanceCounter, QueryPerformanceFrequency, GetSystemTimePreciseAsFileTime, Sleep, SwitchToThread);
     register!(map; CreateThread, WaitForSingleObject, CreateEventW, SetEvent, ResetEvent, CreateWaitableTimerExW, SetWaitableTimer, CloseHandle);
     register!(map; WaitOnAddress, WakeByAddressSingle, WakeByAddressAll);
-    register!(map; GetStdHandle, GetConsoleMode, WriteConsoleW, WriteFile, NtWriteFile, NtQueryVolumeInformationFile, RtlNtStatusToDosError);
+    register!(map; GetStdHandle, GetConsoleMode, WriteConsoleW, NtQueryVolumeInformationFile, RtlNtStatusToDosError);
     register!(map; GetModuleHandleW, GetModuleHandleA, GetModuleHandleExW, LoadLibraryW, LoadLibraryExA, GetProcAddress, GetModuleFileNameW, lstrlenW, ProcessPrng);
     map.insert("FlsAlloc", TlsAlloc as Handler);
     map.insert("FlsGetValue", TlsGetValue as Handler);

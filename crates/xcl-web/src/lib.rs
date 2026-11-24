@@ -9,6 +9,8 @@
 use std::sync::Mutex;
 
 static OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// the game folder for the next `xcl_run`: (path in the folder, contents)
+static GAME: Mutex<Vec<(String, Vec<u8>)>> = Mutex::new(Vec::new());
 
 fn answer(result: Result<String, String>) -> u32 {
     let (code, text) = match result {
@@ -94,10 +96,28 @@ pub unsafe extern "C" fn xcl_disasm(name: *const u8, name_len: usize, data: *con
     answer(xcl::disasm::render(&name, bytes(data, data_len), &args))
 }
 
+/// Put a file into the game folder the next `xcl_run` sees: `path` in the folder
+/// (`data\\hello.txt`), an empty path empties the folder.
+///
+/// # Safety
+/// `path` (UTF-8) and `data`: blocks from `xcl_alloc`.
+#[no_mangle]
+pub unsafe extern "C" fn xcl_game_file(path: *const u8, path_len: usize, data: *const u8, data_len: usize) -> u32 {
+    let path = String::from_utf8_lossy(bytes(path, path_len)).into_owned();
+    let mut game = GAME.lock().unwrap();
+    if path.is_empty() {
+        game.clear();
+    } else {
+        game.push((path, bytes(data, data_len).to_vec()));
+    }
+    answer(Ok(format!("{} files", game.len())))
+}
+
 /// Run a title (a PE file's bytes) on the x86-64 guest: at most `max_instructions` (0: two
 /// billion). The answer is what the title wrote to its standard output and error, then a line
 /// starting with `--- ` that says why it stopped; functions the host does not implement answer 0
-/// and are listed before that line.
+/// and are listed before that line. The title's files are the game folder (`xcl_game_file`);
+/// what it writes stays in memory and is gone after the run.
 ///
 /// # Safety
 /// `name` (UTF-8), `data` and `command_line` (UTF-8; empty: the name): blocks from `xcl_alloc`.
@@ -107,6 +127,9 @@ pub unsafe extern "C" fn xcl_run(name: *const u8, name_len: usize, data: *const 
     let command_line = String::from_utf8_lossy(bytes(command_line, command_line_len)).into_owned();
     let mut g = xcl_guest::Guest::new();
     g.command_line = if command_line.is_empty() { name.clone() } else { command_line };
+    for (path, data) in GAME.lock().unwrap().iter() {
+        g.vfs.add_game_file(path, data.clone());
+    }
     let started = g.map_image(&name, bytes(data, data_len)).and_then(|exe| g.start(exe, 1 << 20));
     if let Err(e) = started {
         return answer(Err(e));

@@ -40,6 +40,10 @@ export async function load(source) {
     inspect: (name, data, json = false) => call(x.xcl_inspect, name, data, json ? 1 : 0),
     /** `xcl disasm`: RDNA2 listing of a shader blob; `args` as on the command line. */
     disasm: (name, data, args = []) => call(x.xcl_disasm, name, data, args.join("\n")),
+    /** Put a file into the game folder the next `run` sees (`path` like "data\\hello.txt"). */
+    gameFile: (path, data) => call(x.xcl_game_file, path, data),
+    /** Empty the game folder. */
+    clearGame: () => call(x.xcl_game_file, "", new Uint8Array(0)),
     /** Run a title on the x86-64 guest: its output, then a `--- stopped: …` line. */
     run: (name, data, commandLine = "", maxInstructions = 0) => call(x.xcl_run, name, data, commandLine, BigInt(maxInstructions)),
   };

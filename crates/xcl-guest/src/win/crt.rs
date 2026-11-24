@@ -83,6 +83,24 @@ fn _crt_atexit(g: &mut Guest) -> H {
     Ok(0)
 }
 
+/// _initialize_onexit_table(table): a DLL's own atexit list (three pointers, kept empty: the
+/// functions are held by the host).
+fn _initialize_onexit_table(g: &mut Guest) -> H {
+    let table = g.arg(0)?;
+    if table == 0 {
+        return Ok(u32::MAX as u64);
+    }
+    g.mem.write(table, &[0u8; 24])?;
+    Ok(0)
+}
+
+/// _register_onexit_function(table, function)
+fn _register_onexit_function(g: &mut Guest) -> H {
+    let f = g.arg(1)?;
+    g.win.atexit.push(f);
+    Ok(0)
+}
+
 /// Run the `atexit` functions, last registered first.
 fn run_atexit(g: &mut Guest) -> Result<(), Stop> {
     while let Some(f) = g.win.atexit.pop() {
@@ -179,17 +197,6 @@ fn __acrt_iob_func(g: &mut Guest) -> H {
     })
 }
 
-fn fwrite(g: &mut Guest) -> H {
-    let (at, size, n, file) = (g.arg(0)?, g.arg(1)?, g.arg(2)?, g.arg(3)?);
-    if file == super::STDOUT || file == super::STDERR {
-        let mut bytes = vec![0u8; size.saturating_mul(n).min(1 << 24) as usize];
-        g.mem.read(at, &mut bytes)?;
-        g.write_std(&bytes);
-        return Ok(n);
-    }
-    Ok(0)
-}
-
 /// printf to a `FILE *`: the format string is written as it is (its arguments are not
 /// formatted) – enough for the CRT's own startup error messages to be seen.
 fn __stdio_common_vfprintf(g: &mut Guest) -> H {
@@ -202,8 +209,9 @@ fn __stdio_common_vfprintf(g: &mut Guest) -> H {
 }
 
 pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
+    register!(map; _initialize_onexit_table, _register_onexit_function);
     register!(map; __p___argc, __p___argv, __p__environ, __p__commode, __p__fmode, _initterm, _initterm_e, _crt_atexit, _cexit, exit, _exit, abort);
-    register!(map; malloc, calloc, realloc, free, strlen, wcslen, strncmp, __acrt_iob_func, fwrite, __stdio_common_vfprintf);
+    register!(map; malloc, calloc, realloc, free, strlen, wcslen, strncmp, __acrt_iob_func, __stdio_common_vfprintf);
     for name in [
         "_configure_narrow_argv",
         "_initialize_narrow_environment",
@@ -212,6 +220,7 @@ pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
         "_set_new_mode",
         "_configthreadlocale",
         "_set_invalid_parameter_handler",
+        "_execute_onexit_table",
         "fflush",
         "setvbuf",
     ] {

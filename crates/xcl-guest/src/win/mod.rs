@@ -9,10 +9,12 @@ use xcl_emu::mem::{Fault, Memory, PROT_R, PROT_W};
 use crate::{Guest, Handler, Stop};
 
 mod crt;
+pub mod files;
 pub mod heap;
 mod kernel32;
 mod kernelx;
 pub mod seh;
+mod user;
 
 /// A module's static TLS, from its TLS directory.
 #[derive(Debug, Clone)]
@@ -35,6 +37,9 @@ pub struct State {
     pub call_depth: u32,
     pub heap: heap::Heap,
     pub xmem: kernelx::XMem,
+    pub window_classes: u32,
+    /// COM objects the host made, by interface: one vtable each
+    pub vtables: HashMap<&'static str, u64>,
     /// TlsAlloc / FlsAlloc slots handed out
     pub tls_count: usize,
     /// guest time (see `Guest::now_ns`)
@@ -57,6 +62,10 @@ pub enum Object {
     Event { signaled: bool, manual: bool },
     /// a waitable timer: signaled from guest time `due` on
     Timer { due: Option<u64>, manual: bool },
+    File(files::File),
+    /// the console's screen
+    Window,
+    Find(files::Find),
 }
 
 impl State {
@@ -108,6 +117,9 @@ pub fn handlers() -> HashMap<&'static str, Handler> {
     crt::register(&mut map);
     kernel32::register(&mut map);
     seh::register(&mut map);
+    user::register(&mut map);
+    // after kernel32 and crt: the file functions also take the standard handles
+    files::register(&mut map);
     // after kernel32: VirtualFree also knows the graphics region
     kernelx::register(&mut map);
     map
@@ -168,6 +180,27 @@ impl Guest {
         let at = self.heap_alloc(text.len() as u64 + 1)?;
         self.mem.write(at, text.as_bytes())?;
         Ok(at)
+    }
+
+    /// A COM object in guest memory whose methods are the host functions `methods` (by the
+    /// names they are registered under), in vtable order. The object is 16 bytes: the vtable
+    /// pointer and a word for the host.
+    pub(crate) fn com_object(&mut self, interface: &'static str, methods: &[&str]) -> Result<u64, Stop> {
+        let vtable = match self.win.vtables.get(interface) {
+            Some(&v) => v,
+            None => {
+                let v = self.heap_alloc(8 * methods.len() as u64)?;
+                for (i, m) in methods.iter().enumerate() {
+                    let slot = self.import_address("@com", m);
+                    self.mem.write_u64(v + 8 * i as u64, slot)?;
+                }
+                self.win.vtables.insert(interface, v);
+                v
+            }
+        };
+        let object = self.heap_alloc(16)?;
+        self.mem.write_u64(object, vtable)?;
+        Ok(object)
     }
 
     /// Bytes the title writes to a standard handle.

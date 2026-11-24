@@ -87,10 +87,6 @@ impl XMem {
         }
         Some(size)
     }
-
-    fn range_of(&self, address: u64) -> Option<(u64, u64)> {
-        self.ranges.iter().map(|(&b, &s)| (b, s)).find(|&(b, s)| address >= b && address < b + s)
-    }
 }
 
 /// XALLOC_ATTRIBUTES: (page size, alignment exponent, memory type).
