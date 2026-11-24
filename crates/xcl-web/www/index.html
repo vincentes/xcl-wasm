@@ -3,22 +3,66 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>XCL</title>
+<link rel="icon" href="data:,">
+<!-- The demo beside the heading is built from crates/xcl-web/demo (README.md); the page works without it. -->
+<link rel="stylesheet" href="./demo.css">
 <style>
-  body { font: 15px/1.4 system-ui, sans-serif; margin: 2rem auto; max-width: 70rem; padding: 0 1rem; }
-  pre { background: #111; color: #ddd; padding: 1rem; overflow: auto; min-height: 10rem; }
-  fieldset { border: 0; padding: 0; margin: 1rem 0; display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
+  :root {
+    --canvas: #f6f5f4; --line: rgb(0 0 0 / 0.1); --ink: rgb(0 0 0 / 0.06);
+    --text-strong: #1c1c1c; --text: #6b6b6b; --ok: #15803d; --ok-soft: rgb(34 197 94 / 0.12); --bad: #b91c1c; --bad-soft: rgb(239 68 68 / 0.12);
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.5 system-ui, sans-serif; color: var(--text-strong); background: #fff; margin: 0 auto; max-width: 72rem; padding: 3rem 1.5rem 4rem; }
+  .hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 720px); gap: 3rem; align-items: center; }
+  .hero:has(#demo:empty) { grid-template-columns: minmax(0, 1fr); }
+  #demo:empty { display: none; }
+  h1 { font-size: 2rem; line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 0.75rem; }
+  .lede { color: var(--text); margin: 0 0 1rem; max-width: 34rem; }
+  #status { color: var(--text); font-size: 13px; margin: 0; }
+  .tool { margin-top: 3rem; }
+  fieldset { border: 0; padding: 0; margin: 0 0 0.75rem; min-width: 0; display: flex; gap: 0.75rem 1.25rem; flex-wrap: wrap; align-items: center; }
+  input[type=file], input[type=text] { font: inherit; font-size: 13px; color: var(--text); }
+  input[type=file]::file-selector-button { font: inherit; font-weight: 500; color: var(--text-strong); height: 28px; padding: 0 10px; margin-right: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+  input[type=text] { height: 28px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--text-strong); flex: 1 1 18rem; min-width: 0; }
+  /* the commands: radio buttons drawn as one segmented control */
+  .seg { display: inline-flex; padding: 2px; border-radius: 8px; background: var(--ink); }
+  .seg label { position: relative; display: grid; place-items: center; height: 26px; padding: 0 12px; border-radius: 6px; font-size: 13px; font-weight: 500; color: var(--text); transition: color 0.2s ease, background-color 0.2s ease; }
+  .seg input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+  .seg label:has(:checked) { color: var(--text-strong); background: #fff; box-shadow: 0 1px 2px rgb(0 0 0 / 0.08), 0 0 0 0.5px rgb(0 0 0 / 0.06); }
+  .seg label:has(:focus-visible) { outline: 2px solid #2563eb; outline-offset: 1px; }
+  .check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
+  #state { display: inline-flex; align-items: center; height: 20px; padding: 0 9px; border-radius: 999px; background: var(--ink); font-size: 11px; font-weight: 500; }
+  #state:empty { display: none; }
+  #state[data-tone=ok] { background: var(--ok-soft); color: var(--ok); }
+  #state[data-tone=bad] { background: var(--bad-soft); color: var(--bad); }
+  pre { font: 12px/1.5 var(--mono); background: var(--canvas); border: 1px solid var(--ink); border-radius: 8px; color: var(--text-strong); margin: 0; padding: 0.875rem 1rem; overflow: auto; min-height: 12rem; }
+  pre:empty::before { content: "Pick a file: its output appears here."; color: var(--text); font-family: system-ui, sans-serif; font-size: 13px; }
+  @media (max-width: 64rem) { .hero { grid-template-columns: minmax(0, 1fr); gap: 2rem; } body { padding-top: 2rem; } }
 </style>
-<h1>XCL in the browser</h1>
-<p id="status">loading…</p>
-<fieldset>
-  <input type="file" id="file">
-  <label><input type="radio" name="cmd" value="inspect" checked> inspect (game exe / dll)</label>
-  <label><input type="radio" name="cmd" value="disasm"> disasm (console shader)</label>
-  <label><input type="radio" name="cmd" value="run"> run (title exe, on the x64 guest)</label>
-  <label><input type="checkbox" id="json"> JSON</label>
-  <input type="text" id="args" placeholder="disasm options (--offset 0x40 --all) / run arguments" size="44">
-</fieldset>
-<pre id="out"></pre>
+<header class="hero">
+  <div>
+    <h1>XCL in the browser</h1>
+    <p class="lede">Inspect a console game's exe or DLL, disassemble its shaders, or run a title's x64 code on the guest, in this tab. There is no graphics yet, so no retail game runs.</p>
+    <p id="status">loading…</p>
+  </div>
+  <div id="demo" aria-hidden="true"></div>
+</header>
+<main class="tool">
+  <fieldset>
+    <input type="file" id="file" aria-label="File">
+    <span class="seg">
+      <label title="a game exe / dll"><input type="radio" name="cmd" value="inspect" checked>inspect</label>
+      <label title="a console shader"><input type="radio" name="cmd" value="disasm">disasm</label>
+      <label title="a title exe, on the x64 guest"><input type="radio" name="cmd" value="run">run</label>
+    </span>
+    <span id="state" role="status"></span>
+    <label class="check"><input type="checkbox" id="json"> JSON</label>
+    <input type="text" id="args" placeholder="disasm options (--offset 0x40 --all) / run arguments" aria-label="Options">
+  </fieldset>
+  <pre id="out"></pre>
+</main>
+<script type="module" src="./demo.js"></script>
 <script type="module">
   import { load } from "./xcl.mjs";
   const $ = (id) => document.getElementById(id);
@@ -29,17 +73,32 @@
   } catch (e) {
     $("status").textContent = "XCL needs a browser with 64-bit WebAssembly memory (memory64): " + e;
   }
+  function state(text, tone) {
+    $("state").textContent = text;
+    $("state").dataset.tone = tone || "";
+  }
+  let latest = 0;
   async function run() {
     const f = $("file").files[0];
     if (!xcl || !f) return;
+    const call = ++latest;
     const data = new Uint8Array(await f.arrayBuffer());
     const cmd = document.querySelector("input[name=cmd]:checked").value;
+    state("");
+    if (cmd === "run") {
+      // the guest runs on this thread: let "Running" reach the screen first
+      state("Running");
+      await new Promise((painted) => requestAnimationFrame(() => setTimeout(painted)));
+    }
+    if (call !== latest) return;
     try {
       const args = $("args").value.split(/\s+/).filter(Boolean);
       $("out").textContent =
         cmd === "inspect" ? xcl.inspect(f.name, data, $("json").checked) : cmd === "disasm" ? xcl.disasm(f.name, data, args) : xcl.run(f.name, data, [f.name, ...args].join(" "));
+      if (cmd === "run") state("Finished", "ok");
     } catch (e) {
       $("out").textContent = "xcl " + cmd + ": " + e.message;
+      if (cmd === "run") state("Failed", "bad");
     }
   }
   for (const id of ["file", "json", "args"]) $(id).addEventListener("change", run);

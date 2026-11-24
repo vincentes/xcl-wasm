@@ -46,3 +46,8 @@ __pycache__/
 
 # the built WebAssembly module, copied next to the page (crates/xcl-web/README.md)
 crates/xcl-web/www/*.wasm
+
+# the page's demo, built into the page's folder from crates/xcl-web/demo (crates/xcl-web/README.md)
+crates/xcl-web/www/demo.js
+crates/xcl-web/www/demo.css
+node_modules/

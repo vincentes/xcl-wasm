@@ -1,0 +1,208 @@
+/* The hero of XCL's browser page. Every rule is scoped to the demo's root. */
+.xd {
+  /* Pinned, bottom bleed: the browser sits one gutter in from the top and
+     sides of a quiet well and runs past the stage's bottom, the output with it */
+  & .ss-stage {
+    --gutter: 32px;
+    overflow: hidden;
+    border-radius: 14px;
+    background: var(--ss-well);
+  }
+
+  & .ss-stage[data-layout='compact'] {
+    --gutter: 16px;
+  }
+
+  .xd-win {
+    position: absolute;
+    top: var(--gutter);
+    left: var(--gutter);
+    right: var(--gutter);
+    height: 460px;
+    box-shadow: var(--ss-shadow-hero);
+  }
+
+  .xd-page {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    height: 100%;
+    padding: 18px 20px 0;
+    background: var(--ss-surface);
+  }
+
+  .ss-stage[data-layout='compact'] .xd-page {
+    padding: 16px 14px 0;
+  }
+
+  .xd-title {
+    color: var(--ss-text-strong);
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+
+  .xd-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 20px;
+  }
+
+  /* The phone column stacks the file over the command */
+  .ss-stage[data-layout='compact'] .xd-controls {
+    flex-direction: column;
+    flex-wrap: nowrap;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .xd-file,
+  .xd-cmd {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .xd-name {
+    color: var(--ss-text);
+    font-size: 12px;
+    line-height: 1.3;
+    white-space: nowrap;
+  }
+
+  .xd-seg {
+    flex: none;
+    width: 204px;
+  }
+
+  /* The pill fades in where it will sit, from just above; its room is
+     always there, so nothing beside it moves */
+  .xd-state {
+    display: flex;
+    opacity: 0;
+    transform: translateY(-4px);
+    transition: opacity 0.2s ease, transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+    /* A layer it keeps, so its word does not hop as it lands */
+    will-change: transform;
+  }
+
+  .xd-state[data-on] {
+    opacity: 1;
+    transform: none;
+  }
+
+  .xd-mark {
+    display: grid;
+    place-items: center;
+    width: 8px;
+    height: 8px;
+  }
+
+  .xd-mark > * {
+    grid-area: 1 / 1;
+    transition: opacity 0.2s ease;
+  }
+
+  .xd-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+
+  .xd-mark[data-done] .ss-spinner,
+  .xd-mark:not([data-done]) .xd-dot {
+    opacity: 0;
+  }
+
+  /* The page's output: a sunken panel of monospace text in the page's own
+     inks, as the real page draws it */
+  .xd-out {
+    position: relative;
+    display: grid;
+    flex: 1;
+    align-content: start;
+    padding: 12px 14px;
+    border-radius: 8px 8px 0 0;
+    background: var(--ss-canvas);
+    box-shadow: inset 0 0 0 1px var(--ss-line-faint);
+    color: var(--ss-text-strong);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px;
+    line-height: 18px;
+  }
+
+  .ss-stage[data-layout='compact'] .xd-out {
+    padding: 12px;
+    font-size: 10.5px;
+  }
+
+  /* The two outputs share the panel; one leaves as the other rises in */
+  .xd-view {
+    grid-area: 1 / 1;
+    opacity: 0;
+    transform: translateY(6px);
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    will-change: transform;
+  }
+
+  .xd-view[data-on] {
+    opacity: 1;
+    transform: none;
+    transition: opacity 0.24s ease 0.14s, transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1) 0.14s;
+  }
+
+  .xd-line {
+    display: flex;
+    align-items: center;
+    height: 18px;
+    white-space: pre;
+  }
+
+  .xd-key {
+    flex: none;
+    width: 15ch;
+    color: var(--ss-text);
+  }
+
+  .xd-dim {
+    color: var(--ss-text);
+  }
+
+  /* The mark keeps its column, a character clear of the check's name */
+  .xd-ok {
+    flex: none;
+    width: 7ch;
+    color: var(--ss-success-text);
+  }
+
+  /* The log's lines arrive in reading order, each where it will stay; they
+     leave with their view, and reset once it has gone */
+  .xd-in {
+    opacity: 0;
+    transform: translateY(3px);
+    transition: opacity 0s 0.2s, transform 0s 0.2s;
+    will-change: transform;
+  }
+
+  .xd-log[data-on] .xd-in {
+    opacity: 1;
+    transform: none;
+    transition: opacity 0.22s ease calc(0.14s + var(--i) * 45ms), transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1) calc(0.14s + var(--i) * 45ms);
+  }
+
+  /* Where the cursor waits: empty panel, right of the lines */
+  .xd-rest {
+    position: absolute;
+    top: 96px;
+    right: 96px;
+    width: 1px;
+    height: 1px;
+  }
+
+  .ss-stage[data-layout='compact'] .xd-rest {
+    top: 20px;
+    right: 28px;
+  }
+}

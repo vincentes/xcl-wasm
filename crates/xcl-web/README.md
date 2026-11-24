@@ -28,6 +28,15 @@ cargo +nightly build -p xcl-web --release --target wasm64-unknown-unknown -Zbuil
 cp target/wasm64-unknown-unknown/release/xcl_web.wasm crates/xcl-web/www/
 ```
 
+The page shows a short animated demo of itself beside its heading. It is optional (without it
+the page is the same, minus the demo) and built separately, with Node 20+, into `www/demo.js` and
+`www/demo.css`:
+
+```sh
+npm ci --prefix crates/xcl-web/demo
+npm run build --prefix crates/xcl-web/demo
+```
+
 ## Test
 
 ```sh
@@ -48,4 +57,5 @@ Serve `crates/xcl-web/www/` with any static file server and open it, e.g.
 - `src/lib.rs` – the module's exports (no bindings generator; pointers and sizes are 64-bit)
 - `www/xcl.mjs` – loader: `load(url | bytes)` → `{ version, inspect, disasm, run }`
 - `www/index.html` – the page
+- `demo/` – the page's demo: `src/XclDemo.tsx` (the scene), `kit/` (Stageshow's kit, MIT, vendored: `kit/README.md`), `REHEARSAL.md` (how it was checked)
 - `www/smoke.mjs` – smoke test of the built module under Node
