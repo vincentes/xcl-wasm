@@ -10,21 +10,35 @@ use std::sync::OnceLock;
 use crate::config::Config;
 use crate::util::glob_match;
 
+#[cfg(windows)]
 pub mod acphal;
 pub mod d3d12_layout;
+#[cfg(windows)]
 pub mod d3d12x;
+#[cfg(windows)]
 pub mod dstorage;
+#[cfg(windows)]
 pub mod dxcompiler;
+#[cfg(windows)]
 pub mod gameinput;
+#[cfg(windows)]
 pub mod kbm;
+#[cfg(windows)]
 pub mod kernelx;
+#[cfg(windows)]
 pub mod mfplat;
+#[cfg(windows)]
 pub mod netoff;
+#[cfg(windows)]
 pub mod opus;
+#[cfg(windows)]
 pub mod user;
+#[cfg(windows)]
 pub mod xaudio2;
 pub mod xma2;
+#[cfg(windows)]
 pub mod xg;
+#[cfg(windows)]
 pub mod xgameruntime;
 
 /// Build an export list from functions whose Rust names equal the exported names.
@@ -95,21 +109,39 @@ pub const ACPHAL: &str = "acphal.dll";
 /// controllers (`GameInputCreate`)
 pub const GAMEINPUT: &str = "gameinput.dll";
 
+/// A module's export table. Off Windows the HLE code is not built: the modules keep their names
+/// and routes (what `inspect` shows) with no functions.
+#[cfg(windows)]
+macro_rules! exports_of {
+    ($m:ident) => {
+        $m::exports()
+    };
+}
+#[cfg(not(windows))]
+macro_rules! exports_of {
+    ($m:ident) => {
+        Vec::new()
+    };
+}
+
 fn build(config: &Config) -> Registry {
+    #[allow(unused_mut)]
     let mut modules = vec![
-        HleModule::new(KERNELX, kernelx::exports(), &[SELF, "kernelbase.dll", "kernel32.dll", "advapi32.dll", "sechost.dll"]),
-        HleModule::new(XGAMERUNTIME, xgameruntime::exports(), &[]),
-        HleModule::new(D3D12X, d3d12x::exports(), &[]),
-        HleModule::new(XAUDIO2, xaudio2::exports(), &["xaudio2_9.dll"]),
-        HleModule::new(MFPLAT, mfplat::exports(), &["mfplat.dll"]),
-        HleModule::new(DXCOMPILER, dxcompiler::exports(), &[]),
-        HleModule::new(MINUSERX, user::exports(), &["user32.dll"]),
-        HleModule::new(XCRDAPI, dstorage::exports(), &[]),
-        HleModule::new(XG, xg::exports(), &[]),
-        HleModule::new(ACPHAL, acphal::exports(), &[]),
-        HleModule::new(GAMEINPUT, gameinput::exports(), &[]),
+        HleModule::new(KERNELX, exports_of!(kernelx), &[SELF, "kernelbase.dll", "kernel32.dll", "advapi32.dll", "sechost.dll"]),
+        HleModule::new(XGAMERUNTIME, exports_of!(xgameruntime), &[]),
+        HleModule::new(D3D12X, exports_of!(d3d12x), &[]),
+        HleModule::new(XAUDIO2, exports_of!(xaudio2), &["xaudio2_9.dll"]),
+        HleModule::new(MFPLAT, exports_of!(mfplat), &["mfplat.dll"]),
+        HleModule::new(DXCOMPILER, exports_of!(dxcompiler), &[]),
+        HleModule::new(MINUSERX, exports_of!(user), &["user32.dll"]),
+        HleModule::new(XCRDAPI, exports_of!(dstorage), &[]),
+        HleModule::new(XG, exports_of!(xg), &[]),
+        HleModule::new(ACPHAL, exports_of!(acphal), &[]),
+        HleModule::new(GAMEINPUT, exports_of!(gameinput), &[]),
     ];
+    #[cfg(windows)]
     let offline = netoff::enabled();
+    #[cfg(windows)]
     if offline {
         // the system's own network functions too, for whatever reaches them (#305)
         netoff::install_system_hooks();
@@ -186,6 +218,7 @@ fn build(config: &Config) -> Registry {
     for p in ["dxcompiler_xs.dll", "dxcompiler_x.dll"] {
         routes.push((p.into(), Route::Hle(c)));
     }
+    #[cfg(windows)]
     if offline {
         let n = idx(netoff::NETOFF);
         for p in ["winhttp.dll", "ws2_32.dll"] {
@@ -265,6 +298,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn cross_module_lookup_finds_xmem() {
         let r = build(&Config::default());
         assert_eq!(r.find_any("XMemAlloc").map(|(m, _)| m.name), Some(KERNELX));

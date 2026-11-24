@@ -74,7 +74,10 @@ pub fn write(level: Level, args: std::fmt::Arguments<'_>) {
         return;
     }
     let t = START.get_or_init(Instant::now).elapsed().as_secs_f64();
+    #[cfg(windows)]
     let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    #[cfg(not(windows))]
+    let tid = 0u32;
     let line = format!("[{t:9.3}][{tid:5}][{}] {args}\n", level.tag());
     if let Ok(mut g) = FILE.try_lock().or_else(|_| FILE.lock()) {
         if let Some(f) = g.as_mut() {

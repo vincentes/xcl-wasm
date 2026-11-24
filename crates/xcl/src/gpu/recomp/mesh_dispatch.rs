@@ -257,6 +257,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn validation_shader_has_only_unconditional_rendezvous() {
         let hlsl = validation_hlsl();
         assert_eq!(
@@ -295,6 +296,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn gpu_dispatch_matches_native_wave64_reference() {
         if let Err(reason) = super::super::runner::adapter() {
             println!("GPU unavailable – skipping ({reason})");

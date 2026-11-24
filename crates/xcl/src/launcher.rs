@@ -3,7 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
 use crate::config::{Boot, Config};
+#[cfg(windows)]
 use crate::util::wide;
 
 /// Data root: `%XCL_DATA_ROOT%` or `%LOCALAPPDATA%\XCL`.
@@ -285,6 +287,7 @@ fn quote(a: &str) -> String {
     s
 }
 
+#[cfg(windows)]
 pub fn run(target: &Path, args: &[String]) -> i32 {
     let (root, explicit_exe, title) = match resolve_location(target) {
         Ok(x) => x,
@@ -414,6 +417,7 @@ pub fn check_cpu_features<F: Fn(&str) -> bool>(has: F) -> Vec<&'static str> {
 
 /// Instruction set extensions of the console's Zen 2 that this CPU does not have (titles are
 /// compiled for them: AVX2, FMA, F16C, BMI1 / BMI2, LZCNT, POPCNT, MOVBE, SSE4.2).
+#[cfg(windows)]
 pub fn missing_console_cpu_features() -> Vec<&'static str> {
     check_cpu_features(|f| match f {
         "sse4.2" => std::arch::is_x86_feature_detected!("sse4.2"),
@@ -430,6 +434,7 @@ pub fn missing_console_cpu_features() -> Vec<&'static str> {
     })
 }
 
+#[cfg(windows)]
 fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Threading::{
@@ -469,6 +474,7 @@ fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String
     }
 }
 
+#[cfg(windows)]
 fn summarize(boot: &Boot, code: u32, environment: &[crate::preflight::Check]) {
     let path = boot.report_path();
     let mut report = crate::report::load(&path);
@@ -637,6 +643,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn finds_exe_in_subfolder_and_via_config() {
         let d = TempDir::new("sub");
         std::fs::create_dir_all(d.0.join("Bin")).unwrap();
@@ -653,6 +660,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn console_detection() {
         // a plain Windows binary imports no console DLLs
         let me = std::env::current_exe().unwrap();

@@ -203,6 +203,7 @@ fn dump_dir() -> PathBuf {
 
 /// Is `[p, p+len)` committed, readable memory? (Game-provided pointers may be garbage
 /// when our guess of a console struct layout is wrong.)
+#[cfg(windows)]
 pub fn readable(p: usize, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
     if p == 0 || len == 0 || len > 256 << 20 {
@@ -237,6 +238,7 @@ pub fn readable(p: usize, len: usize) -> bool {
 /// streaming thread, which has the page arrays of its DirectStorage requests checked, spent most
 /// of the world load there. `false` for a page that is not resident (never touched, paged out,
 /// guard, reserved, no access): the `VirtualQuery` walk answers for those.
+#[cfg(windows)]
 fn resident_and_readable(p: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_NOACCESS};
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
@@ -263,6 +265,7 @@ fn resident_and_readable(p: usize, end: usize) -> bool {
 }
 
 /// Record a shader blob submitted by the title. Safe on garbage pointers.
+#[cfg(windows)]
 pub fn capture(stage: &str, ptr: usize, len: usize) {
     if ptr == 0 && len == 0 {
         return; // unused stage
@@ -320,12 +323,14 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
 /// more for that: the report's `recomp_*` counts come from it). Off by default: a retail game's
 /// ~17 000 dumps took 4.8 GB, and translating each again took its loading threads ~0.1 s a
 /// program at every start.
+#[cfg(windows)]
 fn dumps_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_DUMP_SHADERS").is_ok_and(|v| v == "1"))
 }
 
 /// Console container without dumps: its FSSM variants and instructions accounted.
+#[cfg(windows)]
 fn account_xbox(blob: &[u8], h: u64) {
     let Some(sh) = xbox::parse(blob) else { return };
     let mut insts = xbox::InstStats::default();
@@ -345,6 +350,7 @@ fn account_xbox(blob: &[u8], h: u64) {
 
 /// Console container: account its FSSM variants and instructions, write the
 /// decompressed FSSMs and the disassembly next to the blob.
+#[cfg(windows)]
 fn capture_xbox(blob: &[u8], base: &std::path::Path, h: u64) {
     let Some(sh) = xbox::parse(blob) else { return };
     let mut insts = xbox::InstStats::default();
@@ -377,6 +383,7 @@ fn capture_xbox(blob: &[u8], base: &std::path::Path, h: u64) {
 
 /// Translate every program of a captured console shader (mode from its interface) and
 /// write the HLSL next to the dumps; with `XCL_RECOMP_DXC=1` also compile it (cached).
+#[cfg(windows)]
 fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
     use crate::gpu::recomp;
     let dxc = std::env::var("XCL_RECOMP_DXC").is_ok_and(|v| v == "1");
@@ -482,6 +489,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn readable_rejects_garbage() {
         assert!(!readable(0, 10));
         assert!(!readable(0x10, 10));
@@ -490,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn readable_answers_from_the_working_set_without_touching_pages() {
         use windows_sys::Win32::System::Memory::*;
         unsafe {

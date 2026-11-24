@@ -224,6 +224,7 @@ pub fn element(format: u32) -> Option<(u32, u32)> {
 /// Layout of mip 0 of a T#'s image plus its size in elements. The swizzle the base address
 /// carries below the block size becomes `base_xor`; the data starts at
 /// `address & !(block_bytes - 1)`.
+#[cfg(windows)]
 pub fn image_layout(t: &super::desc::Image, cfg: PipeConfig) -> Option<(Layout, usize, usize)> {
     let (e, side) = element(t.format)?;
     let mut l = Layout::new(t.swizzle_mode, e, cfg)?;
@@ -424,6 +425,7 @@ impl Chain {
 
 /// The mip chain of a T#'s image (all `max_mip + 1` levels of the resource, base swizzle in
 /// `base_xor`); the data starts at `address & !(block_bytes - 1)`.
+#[cfg(windows)]
 pub fn image_chain(t: &super::desc::Image, cfg: PipeConfig) -> Option<Chain> {
     let (e, side) = element(t.format)?;
     let d3 = matches!(t.ty, super::desc::ImageType::D3);
@@ -606,6 +608,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn t_sharp_bc7_layout() {
         let t = crate::gpu::desc::Image {
             address: 0x1_2345_0000 | 0x300,

@@ -626,6 +626,7 @@ impl OwnedExports {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     fn system_file(name: &str) -> Vec<u8> {
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
         std::fs::read(format!("{root}\\System32\\{name}")).expect("read system dll")
@@ -740,6 +741,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn parses_kernel32_exports_and_imports() {
         let data = system_file("kernel32.dll");
         let pe = Pe::parse(&data, Layout::File).unwrap();
@@ -759,6 +761,7 @@ mod tests {
     /// Malformed directories are errors, not panics or runaway loops (#106): a relocation block
     /// claiming more than the directory holds, import descriptors at the end of the address space.
     #[test]
+    #[cfg(windows)]
     fn malformed_relocations_and_imports_are_errors() {
         let mut data = system_file("kernel32.dll");
         let (reloc, import) = {
@@ -790,6 +793,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn parses_own_test_binary_tls() {
         // The test harness itself is an x64 Rust binary with static TLS.
         let me = std::env::current_exe().unwrap();
