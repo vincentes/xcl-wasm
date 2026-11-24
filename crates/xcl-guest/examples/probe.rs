@@ -163,6 +163,8 @@ fn run(folder: &Path, images: &[(String, Vec<u8>)], budget: u64) {
     let after = std::env::var("XCL_PROBE_AFTER").ok();
     let mut opcodes: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut path: std::collections::VecDeque<u64> = Default::default();
+    let at: Vec<u64> = std::env::var("XCL_PROBE_AT").unwrap_or_default().split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect();
+    let mut seen = 0;
     let stop = match started {
         Ok(()) if after.is_some() => {
             let name = after.as_deref().unwrap_or_default();
@@ -174,6 +176,17 @@ fn run(folder: &Path, images: &[(String, Vec<u8>)], budget: u64) {
                 }
                 if stepping {
                     let rip = g.cpu.rip;
+                    // XCL_PROBE_AT=address,…: the registers each time the title is there
+                    if at.contains(&rip) && seen < 64 {
+                        seen += 1;
+                        let r = g.cpu.r;
+                        println!("at {rip:#x}: rcx {:#x} rdx {:#x} r8 {:#x} r9 {:#x} rax {:#x} rsi {:#x} rdi {:#x}", r[1], r[2], r[8], r[9], r[0], r[6], r[7]);
+                        // … and what RAX points at, when it points at something
+                        let bytes: Vec<u8> = (0..0x40).map_while(|i| g.mem.read_u8(r[0].wrapping_add(i)).ok()).collect();
+                        if !bytes.is_empty() {
+                            println!("    [rax]: {bytes:02x?}");
+                        }
+                    }
                     let entry = opcodes.entry(opcode_of(&g, rip)).or_insert((0, rip));
                     entry.0 += 1;
                     if path.len() == 400_000 {
