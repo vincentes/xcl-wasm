@@ -36,6 +36,7 @@ pub mod user;
 #[cfg(windows)]
 pub mod xaudio2;
 pub mod xma2;
+pub mod root_layout;
 pub mod xg;
 #[cfg(windows)]
 pub mod xgameruntime;
