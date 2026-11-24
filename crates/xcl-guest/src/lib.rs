@@ -46,6 +46,9 @@ pub enum Stop {
     /// (between a system function and the scheduler) the calling thread has to wait: ask again
     /// at its next turn
     Wait,
+    /// (between a system function and the scheduler) the function has set the running thread's
+    /// registers, an unwind for one: go on from there, in the `run` loop of this nesting depth
+    Resume { depth: u32 },
 }
 
 impl From<Fault> for Stop {
@@ -73,6 +76,9 @@ pub struct Module {
     pub base: u64,
     pub size: u64,
     pub entry: u64,
+    /// its function table (`.pdata`): address and number of RUNTIME_FUNCTION entries
+    pub pdata: u64,
+    pub pdata_count: u32,
 }
 
 /// What a thread waits for (kept while its system function answers `Stop::Wait`).
@@ -98,6 +104,8 @@ pub struct Thread {
     pub wait: Option<Wait>,
     /// set once its start function returned (or it called ExitThread)
     pub exit_code: Option<u32>,
+    /// handler calls in progress, innermost last (see `win::seh`)
+    pub seh: Vec<win::seh::Boundary>,
 }
 
 pub struct Guest {
@@ -196,7 +204,7 @@ impl Guest {
         cpu.r[xcl_emu::cpu::RSP] = top - 0x40;
         let ret = cpu.trap_address(return_slot);
         abi::call(&mut cpu, &mut self.mem, entry, &[argument], ret)?;
-        self.threads.push(Thread { id, cpu, teb, last_error: 0, tls_slots: Vec::new(), wait: None, exit_code: None });
+        self.threads.push(Thread { id, cpu, teb, last_error: 0, tls_slots: Vec::new(), wait: None, exit_code: None, seh: Vec::new() });
         Ok(self.threads.len() - 1)
     }
 
@@ -282,6 +290,10 @@ impl Guest {
                         continue;
                     }
                     Err(Stop::Wait) => true,
+                    Err(Stop::Resume { depth }) if depth == self.win.call_depth => {
+                        idle = 0;
+                        continue;
+                    }
                     Err(stop) => return stop,
                 },
                 other => return Stop::Cpu(other),

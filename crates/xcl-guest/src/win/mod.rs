@@ -11,6 +11,7 @@ use crate::{Guest, Handler, Stop};
 mod crt;
 pub mod heap;
 mod kernel32;
+pub mod seh;
 
 /// A module's static TLS, from its TLS directory.
 #[derive(Debug, Clone)]
@@ -104,6 +105,7 @@ pub fn handlers() -> HashMap<&'static str, Handler> {
     let mut map = HashMap::new();
     crt::register(&mut map);
     kernel32::register(&mut map);
+    seh::register(&mut map);
     map
 }
 

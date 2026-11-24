@@ -61,7 +61,15 @@ impl Guest {
                 module_base: base,
             });
         }
-        self.modules.push(Module { name: name.to_string(), base, size, entry: if pe.entry_rva != 0 { base + pe.entry_rva as u64 } else { 0 } });
+        let pdata = pe.dir(xcl::pe::DIR_EXCEPTION);
+        self.modules.push(Module {
+            name: name.to_string(),
+            base,
+            size,
+            entry: if pe.entry_rva != 0 { base + pe.entry_rva as u64 } else { 0 },
+            pdata: base + pdata.rva as u64,
+            pdata_count: pdata.size / 12,
+        });
         Ok(self.modules.len() - 1)
     }
 
