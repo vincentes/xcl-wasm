@@ -66,14 +66,15 @@ impl Guest {
         }
         if let Some(tls) = pe.tls().map_err(|e| e.to_string())? {
             let r = |va: u64| va.wrapping_add(delta);
-            self.win.tls_templates.push(crate::win::TlsTemplate {
+            let template = crate::win::TlsTemplate {
                 start: r(tls.start_raw),
                 len: tls.template_len(),
                 zero_fill: tls.size_of_zero_fill as u64,
                 index_address: r(tls.address_of_index),
                 callbacks: if tls.address_of_callbacks != 0 { r(tls.address_of_callbacks) } else { 0 },
                 module_base: base,
-            });
+            };
+            self.win.add_tls_template(template, pe.is_dll());
         }
         let pdata = pe.dir(xcl::pe::DIR_EXCEPTION);
         self.modules.push(Module {

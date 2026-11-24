@@ -80,6 +80,17 @@ pub enum Object {
 }
 
 impl State {
+    /// Static TLS of a module that was mapped. The executable's is index 0, as on Windows where
+    /// it is the first module loaded: code built to know that (MSVC's /GA) does not read its
+    /// index. Only before the first thread: a thread's blocks are in the order of the indexes.
+    pub fn add_tls_template(&mut self, template: TlsTemplate, is_dll: bool) {
+        if is_dll {
+            self.tls_templates.push(template);
+        } else {
+            self.tls_templates.insert(0, template);
+        }
+    }
+
     /// A thread's TEB and static TLS blocks; GS points at the TEB. Returns the TEB.
     pub fn setup_thread(&mut self, cpu: &mut Cpu, mem: &mut Memory, stack_base: u64, stack_top: u64, id: u32) -> Result<u64, Fault> {
         let fault = |_| Fault { addr: 0, write: true };
@@ -232,5 +243,33 @@ impl Guest {
     pub(crate) fn exit(&mut self, code: u32) -> Stop {
         self.win.exit_code = Some(code);
         Stop::Exit(code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_executables_static_tls_is_index_0_whatever_was_mapped_before_it() {
+        let mut mem = Memory::new();
+        let data = mem.alloc(0x1000, PROT_R | PROT_W).unwrap();
+        let stack = mem.alloc(0x4000, PROT_R | PROT_W).unwrap();
+        mem.write_u64(data + 0x100, 0xD11).unwrap();
+        mem.write_u64(data + 0x200, 0xE8E).unwrap();
+        let template = |start: u64, index_address: u64, module_base: u64| TlsTemplate { start, len: 8, zero_fill: 0x2000, index_address, callbacks: 0, module_base };
+        let mut state = State::default();
+        // a DLL the executable imports is mapped first
+        state.add_tls_template(template(data + 0x100, data, 0x1_8000_0000), true);
+        state.add_tls_template(template(data + 0x200, data + 8, 0x1_4000_0000), false);
+        mem.write_u32(data + 8, 77).unwrap();
+        let mut cpu = Cpu::new();
+        let teb = state.setup_thread(&mut cpu, &mut mem, stack, stack + 0x4000, 1).unwrap();
+        let slots = mem.read_u64(teb + 0x58).unwrap();
+        let (first, second) = (mem.read_u64(slots).unwrap(), mem.read_u64(slots + 8).unwrap());
+        assert_eq!((mem.read_u32(data + 8).unwrap(), mem.read_u32(data).unwrap()), (0, 1));
+        assert_eq!((mem.read_u64(first).unwrap(), mem.read_u64(second).unwrap()), (0xE8E, 0xD11));
+        // … and slot 0 is the executable's whole block, zero fill included
+        assert_eq!(mem.read_u64(first + 0x2000).unwrap(), 0);
     }
 }
