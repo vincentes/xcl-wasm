@@ -13,7 +13,10 @@ import { load } from "./xcl.mjs";
 
 const xcl = await load(readFileSync(process.argv[2]));
 const [SGPRS, VGPRS, LANES] = [128, 256, 64];
-const DWORDS = SGPRS + LANES * VGPRS;
+const EXPORTS = SGPRS + LANES * VGPRS;
+// the registers, then the exports of 64 targets
+const DWORDS = EXPORTS + 64 * LANES * 4;
+const exported = (file, target, lane, c) => file[EXPORTS + (target * LANES + lane) * 4 + c];
 const bits = (f) => new Uint32Array(new Float32Array([f]).buffer)[0];
 const float = (u) => new Float32Array(new Uint32Array([u]).buffer)[0];
 const f32 = Math.fround;
@@ -34,7 +37,7 @@ const [S, V] = [(n) => n, (n) => 256 + n];
 const mix = (l, k) => (Math.imul(l + 1, 0x9e3779b1) ^ Math.imul(k + 7, 0x85ebca6b)) >>> 0;
 
 const cases = [];
-const test = (name, program, io, check) => cases.push({ name, program, io, check });
+const test = (name, program, io, check, mem) => cases.push({ name, program, io, check, mem });
 
 // --- 32-bit float and integer vector instructions, one each: v5 = op(v1, v2)
 const A = (l) => bits(l * 0.5 - 7.25), B = (l) => bits(1.25 + (l % 5));
@@ -169,7 +172,63 @@ test("if / else on lanes: s_and_saveexec_b64, a masked write, EXEC restored", [
   assert.deepEqual([res[126], res[127], res[10], res[11]], [0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff]);
 });
 
-// --- a draw: a vertex and a pixel program (the HLSL back end's gpu_graphics_vs_ps_draw)
+// --- memory and exports (the HLSL back end's gpu_memory_and_exports)
+const MEM = Array.from({ length: 256 }, (_, i) => 0x1000 + i);
+test("loads through a pointer and a descriptor, exports", [
+  "S_LOAD_DWORDX2 ENC_SMEM SDATA=8 SBASE=0 OFFSET=0x10 SOFFSET=125",
+  "S_BUFFER_LOAD_DWORD ENC_SMEM SDATA=10 SBASE=6 OFFSET=4 SOFFSET=125",
+  "S_BUFFER_LOAD_DWORD ENC_SMEM SDATA=11 SBASE=6 OFFSET=0x400 SOFFSET=125", // out of range
+  "BUFFER_LOAD_DWORD ENC_MUBUF VDATA=3 VADDR=0 SRSRC=3 SOFFSET=128 OFFSET=8 OFFEN=1",
+  `V_MOV_B32 ENC_VOP1 VDST=4 SRC0=${S(8)}`,
+  "EXP ENC_EXP TGT=12 EN=15 VSRC0=3 VSRC1=4 VSRC2=0 VSRC3=0 DONE=1",
+  "V_CVT_PKRTZ_F16_F32 ENC_VOP2 VDST=5 SRC0=242 VSRC1=6",
+  "EXP ENC_EXP TGT=0 EN=3 VSRC0=5 VSRC1=5 COMPR=1 DONE=1 VM=1",
+  "S_ENDPGM ENC_SOPP",
+  // s0: a pointer to 0; s12..14: a descriptor of 0x100 bytes at 0x40, no stride
+], registers({ s: { 0: 0, 12: 0x40, 13: 0, 14: 0x100 }, v: { 0: (l) => 4 * l, 6: () => bits(0.5) } }), (res) => {
+  assert.deepEqual([res[8], res[9], res[10], res[11]], [0x1004, 0x1005, 0x1000 + 0x44 / 4, 0]);
+  for (let l = 0; l < LANES; l++) {
+    const want = 8 + 4 * l < 0x100 ? 0x1000 + (0x40 + 8 + 4 * l) / 4 : 0;
+    assert.equal(res[SGPRS + l * VGPRS + 3], want, `lane ${l} buffer_load_dword`);
+    assert.deepEqual([0, 1, 2].map((c) => exported(res, 12, l, c)), [want, 0x1004, 4 * l], `lane ${l} pos0`);
+    assert.deepEqual([exported(res, 0, l, 0), exported(res, 0, l, 1)], [0x3c00, 0x3800], `lane ${l} mrt0 (1.0, 0.5) as halves`);
+  }
+}, MEM);
+test("a descriptor with a stride: records by index, x4, past the end 0", [
+  "BUFFER_LOAD_DWORDX4 ENC_MUBUF VDATA=4 VADDR=0 SRSRC=3 SOFFSET=128 OFFSET=4 IDXEN=1",
+  "S_ENDPGM ENC_SOPP",
+  // 20 records of 16 bytes at 0x20
+], registers({ s: { 12: 0x20, 13: 16 << 16, 14: 20 }, v: { 0: (l) => l } }), (res) => {
+  for (let l = 0; l < LANES; l++) {
+    const first = 0x1000 + (0x20 + 16 * l + 4) / 4;
+    assert.deepEqual([4, 5, 6, 7].map((r) => res[SGPRS + l * VGPRS + r]), l < 20 ? [first, first + 1, first + 2, first + 3] : [0, 0, 0, 0], `lane ${l}`);
+  }
+}, MEM);
+// halves rounded toward zero, against a conversion done here
+const halfRtz = (f) => {
+  const b = bits(f), sign = (b >>> 16) & 0x8000, u = b & 0x7fffffff, e = (u >>> 23) - 127;
+  if (u > 0x7f800000) return sign | 0x7e00;
+  if (u === 0x7f800000) return sign | 0x7c00;
+  if (e > 15) return sign | 0x7bff;
+  // the largest half not above |f|: search (halves are ordered as their bits)
+  let h = 0;
+  const value = (x) => ((x >> 10) === 0 ? (x & 0x3ff) * 2 ** -24 : (0x400 | (x & 0x3ff)) * 2 ** ((x >> 10) - 25));
+  for (let bit = 0x4000; bit; bit >>= 1) if ((h | bit) < 0x7c00 && value(h | bit) <= Math.abs(f)) h |= bit;
+  return sign | h;
+};
+const HALVES = [0, -0, 1, -1, 0.1, -0.1, 1 / 3, 65504, 65519.9, 65520, 1e9, -1e9, Infinity, -Infinity, NaN, 2 ** -14, 2 ** -14 * 0.999, 2 ** -24, 2 ** -24 * 1.5, 2 ** -25, 2 ** -24 * 0.99, 6.1e-5, 1.0009765625, 1.00048828125, 1.0014, 3.14159, 1000.7, -2.5e-6];
+const H = (l) => bits(HALVES[l % HALVES.length] * (l >= HALVES.length ? 1.37 + l : 1));
+test("v_cvt_pkrtz_f16_f32 rounds toward zero", [
+  `V_CVT_PKRTZ_F16_F32 ENC_VOP2 VDST=5 SRC0=${V(1)} VSRC1=2`,
+  "S_ENDPGM ENC_SOPP",
+], registers({ v: { 1: H, 2: (l) => H(63 - l) } }), (res) => {
+  for (let l = 0; l < LANES; l++) {
+    const want = (halfRtz(float(H(l))) | (halfRtz(float(H(63 - l))) << 16)) >>> 0;
+    assert.equal(res[SGPRS + l * VGPRS + 5].toString(16), want.toString(16), `lane ${l}: ${float(H(l))}, ${float(H(63 - l))}`);
+  }
+});
+
+// --- draws: a vertex and a pixel program (the HLSL back end's gpu_graphics_vs_ps_draw)
 const draw = {
   // position (attribute 0, v4 v5) to pos0 with z 0 and w 1; the colour (attribute 1) to param 0
   vertex: xcl.wgslVertex(xcl.assemble([
@@ -196,10 +255,36 @@ const draw = {
   vertices: [[-1, -1], [-1, 3], [3, -1]].flatMap((p) => [...p, 0.8, 0.6, 0.4, 1]),
   clear: [0, 0, 1, 1],
   size: 16,
+  expect: (x) => (x >= 8 ? [0.4, 0.6, 0.4, 1] : [0, 0, 1, 1]),
 };
+// the same triangle; the pixel program takes its colour from memory through a descriptor
+// (s8..), adds the attribute's red and exports halves
+const draw2 = {
+  ...draw,
+  pixel: xcl.wgslPixel(xcl.assemble([
+    "S_BUFFER_LOAD_DWORDX4 ENC_SMEM SDATA=16 SBASE=4 OFFSET=8 SOFFSET=125", // s16..19: the colour
+    "V_INTERP_P2_F32 ENC_VINTRP VDST=4 VSRC=1 ATTR=0 ATTRCHAN=0",
+    `V_ADD_F32 ENC_VOP2 VDST=4 SRC0=${S(16)} VSRC1=4`,
+    `V_MOV_B32 ENC_VOP1 VDST=6 SRC0=${S(17)}`,
+    `V_MOV_B32 ENC_VOP1 VDST=8 SRC0=${S(18)}`,
+    `V_MOV_B32 ENC_VOP1 VDST=9 SRC0=${S(19)}`,
+    `V_CVT_PKRTZ_F16_F32 ENC_VOP2 VDST=5 SRC0=${V(4)} VSRC1=6`,
+    `V_CVT_PKRTZ_F16_F32 ENC_VOP2 VDST=7 SRC0=${V(8)} VSRC1=9`,
+    "EXP ENC_EXP TGT=0 EN=15 VSRC0=5 VSRC1=7 COMPR=1 DONE=1 VM=1",
+  ]), 0x302),
+  sgprs: Object.assign(new Array(128).fill(0), { 8: 16, 9: 0, 10: 64 }),
+  // the descriptor: 64 bytes at 16; the colour is its dwords 2..5 (0.125 0.25 0.5 1: exact halves)
+  mem: [...new Array(6).fill(0), bits(0.125), bits(0.25), bits(0.5), bits(1), ...new Array(22).fill(0)],
+  // 0.8 as a float plus 0.125, cut to a half
+  expect: () => [halfValue(halfRtz(f32(f32(0.8) + 0.125))), 0.25, 0.5, 1],
+};
+function halfValue(h) {
+  return (h >> 10) === 0 ? (h & 0x3ff) * 2 ** -24 : (0x400 | (h & 0x3ff)) * 2 ** ((h >> 10) - 25);
+}
+const draws = [draw, draw2].map(({ expect, ...d }) => d);
 
 // --- run them
-const programs = cases.map((c) => ({ name: c.name, wgsl: xcl.wgslKernel(xcl.assemble(c.program)), io: [...c.io] }));
+const programs = cases.map((c) => ({ name: c.name, wgsl: xcl.wgslKernel(xcl.assemble(c.program)), io: [...c.io], mem: c.mem }));
 assert.throws(() => xcl.wgslKernel(xcl.assemble([`V_SIN_F32 ENC_VOP1 VDST=0 SRC0=${V(1)}`])), /v_sin_f32/, "what is missing is named");
 
 const server = createServer((req, res) => res.writeHead(200, { "content-type": "text/html" }).end("<!doctype html><title>wgsl</title>"));
@@ -208,12 +293,12 @@ const browser = await chromium.launch({ headless: true, args: ["--enable-unsafe-
 try {
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
-  const { adapter, results, drawn } = await page.evaluate(async ({ programs, draw }) => {
+  const { adapter, results, drawn } = await page.evaluate(async ({ programs, draws }) => {
     const gpuAdapter = await navigator.gpu?.requestAdapter();
     if (!gpuAdapter) return { adapter: null, results: [] };
     const device = await gpuAdapter.requestDevice();
     const results = [];
-    for (const { wgsl, io } of programs) {
+    for (const { wgsl, io, mem } of programs) {
       device.pushErrorScope("validation");
       const module = device.createShaderModule({ code: wgsl });
       const messages = (await module.getCompilationInfo()).messages.filter((m) => m.type === "error").map((m) => `${m.lineNum}:${m.linePos} ${m.message}`);
@@ -228,7 +313,13 @@ try {
       device.queue.writeBuffer(input, 0, new Uint32Array(io));
       const output = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
       const read = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-      const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: input } }, { binding: 1, resource: { buffer: output } }] });
+      const entries = [{ binding: 0, resource: { buffer: input } }, { binding: 1, resource: { buffer: output } }];
+      if (mem) {
+        const memory = device.createBuffer({ size: mem.length * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(memory, 0, new Uint32Array(mem));
+        entries.push({ binding: 2, resource: { buffer: memory } });
+      }
+      const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
       const encoder = device.createCommandEncoder();
       const pass = encoder.beginComputePass();
       pass.setPipeline(pipeline);
@@ -246,8 +337,8 @@ try {
       results.push({ res: [...new Uint32Array(read.getMappedRange())] });
     }
     // the draw: both stages in one pipeline, the SGPRs as a uniform buffer, a float target read back
-    let drawn;
-    {
+    const drawn = [];
+    for (const draw of draws) {
       device.pushErrorScope("validation");
       const errors = [];
       const stage = async (code) => {
@@ -258,7 +349,7 @@ try {
       const [vs, ps] = [await stage(draw.vertex), await stage(draw.pixel)];
       if (errors.length) {
         await device.popErrorScope();
-        drawn = { error: errors.join("; ") };
+        drawn.push({ error: errors.join("; ") });
       } else {
         const pipeline = device.createRenderPipeline({
           layout: "auto",
@@ -275,23 +366,29 @@ try {
         const encoder = device.createCommandEncoder();
         const pass = encoder.beginRenderPass({ colorAttachments: [{ view: target.createView(), clearValue: draw.clear, loadOp: "clear", storeOp: "store" }] });
         pass.setPipeline(pipeline);
-        pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: sgprs } }] }));
+        const entries = [{ binding: 0, resource: { buffer: sgprs } }];
+        if (draw.mem) {
+          const memory = device.createBuffer({ size: draw.mem.length * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+          device.queue.writeBuffer(memory, 0, new Uint32Array(draw.mem));
+          entries.push({ binding: 1, resource: { buffer: memory } });
+        }
+        pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries }));
         pass.setVertexBuffer(0, vertices);
         pass.draw(3);
         pass.end();
         encoder.copyTextureToBuffer({ texture: target }, { buffer: read, bytesPerRow: n * 16 }, [n, n]);
         device.queue.submit([encoder.finish()]);
         const error = await device.popErrorScope();
-        if (error) drawn = { error: error.message };
+        if (error) drawn.push({ error: error.message });
         else {
           await read.mapAsync(GPUMapMode.READ);
-          drawn = { pixels: [...new Float32Array(read.getMappedRange())] };
+          drawn.push({ pixels: [...new Float32Array(read.getMappedRange())] });
         }
       }
     }
     const info = gpuAdapter.info ?? {};
     return { adapter: `${info.vendor ?? "?"} ${info.architecture ?? ""} ${info.description ?? ""}`.trim(), results, drawn };
-  }, { programs, draw });
+  }, { programs, draws });
   assert.ok(adapter, "no WebGPU adapter in this Chromium");
   let failed = 0;
   cases.forEach((c, i) => {
@@ -303,21 +400,23 @@ try {
       console.log(`FAIL ${c.name}: ${String(e.message).slice(0, 600)}`);
     }
   });
-  try {
-    assert.ok(!drawn.error, drawn.error);
-    for (let y = 0; y < draw.size; y++) {
-      for (let x = 0; x < draw.size; x++) {
-        const got = drawn.pixels.slice((y * draw.size + x) * 4, (y * draw.size + x) * 4 + 4);
-        const want = x >= 8 ? [0.4, 0.6, 0.4, 1] : draw.clear;
-        assert.ok(got.every((g, i) => Math.abs(g - want[i]) < 1e-5), `pixel (${x}, ${y}) = ${got}, expected ${want}`);
+  [draw, draw2].forEach((d, n) => {
+    try {
+      assert.ok(!drawn[n].error, drawn[n].error);
+      for (let y = 0; y < d.size; y++) {
+        for (let x = 0; x < d.size; x++) {
+          const got = drawn[n].pixels.slice((y * d.size + x) * 4, (y * d.size + x) * 4 + 4);
+          const want = d.expect(x);
+          assert.ok(got.every((g, i) => Math.abs(g - want[i]) < 1e-5), `pixel (${x}, ${y}) = ${got}, expected ${want}`);
+        }
       }
+    } catch (e) {
+      failed += 1;
+      console.log(`FAIL draw ${n + 1} with a vertex and a pixel program: ${String(e.message).slice(0, 600)}`);
     }
-  } catch (e) {
-    failed += 1;
-    console.log(`FAIL a draw with a vertex and a pixel program: ${String(e.message).slice(0, 600)}`);
-  }
-  const total = cases.length + 1;
-  console.log(`wgsl tests on WebGPU (${adapter}): ${total - failed} passed, ${failed} failed (${cases.length} kernels, 1 draw)`);
+  });
+  const total = cases.length + 2;
+  console.log(`wgsl tests on WebGPU (${adapter}): ${total - failed} passed, ${failed} failed (${cases.length} kernels, 2 draws)`);
   process.exitCode = failed ? 1 : 0;
 } finally {
   await browser.close();

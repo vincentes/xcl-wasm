@@ -1,8 +1,8 @@
 //! RDNA2 → WGSL: the recompiler's back end for WebGPU. **A beginning**: a first set of
 //! instructions – 32-bit float and integer arithmetic, compares, selects, the scalar unit,
 //! branches, exports and attribute interpolation – as a kernel (the program runs on a register
-//! file, as the HLSL back end's instruction tests do), a vertex stage or a pixel stage. No
-//! memory and no textures yet.
+//! file, as the HLSL back end's instruction tests do), a vertex stage or a pixel stage. Memory
+//! is read (dword loads through a pointer or a buffer descriptor), not written; no textures.
 //!
 //! WGSL has no wave of 64 lanes to rely on (the HLSL back end pins one with `WaveSize(64)` and
 //! uses wave intrinsics). A program is written for a wave of `LANES` lanes: a vector register
@@ -16,7 +16,11 @@
 //! Control flow is the dispatcher loop (`switch pc` over basic blocks), exact for any branch.
 //!
 //! Kernel ABI (the HLSL back end's): `io` holds 128 SGPR slots (106 / 107 VCC, 126 / 127 EXEC,
-//! 125 SCC) and then, per lane, 256 VGPRs; `res` gets the same back.
+//! 125 SCC) and then, per lane, 256 VGPRs; `res` gets the same back, and after it the exports
+//! as raw dwords (`KERNEL_EXPORTS + (target · 64 + lane) · 4 + component`).
+//!
+//! Memory is one read-only array of dwords (`mem`, declared when the program loads: binding 2
+//! of a kernel, 1 of a stage) addressed by the low half of a pointer; a load outside it is 0.
 //!
 //! Stage ABI: the SGPRs come from a uniform buffer (`sg`, group 0 binding 0: 32 × `vec4<u32>`).
 //! A vertex stage gets attribute `k` at `@location(k)` (`vec4<f32>`, in four VGPRs from
@@ -28,13 +32,34 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::{ps_input_vgpr, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS};
+use super::{ps_input_vgpr, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS};
 use crate::gpu::rdna2::{self, Decoded};
 
 pub struct Translation {
     pub wgsl: String,
     /// dwords of the `io` and `res` buffers (a kernel)
     pub dwords: usize,
+    /// the program reads memory: `mem` is declared
+    pub memory: bool,
+}
+
+/// Dwords a load instruction reads (None: not a dword load).
+fn load_count(name: &str) -> Option<u64> {
+    let rest = ["s_buffer_load_", "s_load_", "buffer_load_"].iter().find_map(|p| name.strip_prefix(p))?;
+    Some(match rest {
+        "dword" => 1,
+        "dwordx2" => 2,
+        "dwordx3" => 3,
+        "dwordx4" => 4,
+        "dwordx8" => 8,
+        "dwordx16" => 16,
+        _ => return None,
+    })
+}
+
+/// A register field as the register's number (`SBASE` counts pairs, `SRSRC` fours).
+fn register(d: &Decoded, name: &str) -> Result<u64, String> {
+    Ok(field(d, name).ok_or(name)? * rdna2::register_scale(name))
 }
 
 /// What a program is translated as.
@@ -172,6 +197,7 @@ fn vector_value(name: &str, a: &str, b: &str, c: &str) -> Option<String> {
         "v_cvt_f32_u32" => fr(format!("f32({a})")),
         "v_cvt_i32_f32" => fr(format!("i32({fa})")),
         "v_cvt_u32_f32" => format!("u32({fa})"),
+        "v_cvt_pkrtz_f16_f32" => format!("f16_rtz({fa}) | (f16_rtz({fb}) << 16u)"),
         "v_add_nc_u32" => format!("{a} + {b}"),
         "v_sub_nc_u32" => format!("{a} - {b}"),
         "v_subrev_nc_u32" => format!("{b} - {a}"),
@@ -200,19 +226,86 @@ fn statement(d: &Decoded, stage: Stage) -> Result<String, String> {
     let enc = d.enc.name;
     if name == "exp" {
         let get = |n: &str| field(d, n).unwrap_or(0);
-        if get("COMPR") != 0 {
-            return Err("exp of packed halves".into());
-        }
-        let value: Vec<String> = (0..4).map(|c| if get("EN") >> c & 1 == 1 { format!("bitcast<f32>(v{}[l])", get(&format!("VSRC{c}"))) } else { "0.0".into() }).collect();
-        let value = format!("vec4<f32>({})", value.join(", "));
-        let to = match (stage, get("TGT")) {
-            (Stage::Vertex { .. }, 12) => format!("o_pos = {value};"),
-            (Stage::Vertex { .. }, t @ 32..=63) => format!("o_p{} = {value};", t - 32),
-            (Stage::Pixel { .. }, t @ 0..=7) => format!("o_t{t} = {value}; live = true;"),
-            (Stage::Pixel { .. }, 9) => "live = true;".into(),
-            (_, t) => return Err(format!("exp to target {t} of this stage")),
+        let compr = get("COMPR") != 0;
+        // the components as raw dwords: registers, or the halves of two (COMPR)
+        let raw: Vec<Option<String>> = (0..4u64)
+            .map(|c| {
+                (get("EN") >> c & 1 == 1).then(|| match compr {
+                    true => format!("((v{}[l] >> {}u) & 0xffffu)", get(&format!("VSRC{}", c / 2)), 16 * (c % 2)),
+                    false => format!("v{}[l]", get(&format!("VSRC{c}"))),
+                })
+            })
+            .collect();
+        let tgt = get("TGT");
+        let to = if stage == Stage::Kernel {
+            let at = |c: usize| format!("res[{}u + l * 4u + {c}u]", KERNEL_EXPORTS as u64 + tgt * KERNEL_LANES as u64 * 4);
+            raw.iter().enumerate().filter_map(|(c, r)| Some(format!("{} = {};", at(c), r.as_ref()?))).collect::<Vec<_>>().join(" ")
+        } else {
+            let value: Vec<String> = raw
+                .iter()
+                .map(|r| match (r, compr) {
+                    (Some(r), true) => format!("unpack2x16float({r}).x"),
+                    (Some(r), false) => format!("bitcast<f32>({r})"),
+                    (None, _) => "0.0".into(),
+                })
+                .collect();
+            let value = format!("vec4<f32>({})", value.join(", "));
+            match (stage, tgt) {
+                (Stage::Vertex { .. }, 12) => format!("o_pos = {value};"),
+                (Stage::Vertex { .. }, t @ 32..=63) => format!("o_p{} = {value};", t - 32),
+                (Stage::Pixel { .. }, t @ 0..=7) => format!("o_t{t} = {value}; live = true;"),
+                (Stage::Pixel { .. }, 9) => "live = true;".into(),
+                (_, t) => return Err(format!("exp to target {t} of this stage")),
+            }
         };
         return Ok(format!("for (var l = 0u; l < LANES; l++) {{ if (on(exec, l)) {{ {to} }} }}"));
+    }
+    if let Some(count) = load_count(&name) {
+        let get = |n: &str| field(d, n).unwrap_or(0);
+        if let Some(scalar) = name.strip_prefix("s_") {
+            let sdata = field(d, "SDATA").ok_or("SDATA")?;
+            let sbase = register(d, "SBASE")?;
+            let soff = match get("SOFFSET") {
+                125 => "0u".to_string(),
+                c => source(c, lit)?,
+            };
+            let mut text = String::from("{ ");
+            if scalar.starts_with("buffer_") {
+                // V#: base, stride in dw1[29:16], num_records; a dword past the end reads 0
+                let _ = write!(text, "let off = {}u + {soff}; let st = (s[{}] >> 16u) & 0x3fffu; let lim = select(s[{}] * st, s[{}], st == 0u); let a = s[{sbase}] + off; ", get("OFFSET"), sbase + 1, sbase + 2, sbase + 2);
+                for k in 0..count {
+                    let _ = write!(text, "let t{k} = select(0u, ld(a + {}u), off + {}u < lim); ", 4 * k, 4 * k);
+                }
+            } else {
+                // a pointer and a signed 21-bit offset
+                let imm = (((get("OFFSET") as u32) << 11) as i32 >> 11) as u32;
+                let _ = write!(text, "let a = s[{sbase}] + {imm}u + {soff}; ");
+                for k in 0..count {
+                    let _ = write!(text, "let t{k} = ld(a + {}u); ", 4 * k);
+                }
+            }
+            for k in 0..count {
+                let _ = write!(text, "{} ", store(sdata + k, &format!("t{k}"))?);
+            }
+            return Ok(text + "}");
+        }
+        if get("LDS") != 0 || get("TFE") != 0 {
+            return Err(format!("{name} lds / tfe"));
+        }
+        let (vdata, vaddr, r) = (get("VDATA"), get("VADDR"), register(d, "SRSRC")?);
+        let (offen, idxen) = (get("OFFEN") != 0, get("IDXEN") != 0);
+        let index = if idxen { format!("v{vaddr}[l]") } else { "0u".into() };
+        let voff = if offen { format!("v{}[l]", vaddr + idxen as u64) } else { "0u".into() };
+        let soff = source(get("SOFFSET"), lit)?;
+        let mut text = format!("let st = (s[{}] >> 16u) & 0x3fffu; let n = s[{}]; let idx = {index}; let off = {voff} + {}u; let a = s[{r}] + {soff} + off + st * idx; ", r + 1, r + 2, get("OFFSET"));
+        // in range: by bytes without a stride, by records with one
+        for k in 0..count {
+            let _ = write!(text, "let t{k} = select(0u, ld(a + {}u), select(idx < n, off + {}u <= n, st == 0u)); ", 4 * k, 4 * k + 4);
+        }
+        for k in 0..count {
+            let _ = write!(text, "v{}[l] = t{k}; ", vdata + k);
+        }
+        return Ok(format!("for (var l = 0u; l < LANES; l++) {{ if (on(exec, l)) {{ {text}}} }}"));
     }
     if name.starts_with("v_interp_") {
         if !matches!(stage, Stage::Pixel { .. }) || enc != "ENC_VINTRP" {
@@ -369,6 +462,7 @@ pub fn translate(code: &[u8], stage: Stage) -> Result<Translation, String> {
     let mut written: BTreeSet<u64> = BTreeSet::new();
     // what the stage's interface has: exp param N / mrt N, interpolated attributes
     let (mut params, mut targets, mut attrs) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    let mut memory = false;
     for d in &insts {
         let (r, w) = rdna2::vgpr_uses(d);
         vgprs.extend(r.iter().copied());
@@ -386,6 +480,15 @@ pub fn translate(code: &[u8], stage: Stage) -> Result<Translation, String> {
         if d.enc.name == "ENC_VINTRP" {
             vgprs.insert(get("VDST"));
             attrs.insert(get("ATTR"));
+        }
+        let name = d.inst.name.to_ascii_lowercase();
+        if let Some(count) = load_count(&name) {
+            memory = true;
+            if !name.starts_with("s_") {
+                vgprs.extend(get("VDATA")..get("VDATA") + count);
+                written.extend(get("VDATA")..get("VDATA") + count);
+                vgprs.extend((0..(get("IDXEN") + get("OFFEN"))).map(|k| get("VADDR") + k));
+            }
         }
     }
     // registers the stage fills before the program runs
@@ -474,6 +577,10 @@ pub fn translate(code: &[u8], stage: Stage) -> Result<Translation, String> {
     } else {
         let _ = writeln!(w, "@group(0) @binding(0) var<uniform> sg: array<vec4<u32>, {}>;", KERNEL_SGPRS / 4);
     }
+    if memory {
+        let _ = writeln!(w, "@group(0) @binding({}) var<storage, read> mem: array<u32>;", if kernel { 2 } else { 1 });
+        let _ = writeln!(w, "fn ld(a: u32) -> u32 {{ let i = a >> 2u; if (i < arrayLength(&mem)) {{ return mem[i]; }} return 0u; }}");
+    }
     let _ = writeln!(w, "var<private> s: array<u32, {KERNEL_SGPRS}>;");
     let _ = writeln!(w, "var<private> exec: vec2<u32>;\nvar<private> vcc: vec2<u32>;\nvar<private> scc: bool;");
     for v in &vgprs {
@@ -483,6 +590,8 @@ pub fn translate(code: &[u8], stage: Stage) -> Result<Translation, String> {
     let _ = writeln!(w, "fn on(m: vec2<u32>, l: u32) -> bool {{ if (l < 32u) {{ return ((m.x >> l) & 1u) != 0u; }} return ((m.y >> (l - 32u)) & 1u) != 0u; }}");
     let _ = writeln!(w, "fn put(m: vec2<u32>, l: u32) -> vec2<u32> {{ if (l < 32u) {{ return vec2<u32>(m.x | (1u << l), m.y); }} return vec2<u32>(m.x, m.y | (1u << (l - 32u))); }}");
     let _ = writeln!(w, "fn mul_hi(a: u32, b: u32) -> u32 {{ let al = a & 0xffffu; let ah = a >> 16u; let bl = b & 0xffffu; let bh = b >> 16u; let mid = ah * bl + ((al * bl) >> 16u); let mid2 = al * bh + (mid & 0xffffu); return ah * bh + (mid >> 16u) + (mid2 >> 16u); }}");
+    // a float as a half, rounded toward zero (from the bits: WGSL's pack leaves the rounding open)
+    let _ = writeln!(w, "fn f16_rtz(f: f32) -> u32 {{ let b = bitcast<u32>(f); let sign = (b >> 16u) & 0x8000u; let u = b & 0x7fffffffu; let e = i32(u >> 23u) - 127; if (u > 0x7f800000u) {{ return sign | 0x7e00u; }} if (u == 0x7f800000u) {{ return sign | 0x7c00u; }} if (e > 15) {{ return sign | 0x7bffu; }} if (e < -25) {{ return sign; }} if (e < -14) {{ return sign | (((u & 0x7fffffu) | 0x800000u) >> u32(-1 - e)); }} return sign | (u32(e + 15) << 10u) | ((u & 0x7fffffu) >> 13u); }}");
     match stage {
         Stage::Kernel => {
             let _ = writeln!(w, "@compute @workgroup_size(1) fn main() {{");
@@ -491,6 +600,8 @@ pub fn translate(code: &[u8], stage: Stage) -> Result<Translation, String> {
             for v in &vgprs {
                 let _ = writeln!(w, "  for (var l = 0u; l < LANES; l++) {{ v{v}[l] = io[{KERNEL_SGPRS}u + l * {KERNEL_VGPRS}u + {v}u]; }}");
             }
+            // (before the program: its exports go straight to `res`)
+            let _ = writeln!(w, "  for (var i = 0u; i < {KERNEL_EXPORTS}u; i++) {{ res[i] = io[i]; }}");
         }
         Stage::Vertex { attributes, .. } => {
             let _ = writeln!(w, "var<private> o_pos: vec4<f32>;");
@@ -539,10 +650,9 @@ pub fn translate(code: &[u8], stage: Stage) -> Result<Translation, String> {
     let _ = writeln!(w, "  var pc = 0u;\n  // a program that never ends is cut off\n  for (var steps = 0u; steps < 1000000u; steps++) {{\n    switch pc {{");
     w.push_str(&body);
     let _ = writeln!(w, "      default {{ pc = {END}u; }}\n    }}\n    if (pc == {END}u) {{ break; }}\n  }}");
-    let total = KERNEL_SGPRS + KERNEL_LANES * KERNEL_VGPRS;
+    let total = KERNEL_EXPORTS + 64 * KERNEL_LANES * 4;
     match stage {
         Stage::Kernel => {
-            let _ = writeln!(w, "  for (var i = 0u; i < {total}u; i++) {{ res[i] = io[i]; }}");
             let _ = writeln!(w, "  for (var i = 0u; i < {KERNEL_SGPRS}u; i++) {{ res[i] = s[i]; }}");
             let _ = writeln!(w, "  res[106] = vcc.x; res[107] = vcc.y; res[126] = exec.x; res[127] = exec.y; res[{KERNEL_SCC_SLOT}] = u32(scc);");
             for v in &written {
@@ -562,7 +672,7 @@ pub fn translate(code: &[u8], stage: Stage) -> Result<Translation, String> {
         }
     }
     let _ = writeln!(w, "}}");
-    Ok(Translation { wgsl: w, dwords: total })
+    Ok(Translation { wgsl: w, dwords: total, memory })
 }
 
 #[cfg(test)]
@@ -591,7 +701,8 @@ mod tests {
         // only the registers the program uses are declared, only the written ones stored
         assert!(t.wgsl.contains("var<private> v1: array<u32, 64>;") && !t.wgsl.contains("var<private> v3:"));
         assert!(t.wgsl.contains("+ 5u] = v5[l];") && !t.wgsl.contains("+ 1u] = v1[l];"));
-        assert_eq!(t.dwords, 128 + 64 * 256);
+        assert_eq!(t.dwords, 128 + 64 * 256 + 64 * 64 * 4);
+        assert!(!t.memory && !t.wgsl.contains("mem:"));
     }
 
     #[test]
@@ -618,7 +729,29 @@ mod tests {
         assert!(t.wgsl.contains("v4[l] = bitcast<u32>(xi.a1[2]);") && t.wgsl.contains("@location(1) a1: vec4<f32>,"), "{}", t.wgsl);
         assert!(t.wgsl.contains("if (!live) { discard; }") && t.wgsl.contains("return PsOut(o_t0);"), "{}", t.wgsl);
         // an export a stage does not have is refused
-        assert!(translate(&ps, Stage::Kernel).is_err() && translate(&vs, Stage::Pixel { input_ena: 0 }).is_err());
+        assert!(translate(&vs, Stage::Pixel { input_ena: 0 }).is_err() && translate(&ps, Stage::Vertex { attr_base: 4, attributes: 0 }).is_err());
+    }
+
+    #[test]
+    fn loads_read_the_memory_array_within_a_descriptor() {
+        let code = asm(&[
+            ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0x10), ("SOFFSET", 125)], None),
+            ("S_BUFFER_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 10), ("SBASE", 6), ("OFFSET", 4), ("SOFFSET", 125)], None),
+            ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 3), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 8), ("OFFEN", 1)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0x3), ("VSRC0", 3), ("VSRC1", 3), ("COMPR", 1), ("DONE", 1)], None),
+        ]);
+        let t = translate_kernel(&code).unwrap();
+        assert!(t.memory && t.wgsl.contains("@group(0) @binding(2) var<storage, read> mem: array<u32>;"), "{}", t.wgsl);
+        // SBASE counts register pairs, SRSRC fours: both descriptors are s12..
+        assert!(t.wgsl.contains("let a = s[0] + 16u + 0u; let t0 = ld(a + 0u); let t1 = ld(a + 4u); s[8] = t0; s[9] = t1;"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("let a = s[12] + off; let t0 = select(0u, ld(a + 0u), off + 0u < lim); s[10] = t0;"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("let off = v0[l] + 8u; let a = s[12] + 0u + off + st * idx;") && t.wgsl.contains("v3[l] = t0;"), "{}", t.wgsl);
+        // a kernel's export is raw dwords after the registers: target 12, the halves of v3
+        let at = 128 + 64 * 256 + 12 * 64 * 4;
+        assert!(t.wgsl.contains(&format!("res[{at}u + l * 4u + 1u] = ((v3[l] >> 16u) & 0xffffu);")), "{}", t.wgsl);
+        // in a stage the array is binding 1
+        let t = translate(&code, Stage::Vertex { attr_base: 4, attributes: 0 }).unwrap();
+        assert!(t.wgsl.contains("@group(0) @binding(1) var<storage, read> mem") && t.wgsl.contains("unpack2x16float(((v3[l] >> 0u) & 0xffffu)).x"), "{}", t.wgsl);
     }
 
     #[test]
