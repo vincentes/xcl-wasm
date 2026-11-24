@@ -125,6 +125,14 @@ fn CoTaskMemFree(g: &mut Guest) -> H {
     Ok(0)
 }
 
+/// The command line as bytes (GetCommandLineW's, which is ASCII or is taken as UTF-8).
+fn GetCommandLineA(g: &mut Guest) -> H {
+    g.static_block("command line, narrow", |g| {
+        let line = g.command_line.clone();
+        g.alloc_cstr(&line)
+    })
+}
+
 /// GetStartupInfoW(info): 104 bytes, of which only the size says anything.
 fn GetStartupInfoW(g: &mut Guest) -> H {
     let at = g.arg(0)?;
@@ -138,13 +146,51 @@ fn GetUserDefaultUILanguage(_: &mut Guest) -> H {
     Ok(0x0409)
 }
 
+const ERROR_FILE_NOT_FOUND: u64 = 2;
+
+/// RegOpenKeyW(key, sub key, key out) / RegOpenKeyExW(key, sub key, options, access, key out):
+/// there is no registry. The answer is an error code (0 would be "opened").
+fn reg_open(g: &mut Guest, out: usize) -> H {
+    let (name, out) = (g.arg(1)?, g.arg(out)?);
+    let name = if name == 0 { String::new() } else { g.mem.wstr(name, 512)? };
+    let note = format!("[registry] no key {name}");
+    if !g.log.contains(&note) {
+        g.log.push(note);
+    }
+    if out != 0 {
+        g.mem.write_u64(out, 0)?;
+    }
+    Ok(ERROR_FILE_NOT_FOUND)
+}
+
+fn RegOpenKeyW(g: &mut Guest) -> H {
+    reg_open(g, 2)
+}
+
+fn RegOpenKeyExW(g: &mut Guest) -> H {
+    reg_open(g, 4)
+}
+
+/// A value of a key that could not be opened.
+fn reg_not_found(_: &mut Guest) -> H {
+    Ok(ERROR_FILE_NOT_FOUND)
+}
+
+/// RegCloseKey of a key nobody has: ERROR_INVALID_HANDLE.
+fn RegCloseKey(_: &mut Guest) -> H {
+    Ok(ERROR_INVALID_HANDLE as u64)
+}
+
 pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
+    register!(map; RegOpenKeyW, RegOpenKeyExW, RegCloseKey);
+    map.insert("RegQueryValueExW", reg_not_found as Handler);
+    map.insert("RegGetValueW", reg_not_found as Handler);
     register!(map; MultiByteToWideChar, WideCharToMultiByte, lstrcmpW, lstrcmpiW, LocalAlloc, LocalFree, CoTaskMemAlloc, CoTaskMemFree);
-    register!(map; GetStartupInfoW, GetUserDefaultUILanguage);
+    register!(map; GetStartupInfoW, GetUserDefaultUILanguage, GetCommandLineA);
     map.insert("GlobalFree", LocalFree as Handler);
     // the functions that differ from one the host has only in what their extra arguments
     // say, which the host does not look at
-    for (name, same) in [("GetEnvironmentVariableA", "GetEnvironmentVariableW"), ("LoadLibraryA", "LoadLibraryExA"), ("LoadLibraryExW", "LoadLibraryW")] {
+    for (name, same) in [("GetEnvironmentVariableA", "GetEnvironmentVariableW"), ("CreateEventA", "CreateEventW"), ("LoadLibraryA", "LoadLibraryExA"), ("LoadLibraryExW", "LoadLibraryW")] {
         if let Some(&f) = map.get(same) {
             map.insert(name, f);
         }
@@ -229,6 +275,31 @@ mod tests {
         assert_eq!(call(&mut g, lstrcmpiW, &[page, page + 0x100]), Ok(0));
         assert_eq!(call(&mut g, lstrcmpW, &[page, page + 0x100]), Ok(u32::MAX as u64));
         assert_eq!(call(&mut g, lstrcmpiW, &[page + 0x200, page]), Ok(1));
+    }
+
+    #[test]
+    fn the_command_line_is_one_block_of_bytes() {
+        let (mut g, _) = guest();
+        g.command_line = "title.exe -level 3".into();
+        let at = call(&mut g, GetCommandLineA, &[]).unwrap();
+        assert_eq!(g.mem.cstr(at, 64).unwrap(), "title.exe -level 3");
+        assert_eq!(call(&mut g, GetCommandLineA, &[]), Ok(at));
+    }
+
+    #[test]
+    fn the_registry_has_no_keys() {
+        let (mut g, page) = guest();
+        let name: Vec<u8> = "SOFTWARE\\Vendor".encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        g.mem.write(page, &name).unwrap();
+        g.mem.write_u64(page + 0x100, 0x1234).unwrap();
+        let hklm = 0xFFFF_FFFF_8000_0002;
+        assert_eq!(call(&mut g, RegOpenKeyW, &[hklm, page, page + 0x100]), Ok(2));
+        assert_eq!(g.mem.read_u64(page + 0x100).unwrap(), 0);
+        assert_eq!(call(&mut g, RegOpenKeyExW, &[hklm, page, 0, 0x20019, page + 0x100]), Ok(2));
+        // asked twice, noted once
+        assert_eq!(g.log, ["[registry] no key SOFTWARE\\Vendor"]);
+        assert_eq!(call(&mut g, reg_not_found, &[0, page]), Ok(2));
+        assert_eq!(call(&mut g, RegCloseKey, &[0]), Ok(6));
     }
 
     #[test]
