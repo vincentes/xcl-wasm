@@ -311,6 +311,7 @@ impl Guest {
             }
             // what goes on behind the title's back: the queues of the graphics device
             win::d3d12x::pump(self);
+            win::xaudio2::pump(self);
             let waits = match exit {
                 Exit::Limit => {
                     if left == 0 {

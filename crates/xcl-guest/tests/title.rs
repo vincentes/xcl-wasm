@@ -35,7 +35,6 @@ const FAILS: &[&str] = &[
     "D3D12.X: dynamic depth bias",
     // libraries the guest does not have
     "MFPlat",
-    "XAudio2",
 ];
 
 /// Checks of areas that are being worked on: they may pass or fail.
@@ -77,7 +76,7 @@ fn the_test_title_passes_its_checks_up_to_where_the_guest_gets() {
     // it runs to its end and exits with the number of checks that failed
     assert_eq!(lines.last(), Some(&format!("xcl_testtitle: done, failures: {failed}").as_str()));
     assert_eq!(stop, Stop::Exit(failed));
-    assert!(failed <= 7, "{failed} checks failed");
+    assert!(failed <= 6, "{failed} checks failed");
     // the game folder is as it was: what the title changed is in the overlay
     assert_eq!(g.vfs.game_file("data\\hello.txt"), Some(&std::fs::read(folder.join("data/hello.txt")).unwrap()[..]));
     assert!(g.vfs.game_file("data\\delete_me.txt").is_some());

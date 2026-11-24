@@ -244,8 +244,14 @@ impl Guest {
     /// The worker thread is at its slot: give it the next thread-pool callback that is due
     /// (`Ok(true)`), or say until when it has nothing to do.
     pub(crate) fn worker_turn(&mut self) -> Result<bool, Stop> {
+        // a callback the host has queued (a voice's buffer ended …) comes first
+        if let Some((function, args)) = self.win.host_calls.pop_front() {
+            self.thread_mut().wait = None;
+            self.host_thread_call(function, &args)?;
+            return Ok(true);
+        }
         let now = self.now_ns();
-        // the Win32 thread pool's callbacks first, then the task queues'
+        // the Win32 thread pool's callbacks, then the task queues'
         let mut next = match super::threadpool::take(self, now) {
             Ok((callback, args)) => {
                 self.thread_mut().wait = None;

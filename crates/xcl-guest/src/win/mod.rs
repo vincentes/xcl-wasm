@@ -23,6 +23,7 @@ mod sync;
 mod text;
 mod threadpool;
 mod user;
+pub mod xaudio2;
 pub mod xg;
 pub mod xgameruntime;
 
@@ -50,6 +51,9 @@ pub struct State {
     pub window_classes: u32,
     pub xgr: xgameruntime::State,
     pub xg: xg::State,
+    pub audio: xaudio2::State,
+    /// guest functions for the host-driven thread to call: (function, arguments)
+    pub host_calls: std::collections::VecDeque<(u64, Vec<u64>)>,
     pub d3d: d3d12x::State,
     pub pool: threadpool::Pool,
     pub dstorage: dstorage::State,
@@ -157,6 +161,7 @@ pub fn handlers() -> HashMap<&'static str, Handler> {
     user::register(&mut map);
     xgameruntime::register(&mut map);
     xg::register(&mut map);
+    xaudio2::register(&mut map);
     gdk::register(&mut map);
     d3d12x::register(&mut map);
     // after kernel32 and crt: the file functions also take the standard handles
