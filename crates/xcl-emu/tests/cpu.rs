@@ -191,6 +191,11 @@ fn the_guest_leaves_through_traps_faults_and_limits() {
     let (mut cpu, mut mem) = machine(&[0xD9, 0xE8, 0xC3]);
     assert!(matches!(cpu.run(&mut mem, 1000), Exit::Undefined { rip: CODE, .. }));
 
+    // mov ecx,7; int 0x29 (__fastfail(7))
+    let (mut cpu, mut mem) = machine(&[0xB9, 7, 0, 0, 0, 0xCD, 0x29]);
+    assert_eq!(cpu.run(&mut mem, 1000), Exit::FailFast);
+    assert_eq!((cpu.rip, cpu.r[RCX]), (CODE + 5, 7));
+
     // jmp $
     let (mut cpu, mut mem) = machine(&[0xEB, 0xFE]);
     assert_eq!(cpu.run(&mut mem, 1000), Exit::Limit);

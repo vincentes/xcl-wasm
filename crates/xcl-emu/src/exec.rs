@@ -863,6 +863,10 @@ impl Ctx<'_> {
                 self.cpu.r[RBP] = self.pop()?;
             }
             0xCC => return Err(Exit::Breakpoint),
+            // int n: only __fastfail (int 0x29) means something without a kernel
+            0xCD => {
+                return Err(if self.fetch8()? == 0x29 { Exit::FailFast } else { self.undefined() });
+            }
             // fwait
             0x9B => {}
             // x87: only its control word (fninit, fnclex, fldcw, fnstcw); no x87 stack yet

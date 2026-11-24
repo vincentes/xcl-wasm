@@ -35,6 +35,9 @@ pub enum Exit {
     DivideError,
     /// `int3`. RIP is after it.
     Breakpoint,
+    /// `int 0x29` (`__fastfail`): the program ends itself at once; the code is in RCX. RIP is
+    /// at the instruction.
+    FailFast,
     /// `hlt` / `ud2`-style stop the guest asked for. RIP is at the instruction.
     Halt,
 }

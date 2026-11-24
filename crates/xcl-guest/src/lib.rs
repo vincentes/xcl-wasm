@@ -343,6 +343,13 @@ impl Guest {
                     }
                     Err(stop) => return stop,
                 },
+                // __fastfail: the title ends itself (STATUS_STACK_BUFFER_OVERRUN is what Windows
+                // reports for every fail-fast code)
+                Exit::FailFast => {
+                    let code = self.cpu.r[xcl_emu::cpu::RCX];
+                    self.log.push(format!("the title failed fast (code {code}) at {:#x}", self.cpu.rip));
+                    return self.exit(0xC000_0409);
+                }
                 other => return Stop::Cpu(other),
             };
             if waits {
