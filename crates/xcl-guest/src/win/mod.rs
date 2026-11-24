@@ -23,6 +23,7 @@ mod sync;
 mod text;
 mod threadpool;
 mod user;
+pub mod xg;
 pub mod xgameruntime;
 
 /// A module's static TLS, from its TLS directory.
@@ -48,6 +49,7 @@ pub struct State {
     pub xmem: kernelx::XMem,
     pub window_classes: u32,
     pub xgr: xgameruntime::State,
+    pub xg: xg::State,
     pub d3d: d3d12x::State,
     pub pool: threadpool::Pool,
     pub dstorage: dstorage::State,
@@ -154,6 +156,7 @@ pub fn handlers() -> HashMap<&'static str, Handler> {
     text::register(&mut map);
     user::register(&mut map);
     xgameruntime::register(&mut map);
+    xg::register(&mut map);
     gdk::register(&mut map);
     d3d12x::register(&mut map);
     // after kernel32 and crt: the file functions also take the standard handles

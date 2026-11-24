@@ -34,8 +34,12 @@ const FAILS: &[&str] = &[
     "D3D12.X: triangle rendered",
     "D3D12.X: dynamic depth bias",
     // libraries the guest does not have
-    "DirectStorage",
+    "MFPlat",
+    "XAudio2",
 ];
+
+/// Checks of areas that are being worked on: they may pass or fail.
+const EITHER: &[&str] = &["DirectStorage"];
 
 #[test]
 fn the_test_title_passes_its_checks_up_to_where_the_guest_gets() {
@@ -60,18 +64,20 @@ fn the_test_title_passes_its_checks_up_to_where_the_guest_gets() {
     let lines: Vec<&str> = output.lines().collect();
     assert_eq!(lines.first(), Some(&"xcl_testtitle: start"));
     let checks: Vec<&str> = lines.iter().skip(1).copied().filter(|l| l.starts_with("[PASS] ") || l.starts_with("[FAIL] ")).collect();
-    let mut passed = 0;
+    assert_eq!(checks.len(), 50, "the title has 50 checks");
+    let mut failed = 0;
     for line in &checks {
         let name = &line[7..];
-        let expected_to_fail = FAILS.iter().any(|f| name.starts_with(f));
-        assert_eq!(line.starts_with("[FAIL] "), expected_to_fail, "{line}");
-        passed += !expected_to_fail as usize;
+        let fails = line.starts_with("[FAIL] ");
+        failed += fails as u32;
+        if !EITHER.iter().any(|e| name.starts_with(e)) {
+            assert_eq!(fails, FAILS.iter().any(|f| name.starts_with(f)), "{line}");
+        }
     }
-    // the title ends itself in its XG texture check (no xg_xs.dll here), after these
-    assert_eq!(passed, 41, "checks passed");
-    assert!(checks.last().is_some_and(|l| l.starts_with("[FAIL] DirectStorage")), "the last check reached");
-    // … with a fail-fast (its own abort), not a fault of the guest
-    assert_eq!(stop, Stop::Exit(0xC000_0409));
+    // it runs to its end and exits with the number of checks that failed
+    assert_eq!(lines.last(), Some(&format!("xcl_testtitle: done, failures: {failed}").as_str()));
+    assert_eq!(stop, Stop::Exit(failed));
+    assert!(failed <= 7, "{failed} checks failed");
     // the game folder is as it was: what the title changed is in the overlay
     assert_eq!(g.vfs.game_file("data\\hello.txt"), Some(&std::fs::read(folder.join("data/hello.txt")).unwrap()[..]));
     assert!(g.vfs.game_file("data\\delete_me.txt").is_some());

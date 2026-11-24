@@ -23,14 +23,20 @@
 
 #![allow(non_snake_case)]
 
+#[cfg(windows)]
 use std::ffi::c_void;
+#[cfg(windows)]
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(windows)]
 use std::sync::OnceLock;
 
 use crate::gpu::tiling::{Chain, Layout};
-use crate::util::{HRESULT, S_OK};
+use crate::util::HRESULT;
+#[cfg(windows)]
+use crate::util::S_OK;
 
 const E_NOTIMPL: HRESULT = 0x8000_4001u32 as i32;
+#[cfg(windows)]
 const E_POINTER: HRESULT = 0x8000_4003u32 as i32;
 const E_INVALIDARG: HRESULT = 0x8007_0057u32 as i32;
 const E_FAIL: HRESULT = 0x8000_4005u32 as i32;
@@ -42,6 +48,7 @@ const MIP_BYTES: usize = 0x70;
 const PLANE_BYTES: usize = MIP + 15 * MIP_BYTES;
 const MAX_MIPS: usize = 15;
 
+#[cfg(windows)]
 pub fn exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![XGCreateTextureComputer, XGSuggestSwizzleMode]
 }
@@ -134,7 +141,11 @@ fn micro(e: u32) -> (usize, usize) {
 impl Texture {
     /// From a D3D12_RESOURCE_DESC (0x38 bytes) as the console's.
     pub fn new(d: &[u8; 0x38]) -> Result<Texture, HRESULT> {
-        Self::with_pipes(d, crate::gpu::texture::console_pipes())
+        // the console XCL reports to the title (as `gpu::texture::console_pipes`, which is
+        // Windows-only like the rest of that module)
+        let series_s = crate::state::config().is_series_s();
+        let pipes = if series_s { crate::gpu::tiling::PipeConfig { pipes_log2: 3, pkrs_log2: 2 } } else { crate::gpu::tiling::PipeConfig { pipes_log2: 5, pkrs_log2: 3 } };
+        Self::with_pipes(d, pipes)
     }
 
     /// `new` for a given pipe / packer configuration (only the XOR modes depend on it).
@@ -374,7 +385,7 @@ impl Surface {
     }
 
     /// depth slices of level `i` (an array's slices) and the same padded to whole blocks
-    fn slices(&self, i: usize) -> (u32, u32) {
+    pub fn slices(&self, i: usize) -> (u32, u32) {
         if self.depth == 0 {
             return (self.array, self.array);
         }
@@ -474,12 +485,14 @@ impl Surface {
 // ---------------------------------------------------------------------------------------
 
 #[repr(C)]
+#[cfg(windows)]
 struct Computer {
     vtbl: *const usize,
     refs: AtomicU32,
     tex: Texture,
 }
 
+#[cfg(windows)]
 fn vtbl() -> &'static [usize] {
     static V: OnceLock<&'static [usize]> = OnceLock::new();
     V.get_or_init(|| {
@@ -504,6 +517,7 @@ fn vtbl() -> &'static [usize] {
     })
 }
 
+#[cfg(windows)]
 unsafe fn tex<'a>(p: *mut c_void) -> &'a Texture {
     &(*(p as *const Computer)).tex
 }
@@ -513,6 +527,7 @@ unsafe fn tex<'a>(p: *mut c_void) -> &'a Texture {
 /// (a newer library's; a retail game passes 0 and its desc's own layout field as `out`): the explicit
 /// layout (0x100 | mode) the library takes for `Layout` 0. The choice itself is checked against
 /// the console's library (`optimal_mode`), this function is not – none at hand exports it.
+#[cfg(windows)]
 pub unsafe extern "system" fn XGSuggestSwizzleMode(desc: *const u8, _what: u32, out: *mut u32) -> HRESULT {
     if desc.is_null() || out.is_null() {
         return E_POINTER;
@@ -537,6 +552,7 @@ pub unsafe extern "system" fn XGSuggestSwizzleMode(desc: *const u8, _what: u32, 
     S_OK
 }
 
+#[cfg(windows)]
 pub unsafe extern "system" fn XGCreateTextureComputer(desc: *const u8, out: *mut *mut c_void) -> HRESULT {
     if desc.is_null() || out.is_null() {
         return E_POINTER;
@@ -558,10 +574,12 @@ pub unsafe extern "system" fn XGCreateTextureComputer(desc: *const u8, out: *mut
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn add_ref(p: *mut c_void) -> u32 {
     (*(p as *const Computer)).refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn release(p: *mut c_void) -> u32 {
     let n = (*(p as *const Computer)).refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if n == 0 {
@@ -570,6 +588,7 @@ unsafe extern "system" fn release(p: *mut c_void) -> u32 {
     n
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn get_resource_layout(p: *mut c_void, out: *mut u8) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
@@ -578,14 +597,17 @@ unsafe extern "system" fn get_resource_layout(p: *mut c_void, out: *mut u8) -> H
     S_OK
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn get_size(p: *mut c_void) -> u64 {
     tex(p).size()
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn get_alignment(p: *mut c_void) -> u64 {
     tex(p).alignment()
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn get_mip_offset(p: *mut c_void, plane: u32, mip: u32) -> u64 {
     match tex(p).plane_surface(plane) {
         Some((s, at)) if (mip as usize) < s.chain.levels.len() => at + s.mip_offset(mip as usize),
@@ -593,6 +615,7 @@ unsafe extern "system" fn get_mip_offset(p: *mut c_void, plane: u32, mip: u32) -
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn get_texel_offset(p: *mut c_void, plane: u32, mip: u32, x: u64, y: u32, slice: u32, _sample: u32, bit: *mut u32) -> u64 {
     if !bit.is_null() {
         *bit = 0;
@@ -603,6 +626,7 @@ unsafe extern "system" fn get_texel_offset(p: *mut c_void, plane: u32, mip: u32,
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn not_implemented(_p: *mut c_void) -> HRESULT {
     E_NOTIMPL
 }
@@ -612,6 +636,7 @@ unsafe extern "system" fn not_implemented(_p: *mut c_void) -> HRESULT {
 /// swizzle modes E_FAIL; the mip tail is tile 0 of a slice; `count` comes back as the standard
 /// – not packed – subresources among the asked ones, written at their index from `first`, the
 /// packed ones left as they were). Volumes: not modelled (E_NOTIMPL).
+#[cfg(windows)]
 unsafe extern "system" fn get_resource_tiling(p: *mut c_void, tiles: *mut u32, packed: *mut [u32; 3], shape: *mut [u32; 3], count: *mut u32, first: u32, out: *mut [u32; 3]) -> HRESULT {
     let Some(s) = tex(p).texels() else { return E_FAIL };
     if s.depth > 0 {
@@ -661,10 +686,11 @@ unsafe extern "system" fn get_resource_tiling(p: *mut c_void, tiles: *mut u32, p
 }
 
 /// bytes of a tiled resource's tile
+#[cfg(windows)]
 const TILE_BYTES: usize = 0x1_0000;
 
 /// (surface, its offset, level, slice) of a subresource (mip + slice × mips) of a plane
-fn subresource(t: &Texture, plane: u32, sub: u32) -> Option<(&Surface, u64, usize, usize)> {
+pub fn subresource(t: &Texture, plane: u32, sub: u32) -> Option<(&Surface, u64, usize, usize)> {
     let (s, at) = t.plane_surface(plane)?;
     let mips = s.chain.levels.len();
     let (i, k) = (sub as usize % mips, sub as usize / mips);
@@ -672,6 +698,7 @@ fn subresource(t: &Texture, plane: u32, sub: u32) -> Option<(&Surface, u64, usiz
 }
 
 /// rows of `src` (`row_pitch` apart) → the level's place in `dst` (the whole resource)
+#[cfg(windows)]
 unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
@@ -695,6 +722,7 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
 }
 
 /// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart)
+#[cfg(windows)]
 unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];

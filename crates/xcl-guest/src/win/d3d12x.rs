@@ -11,6 +11,9 @@
 //!   between buffers, the console's memory commands (writes, fills, copies, timestamps) and
 //!   waits for a value in memory, which hold the queue until another thread writes it. A fence
 //!   is signalled when the queue gets there.
+//! * textures are laid out in their memory as the console lays them out (its tiling, from
+//!   `xcl::hle::xg`): copies between textures and buffers tile and untile, a cleared target is
+//!   filled, and PresentX hands the host the back buffer's pixels in rows.
 //! * draws, pipelines, views and everything else are accepted and do nothing.
 //!
 //! An object is a small block of guest memory whose first word points at its vtable; what the
@@ -23,6 +26,8 @@
 #![allow(non_snake_case)]
 
 use std::collections::{HashMap, VecDeque};
+
+use xcl::hle::xg::Texture;
 
 use super::*;
 use crate::{Guest, Handler, Stop};
@@ -132,6 +137,10 @@ pub enum Command {
     Signal { fence: u64, value: u64 },
     /// PresentX: the frame is what the resource holds when the queue gets here
     Present { token: u64, resource: u64 },
+    /// a texture's subresource, untiled, to rows `pitch` apart in memory – and back
+    TextureToRows { texture: u64, sub: u32, to: u64, pitch: u64 },
+    RowsToTexture { from: u64, pitch: u64, texture: u64, sub: u32 },
+    TextureToTexture { from: u64, from_sub: u32, to: u64, to_sub: u32 },
 }
 
 #[derive(Default)]
@@ -151,6 +160,8 @@ pub struct State {
     page_pools: Vec<Option<(u64, u32)>>,
     /// render target views: descriptor handle → resource
     render_targets: HashMap<u64, u64>,
+    /// the console's layout of each texture resource
+    textures: HashMap<u64, Texture>,
     dxgi_device: u64,
     dxgi_adapter: u64,
     pub clock: FrameClock,
@@ -462,11 +473,16 @@ fn new_resource(g: &mut Guest, desc: u64, address: Option<u64>, readback: bool, 
     if ppv == 0 {
         return Ok(S_FALSE);
     }
-    let size = approx_size(g, desc)?;
     let mut d = [0u8; 64];
     if desc != 0 {
         g.mem.read(desc, &mut d[..56])?;
     }
+    // a texture takes what the console's layout of it takes
+    let texture = (desc != 0 && d[0] != 1).then(|| Texture::new(d[..56].try_into().unwrap()).ok()).flatten().filter(|t| t.size() != 0);
+    let size = match &texture {
+        Some(t) => t.size(),
+        None => approx_size(g, desc)?,
+    };
     let at = match address {
         Some(at) => at,
         None => match graphics_memory(g, size, readback) {
@@ -479,6 +495,9 @@ fn new_resource(g: &mut Guest, desc: u64, address: Option<u64>, readback: bool, 
         obj.desc = d;
         obj.mem = (at, size);
         obj.value = at;
+    }
+    if let Some(t) = texture {
+        g.win.d3d.textures.insert(o, t);
     }
     g.mem.write_u64(ppv, o)?;
     Ok(0)
@@ -649,32 +668,50 @@ fn Device_CreateFence(g: &mut Guest) -> H {
     Ok(0)
 }
 
-/// GetCopyableFootprints(desc, first, count, base offset, layouts, row counts, row sizes, total)
+/// GetCopyableFootprints(desc, first, count, base offset, layouts, row counts, row sizes, total):
+/// where the subresources of a texture go in a buffer – one after the other, rows 256 bytes
+/// aligned and subresources 512, as D3D12 places them.
 fn Device_GetCopyableFootprints(g: &mut Guest) -> H {
-    let (desc, count, base) = (g.arg(1)?, g.arg(3)? as u32 as u64, g.arg(4)?);
-    let (layouts, rows, row_sizes, total) = (g.arg(5)?, g.arg(6)?, g.arg(7)?, g.arg(8)?);
-    let size = approx_size(g, desc)?;
-    let (width, height, format) = if desc == 0 { (1, 1, 0) } else { (g.mem.read_u64(desc + 16)?.max(1), g.mem.read_u32(desc + 24)?.max(1), g.mem.read_u32(desc + 32)?) };
-    let row = ((width * 4 + 255) & !255) as u32;
-    for i in 0..count {
+    let (desc, first, count, base) = (g.arg(1)?, g.arg(2)? as u32, g.arg(3)? as u32, g.arg(4)?);
+    let (layouts, rows_out, row_sizes, total) = (g.arg(5)?, g.arg(6)?, g.arg(7)?, g.arg(8)?);
+    if desc == 0 {
+        return Ok(0);
+    }
+    let d: [u8; 56] = g.mem.read_n(desc)?;
+    let format = u32::from_le_bytes(d[32..36].try_into().unwrap());
+    let texture = (d[0] != 1).then(|| Texture::new(&d).ok()).flatten();
+    let mut cursor = base;
+    for i in 0..count as u64 {
+        // (pixels a row, rows of pixels, slices, bytes a row, rows of elements)
+        let (width, height, depth, row_bytes, rows) = match texture.as_ref().and_then(|t| crate::win::xg::level_shape(t, t.main as u32, first + i as u32).map(|s| (t, s))) {
+            Some((t, (w, h, depth, bytes))) => {
+                let side = t.texels().map_or(1, |s| s.side as usize);
+                ((w * side) as u32, (h * side) as u32, depth as u32, (w * bytes) as u64, h as u64)
+            }
+            // a buffer: one row of its width
+            None => (u64::from_le_bytes(d[16..24].try_into().unwrap()) as u32, 1, 1, u64::from_le_bytes(d[16..24].try_into().unwrap()), 1),
+        };
+        let pitch = (row_bytes + 255) & !255;
+        let offset = (cursor + 511) & !511;
         if layouts != 0 {
             let l = layouts + 32 * i;
-            g.mem.write_u64(l, base)?;
+            g.mem.write_u64(l, offset)?;
             g.mem.write_u32(l + 8, format)?;
-            g.mem.write_u32(l + 12, width as u32)?;
+            g.mem.write_u32(l + 12, width)?;
             g.mem.write_u32(l + 16, height)?;
-            g.mem.write_u32(l + 20, 1)?;
-            g.mem.write_u32(l + 24, row)?;
+            g.mem.write_u32(l + 20, depth)?;
+            g.mem.write_u32(l + 24, pitch as u32)?;
         }
-        if rows != 0 {
-            g.mem.write_u32(rows + 4 * i, height)?;
+        if rows_out != 0 {
+            g.mem.write_u32(rows_out + 4 * i, rows as u32)?;
         }
         if row_sizes != 0 {
-            g.mem.write_u64(row_sizes + 8 * i, width * 4)?;
+            g.mem.write_u64(row_sizes + 8 * i, row_bytes)?;
         }
+        cursor = offset + pitch * (rows * depth as u64 - 1) + row_bytes;
     }
     if total != 0 {
-        g.mem.write_u64(total, size.max(row as u64 * height as u64))?;
+        g.mem.write_u64(total, cursor - base)?;
     }
     Ok(0)
 }
@@ -749,16 +786,40 @@ fn run(g: &mut Guest, c: &Command) -> Result<bool, xcl_emu::mem::Fault> {
                 d3d.clock.flipped.pop_front();
             }
             d3d.presents += 1;
-            // the back buffer's texels as they are in its memory: rows of 4 bytes a texel (this
-            // device keeps textures linear; the console's tiling is not modelled)
-            if let Some(o) = d3d.objects.get(&resource).filter(|o| o.kind == Kind::Resource) {
+            // the back buffer's texels, untiled: rows of 4 bytes a texel
+            if let (Some(o), Some(t)) = (g.win.d3d.objects.get(&resource), g.win.d3d.textures.get(&resource)) {
                 let u32_at = |i: usize| u32::from_le_bytes(o.desc[i..i + 4].try_into().unwrap());
-                let (width, height, format, at) = (u32_at(16), u32_at(24), u32_at(32), o.mem.0);
-                let mut pixels = vec![0u8; width as usize * height as usize * 4];
-                if pixels.len() as u64 <= o.mem.1 {
-                    g.mem.read(at, &mut pixels)?;
+                let (width, height, format) = (u32_at(16), u32_at(24), u32_at(32));
+                if let Some(pixels) = super::xg::read_level(&g.mem, t, o.mem.0, t.main as u32, 0).filter(|p| p.len() == width as usize * height as usize * 4) {
                     g.win.d3d.frame = Some(Frame { width, height, format, pixels, token });
                 }
+            }
+        }
+        Command::TextureToRows { texture, sub, to, pitch } => {
+            let (Some(o), Some(t)) = (g.win.d3d.objects.get(&texture), g.win.d3d.textures.get(&texture)) else { return Ok(true) };
+            let plane = t.main as u32;
+            if let (Some(linear), Some((width, _, _, bytes))) = (super::xg::read_level(&g.mem, t, o.mem.0, plane, sub), super::xg::level_shape(t, plane, sub)) {
+                for (n, row) in linear.chunks_exact(width * bytes).enumerate() {
+                    g.mem.write(to + n as u64 * pitch, row)?;
+                }
+            }
+        }
+        Command::RowsToTexture { from, pitch, texture, sub } => {
+            let (Some(o), Some(t)) = (g.win.d3d.objects.get(&texture), g.win.d3d.textures.get(&texture)) else { return Ok(true) };
+            let plane = t.main as u32;
+            if let Some((width, height, depth, bytes)) = super::xg::level_shape(t, plane, sub) {
+                let mut linear = vec![0u8; width * bytes * height * depth];
+                for (n, row) in linear.chunks_exact_mut(width * bytes).enumerate() {
+                    g.mem.read(from + n as u64 * pitch, row)?;
+                }
+                super::xg::write_level(&mut g.mem, t, o.mem.0, plane, sub, &linear);
+            }
+        }
+        Command::TextureToTexture { from, from_sub, to, to_sub } => {
+            let d3d = &g.win.d3d;
+            let (Some(a), Some(ta), Some(b), Some(tb)) = (d3d.objects.get(&from), d3d.textures.get(&from), d3d.objects.get(&to), d3d.textures.get(&to)) else { return Ok(true) };
+            if let Some(linear) = super::xg::read_level(&g.mem, ta, a.mem.0, ta.main as u32, from_sub) {
+                super::xg::write_level(&mut g.mem, tb, b.mem.0, tb.main as u32, to_sub, &linear);
             }
         }
         Command::Signal { fence, value } => {
@@ -900,6 +961,35 @@ fn List_CopyBufferRegion(g: &mut Guest) -> H {
     }
 }
 
+/// CopyTextureRegion(destination, x, y, z, source, box): whole subresources, between textures
+/// and placed footprints in buffers. A location is { resource @0, type @8 (0: a subresource
+/// index @16, 1: a footprint – offset @16, row pitch @40) }. Copies of a part (an offset or a
+/// box) are not done.
+fn List_CopyTextureRegion(g: &mut Guest) -> H {
+    let (dst, x, y, z, src, part) = (g.arg(1)?, g.arg(2)? as u32, g.arg(3)? as u32, g.arg(4)? as u32, g.arg(5)?, g.arg(6)?);
+    if dst == 0 || src == 0 {
+        return Ok(0);
+    }
+    if (x, y, z) != (0, 0, 0) || part != 0 {
+        g.log.push("D3D12.X: CopyTextureRegion of a part of a subresource is not done".into());
+        return Ok(0);
+    }
+    // (resource, its address, footprint: offset and pitch – or the subresource)
+    let location = |g: &mut Guest, at: u64| -> Result<(u64, Option<(u64, u64)>, u32), Stop> {
+        let resource = g.mem.read_u64(at)?;
+        let base = object(g, resource).map_or(0, |o| o.mem.0);
+        Ok(if g.mem.read_u32(at + 8)? == 1 { (resource, Some((base + g.mem.read_u64(at + 16)?, g.mem.read_u32(at + 40)? as u64)), 0) } else { (resource, None, g.mem.read_u32(at + 16)?) })
+    };
+    let (to, from) = (location(g, dst)?, location(g, src)?);
+    let command = match (to, from) {
+        ((_, Some((to, pitch)), _), (texture, None, sub)) => Command::TextureToRows { texture, sub, to, pitch },
+        ((texture, None, sub), (_, Some((from, pitch)), _)) => Command::RowsToTexture { from, pitch, texture, sub },
+        ((to, None, to_sub), (from, None, from_sub)) => Command::TextureToTexture { from, from_sub, to, to_sub },
+        _ => return Ok(0),
+    };
+    record(g, command)
+}
+
 /// list #60 CopyMemoryToMemoryX(destination, source, bytes, flags)
 fn List_CopyMemoryToMemoryX(g: &mut Guest) -> H {
     let (to, from, bytes) = (g.arg(1)?, g.arg(2)?, g.arg(3)?);
@@ -986,11 +1076,9 @@ fn List_ClearRenderTargetView(g: &mut Guest) -> H {
         87 | 88 | 90..=93 => channel[2] | channel[1] << 8 | channel[0] << 16 | channel[3] << 24,
         _ => return Ok(0),
     };
-    let bytes = width * height * 4;
-    if bytes > size {
-        return Ok(0);
-    }
-    record(g, Command::Fill { at, bytes, value })
+    // every texel of the target, wherever the console's tiling puts it (and the padding)
+    let _ = (width, height);
+    record(g, Command::Fill { at, bytes: size, value })
 }
 
 /// queue #30 PresentX(plane count, planes, parameters); a plane is { frame token @0, resource
@@ -1381,6 +1469,7 @@ fn slots(kind: Kind) -> Vec<(usize, Handler)> {
             (9, ret_ok), // Close
             (10, List_Reset),
             (15, List_CopyBufferRegion),
+            (16, List_CopyTextureRegion),
             (26, ret_ok), // ResourceBarrier
             (50, ret_ok), // OMSetRenderTargets
             (52, List_ClearRenderTargetView),
@@ -1396,7 +1485,7 @@ fn slots(kind: Kind) -> Vec<(usize, Handler)> {
             (148, List_AllocateUploadMemory),
         ],
         // Close, Reset, CopyBufferRegion (CopyTextureRegion, CopyResource and CopyTiles follow)
-        Kind::DmaCommandList => &[(9, ret_ok), (10, List_Reset), (11, List_CopyBufferRegion)],
+        Kind::DmaCommandList => &[(9, ret_ok), (10, List_Reset), (11, List_CopyBufferRegion), (12, List_CopyTextureRegion)],
         Kind::Fence => &[(8, Fence_GetCompletedValue), (9, Fence_SetEventOnCompletion), (10, Fence_Signal)],
         Kind::DescriptorHeap => &[(8, Heap_GetDesc16), (9, Heap_GetHandleStart), (10, Heap_GetHandleStart)],
         Kind::Resource => &[
