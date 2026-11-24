@@ -9,13 +9,14 @@
 //! (DLL_PROCESS_ATTACH). With `--run`, the folder's executable is started instead and run for
 //! that many instructions (100 million when none is given): where it stopped, the last system
 //! functions it called and the ones the host answered with a stub. Without `--run` only the
-//! folder's images are read; with it the title also gets the folder's other files of up to 16 MB
-//! (the guest's file system holds a file whole: the large archives are left out, and named).
+//! folder's images are read; with it the title also gets the folder's other files: those of up
+//! to 16 MB whole, the larger ones (its archives) read from disk a range at a time, as it asks.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use xcl::pe::{ImportName, Layout, Pe};
+use xcl_guest::vfs::Source;
 use xcl_guest::{Guest, Stop};
 
 fn is_image(name: &str) -> bool {
@@ -102,14 +103,26 @@ fn main() {
 /// The largest file the title is given whole.
 const WHOLE_FILE_LIMIT: u64 = 16 << 20;
 
-/// Give the title the files of `dir` (and below) that are not images, as `prefix` + their name.
-fn add_small_files(g: &mut Guest, dir: &Path, prefix: &str, left_out: &mut Vec<String>) {
+/// A file on disk that is read a range at a time.
+fn on_demand(path: &Path, size: u64) -> Option<Source> {
+    use std::io::{Read, Seek, SeekFrom};
+    let file = std::cell::RefCell::new(std::fs::File::open(path).ok()?);
+    let read = move |offset: u64, buffer: &mut [u8]| {
+        let mut file = file.borrow_mut();
+        file.seek(SeekFrom::Start(offset)).is_ok() && file.read_exact(buffer).is_ok()
+    };
+    Some(Source { size, read: Box::new(read) })
+}
+
+/// Give the title the files of `dir` (and below) that are not images, as `prefix` + their name:
+/// the small ones whole, the others (counted in `large`) read on demand.
+fn add_files(g: &mut Guest, dir: &Path, prefix: &str, large: &mut (usize, u64)) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
         let path = entry.path();
         if path.is_dir() {
-            add_small_files(g, &path, &format!("{name}\\"), left_out);
+            add_files(g, &path, &format!("{name}\\"), large);
         } else if !is_image(&name) && !name.starts_with('.') {
             match std::fs::metadata(&path).map(|m| m.len()) {
                 Ok(size) if size <= WHOLE_FILE_LIMIT => {
@@ -117,7 +130,12 @@ fn add_small_files(g: &mut Guest, dir: &Path, prefix: &str, left_out: &mut Vec<S
                         g.vfs.add_game_file(&name, bytes);
                     }
                 }
-                Ok(size) => left_out.push(format!("{name} ({} MB)", size >> 20)),
+                Ok(size) => {
+                    if let Some(source) = on_demand(&path, size) {
+                        g.vfs.add_game_source(&name, source);
+                        *large = (large.0 + 1, large.1 + size);
+                    }
+                }
                 Err(_) => {}
             }
         }
@@ -131,14 +149,14 @@ fn run(folder: &Path, images: &[(String, Vec<u8>)], budget: u64) {
         return;
     };
     let mut g = Guest::new();
-    g.trace_len = 24;
+    g.trace_len = 48;
     g.command_line = name.clone();
     for (other, bytes) in images {
         g.vfs.add_game_file(other, bytes.clone());
     }
-    let mut left_out = Vec::new();
-    add_small_files(&mut g, folder, "", &mut left_out);
-    println!("{} files of the folder are too large to give the title whole: {}", left_out.len(), left_out.join(", "));
+    let mut large = (0, 0);
+    add_files(&mut g, folder, "", &mut large);
+    println!("{} files of the folder ({} GB) are read on demand", large.0, large.1 >> 30);
     let started = g.map_image(name, data).and_then(|index| g.start(index, 1 << 20));
     let stop = match started {
         Ok(()) => g.run(budget),
@@ -149,6 +167,9 @@ fn run(folder: &Path, images: &[(String, Vec<u8>)], budget: u64) {
     };
     let instructions: u64 = g.cpu.icount;
     println!("{name}: {stop:x?} after {instructions} instructions on the running thread, rip {:#x}, {} threads", g.cpu.rip, g.threads.len());
+    let names = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
+    let registers: Vec<String> = names.iter().zip(g.cpu.r).map(|(n, v)| format!("{n} {v:#x}")).collect();
+    println!("    {}", registers.join(", "));
     for m in &g.modules {
         println!("    module {:#x}..{:#x} {}", m.base, m.base + m.size, m.name);
     }
@@ -158,6 +179,11 @@ fn run(folder: &Path, images: &[(String, Vec<u8>)], budget: u64) {
         let block = g.mem.read_u64(slots + 8 * i as u64).unwrap_or(0);
         let index = g.mem.read_u32(t.index_address).unwrap_or(u32::MAX);
         println!("    static TLS {i}: {} + {} bytes of module {:#x}, its index {index}, this thread's block {block:#x}", t.len, t.zero_fill, t.module_base);
+    }
+    // XCL_PROBE_PEEK=address,address: the text at those addresses of the title's memory now
+    for at in std::env::var("XCL_PROBE_PEEK").unwrap_or_default().split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()) {
+        let bytes: Vec<u8> = (0..48).map_while(|i| g.mem.read_u8(at + i).ok()).collect();
+        println!("    at {at:#x}: {:?} {bytes:02x?}", g.mem.cstr(at, 96).unwrap_or_default());
     }
     println!("last system calls:");
     for line in &g.trace {
