@@ -362,6 +362,53 @@ fn IsProcessorFeaturePresent(g: &mut Guest) -> H {
     } as u64)
 }
 
+/// GetLogicalProcessorInformation(buffer, length in/out): the one processor GetSystemInfo
+/// reports, as 32-byte records: its core, its caches (those of the console's Zen 2 core), its
+/// package and its NUMA node.
+fn GetLogicalProcessorInformation(g: &mut Guest) -> H {
+    const CORE: u32 = 0;
+    const NUMA_NODE: u32 = 1;
+    const CACHE: u32 = 2;
+    const PACKAGE: u32 = 3;
+    // (relationship, cache: level, associativity, size, type – 0 unified, 1 instruction, 2 data)
+    let records: [(u32, [u32; 4]); 7] = [
+        (CORE, [0; 4]),
+        (CACHE, [1, 8, 32 << 10, 2]),
+        (CACHE, [1, 8, 32 << 10, 1]),
+        (CACHE, [2, 8, 512 << 10, 0]),
+        (CACHE, [3, 16, 8 << 20, 0]),
+        (PACKAGE, [0; 4]),
+        (NUMA_NODE, [0; 4]),
+    ];
+    let (at, length) = (g.arg(0)?, g.arg(1)?);
+    if length == 0 {
+        g.set_last_error(ERROR_INVALID_PARAMETER);
+        return Ok(0);
+    }
+    let needed = 32 * records.len() as u32;
+    let size = g.mem.read_u32(length)?;
+    g.mem.write_u32(length, needed)?;
+    if at == 0 || size < needed {
+        g.set_last_error(ERROR_INSUFFICIENT_BUFFER);
+        return Ok(0);
+    }
+    for (i, (relationship, [level, associativity, cache_size, kind])) in records.into_iter().enumerate() {
+        let record = at + 32 * i as u64;
+        g.mem.write(record, &[0u8; 32])?;
+        // the processors it is about: processor 0
+        g.mem.write_u64(record, 1)?;
+        g.mem.write_u32(record + 8, relationship)?;
+        if relationship == CACHE {
+            g.mem.write_u8(record + 16, level as u8)?;
+            g.mem.write_u8(record + 17, associativity as u8)?;
+            g.mem.write_u16(record + 18, 64)?;
+            g.mem.write_u32(record + 20, cache_size)?;
+            g.mem.write_u32(record + 24, kind)?;
+        }
+    }
+    Ok(1)
+}
+
 fn GetTickCount64(g: &mut Guest) -> H {
     Ok(g.now_ns() / 1_000_000)
 }
@@ -407,6 +454,7 @@ pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
     // a condition variable is its address: nothing to set up
     map.insert("InitializeConditionVariable", no as Handler);
     register!(map; InitializeSListHead, InterlockedPushEntrySList, InterlockedPopEntrySList, InterlockedFlushSList, QueryDepthSList);
+    register!(map; GetLogicalProcessorInformation);
     register!(map; IsProcessorFeaturePresent, GetTickCount64, GetTickCount, OutputDebugStringA, OutputDebugStringW);
     map.insert("EncodePointer", pointer as Handler);
     map.insert("DecodePointer", pointer as Handler);
@@ -602,6 +650,30 @@ mod tests {
         assert_eq!(g.mem.read_u64(b).unwrap(), a);
         assert_eq!(call(&mut g, 0, QueryDepthSList, [head, 0, 0, 0]), Ok(0));
         assert_eq!(call(&mut g, 0, InterlockedPopEntrySList, [head, 0, 0, 0]), Ok(0));
+    }
+
+    #[test]
+    fn the_processor_layout_is_asked_for_its_size_first() {
+        let (mut g, page) = guest(1);
+        let (length, buffer) = (page, page + 0x100);
+        g.mem.write_u32(length, 0).unwrap();
+        assert_eq!(call(&mut g, 0, GetLogicalProcessorInformation, [0, length, 0, 0]), Ok(0));
+        assert_eq!(g.threads[0].last_error, ERROR_INSUFFICIENT_BUFFER);
+        let needed = g.mem.read_u32(length).unwrap();
+        assert_eq!(needed % 32, 0);
+        assert_eq!(call(&mut g, 0, GetLogicalProcessorInformation, [buffer, length, 0, 0]), Ok(1));
+        let mut cores = 0;
+        let mut caches = Vec::new();
+        for record in (0..needed as u64).step_by(32).map(|o| buffer + o) {
+            assert_eq!(g.mem.read_u64(record).unwrap(), 1);
+            match g.mem.read_u32(record + 8).unwrap() {
+                0 => cores += 1,
+                2 => caches.push((g.mem.read_u8(record + 16).unwrap(), g.mem.read_u16(record + 18).unwrap(), g.mem.read_u32(record + 20).unwrap())),
+                _ => {}
+            }
+        }
+        assert_eq!(cores, 1);
+        assert_eq!(caches, [(1, 64, 32 << 10), (1, 64, 32 << 10), (2, 64, 512 << 10), (3, 64, 8 << 20)]);
     }
 
     #[test]
