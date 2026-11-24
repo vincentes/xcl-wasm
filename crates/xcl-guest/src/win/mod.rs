@@ -69,6 +69,9 @@ pub enum Object {
     /// the console's screen
     Window,
     Find(files::Find),
+    Semaphore { count: u32, max: u32 },
+    /// owned by the thread with this id (0: nobody), `count` times
+    Mutex { owner: u32, count: u32 },
 }
 
 impl State {
@@ -131,6 +134,9 @@ pub fn handlers() -> HashMap<&'static str, Handler> {
 }
 
 pub(crate) const ERROR_INVALID_HANDLE: u32 = 6;
+pub(crate) const ERROR_INVALID_PARAMETER: u32 = 87;
+pub(crate) const ERROR_NOT_OWNER: u32 = 288;
+pub(crate) const ERROR_TOO_MANY_POSTS: u32 = 298;
 pub(crate) const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 pub(crate) const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
 pub(crate) const ERROR_MOD_NOT_FOUND: u32 = 126;

@@ -103,12 +103,13 @@ fn TlsSetValue(g: &mut Guest) -> H {
 
 const INFINITE: u32 = u32::MAX;
 
-/// CreateThread(security, stack size, start, parameter, flags, id out)
+/// CreateThread(security, stack size, start, parameter, flags, id out); flag 4: suspended
 fn CreateThread(g: &mut Guest) -> H {
-    let (stack_size, start, parameter, id_out) = (g.arg(1)?, g.arg(2)?, g.arg(3)?, g.arg(5)?);
+    let (stack_size, start, parameter, flags, id_out) = (g.arg(1)?, g.arg(2)?, g.arg(3)?, g.arg(4)?, g.arg(5)?);
     let size = xcl_emu::mem::page_up(if stack_size == 0 { 1 << 20 } else { stack_size.max(0x1_0000) });
     let Ok(stack) = g.mem.alloc(size, PROT_R | PROT_W) else { return Ok(0) };
     let index = g.add_thread(stack, stack + size, start, parameter, crate::SLOT_THREAD_RETURN)?;
+    g.threads[index].suspended = flags & 4 != 0;
     if id_out != 0 {
         g.mem.write_u32(id_out, g.threads[index].id)?;
     }
@@ -158,9 +159,11 @@ fn SwitchToThread(g: &mut Guest) -> H {
     Ok(1)
 }
 
-/// Whether the object behind `handle` is signaled; an auto-reset one is taken by this.
-fn signaled(g: &mut Guest, handle: u64) -> Option<bool> {
+/// Whether the object behind `handle` is signaled. With `take`, the running thread's wait for
+/// it ends by this: an auto-reset event is reset, a semaphore counted down, a mutex owned.
+pub(super) fn signaled(g: &mut Guest, handle: u64, take: bool) -> Option<bool> {
     let now = g.now_ns();
+    let me = g.thread().id;
     Some(match g.win.handles.get_mut(&handle)? {
         Object::Thread(i) => {
             let i = *i;
@@ -168,25 +171,40 @@ fn signaled(g: &mut Guest, handle: u64) -> Option<bool> {
         }
         Object::Event { signaled, manual } => {
             let was = *signaled;
-            if !*manual {
+            if take && !*manual {
                 *signaled = false;
             }
             was
         }
         Object::Timer { due, manual } => {
             let fired = due.is_some_and(|d| now >= d);
-            if fired && !*manual {
+            if take && fired && !*manual {
                 *due = None;
             }
             fired
         }
         // a file is always "signaled": its I/O is done when the call returns
         Object::File(_) | Object::Find(_) | Object::Window => true,
+        Object::Semaphore { count, .. } => {
+            let free = *count > 0;
+            if take && free {
+                *count -= 1;
+            }
+            free
+        }
+        Object::Mutex { owner, count } => {
+            let free = *owner == 0 || *owner == me;
+            if take && free {
+                *owner = me;
+                *count += 1;
+            }
+            free
+        }
     })
 }
 
 /// Guest time at which the object behind `handle` becomes signaled by itself (a timer).
-fn due(g: &Guest, handle: u64) -> Option<u64> {
+pub(super) fn due(g: &Guest, handle: u64) -> Option<u64> {
     match g.win.handles.get(&handle)? {
         Object::Timer { due, .. } => *due,
         _ => None,
@@ -195,7 +213,7 @@ fn due(g: &Guest, handle: u64) -> Option<u64> {
 
 fn WaitForSingleObject(g: &mut Guest) -> H {
     let (handle, ms) = (g.arg(0)?, g.arg(1)? as u32);
-    let Some(ready) = signaled(g, handle) else {
+    let Some(ready) = signaled(g, handle, true) else {
         g.set_last_error(ERROR_INVALID_HANDLE);
         return Ok(u32::MAX as u64);
     };

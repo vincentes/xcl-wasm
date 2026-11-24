@@ -112,6 +112,8 @@ pub struct Thread {
     pub wait: Option<Wait>,
     /// set once its start function returned (or it called ExitThread)
     pub exit_code: Option<u32>,
+    /// made with CREATE_SUSPENDED and not resumed yet: it gets no turn
+    pub suspended: bool,
     /// the top of its stack
     pub stack_top: u64,
     /// handler calls in progress, innermost last (see `win::seh`)
@@ -223,7 +225,7 @@ impl Guest {
         cpu.r[xcl_emu::cpu::RSP] = top - 0x40;
         let ret = cpu.trap_address(return_slot);
         abi::call(&mut cpu, &mut self.mem, entry, &[argument], ret)?;
-        self.threads.push(Thread { id, name: String::new(), cpu, teb, last_error: 0, tls_slots: Vec::new(), wait: None, exit_code: None, stack_top: top, seh: Vec::new() });
+        self.threads.push(Thread { id, name: String::new(), cpu, teb, last_error: 0, tls_slots: Vec::new(), wait: None, exit_code: None, suspended: false, stack_top: top, seh: Vec::new() });
         Ok(self.threads.len() - 1)
     }
 
@@ -251,10 +253,11 @@ impl Guest {
         }
     }
 
-    /// The next thread that has not ended, after the running one (itself when it is the only one).
+    /// The next thread that has not ended and is not suspended, after the running one (itself
+    /// when it is the only one).
     fn next_thread(&self) -> Option<usize> {
         let n = self.threads.len();
-        (1..=n).map(|k| (self.current + k) % n).find(|&i| self.threads[i].exit_code.is_none())
+        (1..=n).map(|k| (self.current + k) % n).find(|&i| self.threads[i].exit_code.is_none() && !self.threads[i].suspended)
     }
 
     /// Run the title: at most `max_instructions`, until it stops.

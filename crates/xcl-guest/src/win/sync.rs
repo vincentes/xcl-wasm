@@ -6,12 +6,15 @@
 //! - SRWLOCK (8 bytes, 0 when free): bit 0 an exclusive owner, the shared owners counted from bit 4
 //! - CONDITION_VARIABLE (8 bytes): not written; a sleeping thread waits on its address
 //! - SLIST_HEADER (16 bytes): the depth at +0, the first entry at +8
+//!
+//! … and the kernel objects next to kernel32's events and timers: semaphores, mutexes, waits
+//! for several objects, and threads made suspended.
 
 #![allow(non_snake_case)]
 
 use std::collections::HashMap;
 
-use super::kernel32::{leave_cs, try_enter_cs, wake};
+use super::kernel32::{due, leave_cs, signaled, try_enter_cs, wait, wake};
 use super::*;
 use crate::{Guest, Handler, Stop, Wait};
 
@@ -159,6 +162,138 @@ fn WakeAllConditionVariable(g: &mut Guest) -> H {
     wake(g, true)
 }
 
+// --- semaphores, mutexes and waits for several objects -------------------------------------------
+
+/// CreateSemaphoreExW(security, initial count, maximum count, name, flags, access); the first
+/// three arguments are CreateSemaphoreW's too
+fn CreateSemaphoreExW(g: &mut Guest) -> H {
+    let (count, max) = (g.arg(1)? as u32, g.arg(2)? as u32);
+    if max == 0 || count > max {
+        g.set_last_error(ERROR_INVALID_PARAMETER);
+        return Ok(0);
+    }
+    Ok(g.win.new_handle(Object::Semaphore { count, max }))
+}
+
+/// ReleaseSemaphore(semaphore, count, previous count out)
+fn ReleaseSemaphore(g: &mut Guest) -> H {
+    let (handle, by, previous) = (g.arg(0)?, g.arg(1)? as u32, g.arg(2)?);
+    let Some(Object::Semaphore { count, max }) = g.win.handles.get_mut(&handle) else {
+        g.set_last_error(ERROR_INVALID_HANDLE);
+        return Ok(0);
+    };
+    let before = *count;
+    if by == 0 || by > *max - before {
+        g.set_last_error(ERROR_TOO_MANY_POSTS);
+        return Ok(0);
+    }
+    *count = before + by;
+    if previous != 0 {
+        g.mem.write_u32(previous, before)?;
+    }
+    Ok(1)
+}
+
+fn create_mutex(g: &mut Guest, owned: bool) -> H {
+    let owner = if owned { g.thread().id } else { 0 };
+    Ok(g.win.new_handle(Object::Mutex { owner, count: owned as u32 }))
+}
+
+/// CreateMutexW(security, initial owner, name)
+fn CreateMutexW(g: &mut Guest) -> H {
+    let owned = g.arg(1)? as u32 != 0;
+    create_mutex(g, owned)
+}
+
+/// CreateMutexExW(security, name, flags, access); flag 1: the caller owns it
+fn CreateMutexExW(g: &mut Guest) -> H {
+    let owned = g.arg(2)? & 1 != 0;
+    create_mutex(g, owned)
+}
+
+fn ReleaseMutex(g: &mut Guest) -> H {
+    let handle = g.arg(0)?;
+    let me = g.thread().id;
+    match g.win.handles.get_mut(&handle) {
+        Some(Object::Mutex { owner, count }) if *owner == me => {
+            *count -= 1;
+            if *count == 0 {
+                *owner = 0;
+            }
+            Ok(1)
+        }
+        Some(Object::Mutex { .. }) => {
+            g.set_last_error(ERROR_NOT_OWNER);
+            Ok(0)
+        }
+        _ => {
+            g.set_last_error(ERROR_INVALID_HANDLE);
+            Ok(0)
+        }
+    }
+}
+
+/// CreateEventExW(security, name, flags, access); flag 1: manual reset, flag 2: set
+fn CreateEventExW(g: &mut Guest) -> H {
+    let flags = g.arg(2)?;
+    Ok(g.win.new_handle(Object::Event { signaled: flags & 2 != 0, manual: flags & 1 != 0 }))
+}
+
+const MAXIMUM_WAIT_OBJECTS: u64 = 64;
+const WAIT_FAILED: u64 = 0xFFFF_FFFF;
+
+/// WaitForMultipleObjects(count, handles, wait for all, milliseconds); …Ex takes the same four
+/// first. The index of the object that ended the wait (0 for all of them), or WAIT_TIMEOUT.
+fn WaitForMultipleObjects(g: &mut Guest) -> H {
+    let (count, at, all, ms) = (g.arg(0)?, g.arg(1)?, g.arg(2)? as u32 != 0, g.arg(3)? as u32);
+    if count == 0 || count > MAXIMUM_WAIT_OBJECTS {
+        g.set_last_error(ERROR_INVALID_PARAMETER);
+        return Ok(WAIT_FAILED);
+    }
+    let mut handles = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        handles.push(g.mem.read_u64(at + 8 * i)?);
+    }
+    let mut ready = Vec::with_capacity(handles.len());
+    for &h in &handles {
+        let Some(is) = signaled(g, h, false) else {
+            g.set_last_error(ERROR_INVALID_HANDLE);
+            return Ok(WAIT_FAILED);
+        };
+        ready.push(is);
+    }
+    // nothing is taken before the wait can end: all of them, or the first that is signaled
+    let ends = if all { ready.iter().all(|&r| r).then_some(0) } else { ready.iter().position(|&r| r) };
+    if let Some(first) = ends {
+        for &h in if all { &handles[..] } else { &handles[first..first + 1] } {
+            signaled(g, h, true);
+        }
+    }
+    let waited = wait(g, ends.is_some(), ms);
+    if matches!(waited, Err(Stop::Wait)) {
+        // a timer among them ends the wait by itself
+        let timers = handles.iter().filter_map(|&h| due(g, h));
+        if let Some(d) = if all { timers.max() } else { timers.min() } {
+            if let Some(w) = g.thread_mut().wait.as_mut() {
+                w.deadline = Some(w.deadline.map_or(d, |own| own.min(d)));
+            }
+        }
+    }
+    Ok(if waited? { ends.unwrap_or(0) as u64 } else { WAIT_TIMEOUT })
+}
+
+// --- threads --------------------------------------------------------------------------------
+
+/// ResumeThread(thread): how often it was suspended before (1 for a thread made suspended).
+fn ResumeThread(g: &mut Guest) -> H {
+    let handle = g.arg(0)?;
+    let Some(&Object::Thread(index)) = g.win.handles.get(&handle) else {
+        g.set_last_error(ERROR_INVALID_HANDLE);
+        return Ok(u32::MAX as u64);
+    };
+    Ok(std::mem::take(&mut g.threads[index].suspended) as u64)
+}
+
 // --- interlocked singly-linked lists ------------------------------------------------------------
 
 fn InitializeSListHead(g: &mut Guest) -> H {
@@ -276,6 +411,19 @@ pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
     map.insert("EncodePointer", pointer as Handler);
     map.insert("DecodePointer", pointer as Handler);
     map.insert("IsDebuggerPresent", no as Handler);
+    register!(map; CreateSemaphoreExW, ReleaseSemaphore, CreateMutexW, CreateMutexExW, ReleaseMutex, CreateEventExW);
+    register!(map; WaitForMultipleObjects, ResumeThread);
+    map.insert("CreateSemaphoreW", CreateSemaphoreExW as Handler);
+    map.insert("WaitForMultipleObjectsEx", WaitForMultipleObjects as Handler);
+    // the guest's threads take turns: priorities and processors change nothing
+    for name in ["SetThreadPriority", "SetThreadAffinityMask", "SetThreadIdealProcessorEx", "SetThreadPriorityBoost"] {
+        map.insert(name, yes as Handler);
+    }
+    // THREAD_PRIORITY_NORMAL
+    map.insert("GetThreadPriority", no as Handler);
+    if let Some(&single) = map.get("WaitForSingleObject") {
+        map.insert("WaitForSingleObjectEx", single);
+    }
     map.insert("DisableThreadLibraryCalls", yes as Handler);
     // the same clock, as kernel32 has it for GetSystemTimePreciseAsFileTime
     if let Some(&precise) = map.get("GetSystemTimePreciseAsFileTime") {
@@ -370,6 +518,70 @@ mod tests {
         assert_eq!(g.threads[0].last_error, ERROR_TIMEOUT);
         // … with the critical section owned again
         assert_eq!(g.mem.read_u64(cs + 16).unwrap(), g.threads[0].id as u64);
+    }
+
+    #[test]
+    fn a_semaphore_counts_and_a_mutex_belongs_to_its_thread() {
+        let (mut g, page) = guest(2);
+        let semaphore = call(&mut g, 0, CreateSemaphoreExW, [0, 1, 2, 0]).unwrap();
+        assert_eq!(call(&mut g, 0, CreateSemaphoreExW, [0, 3, 2, 0]), Ok(0));
+        assert_eq!(signaled(&mut g, semaphore, true), Some(true));
+        assert_eq!(signaled(&mut g, semaphore, true), Some(false));
+        assert_eq!(call(&mut g, 0, ReleaseSemaphore, [semaphore, 3, 0, 0]), Ok(0));
+        assert_eq!(g.threads[0].last_error, ERROR_TOO_MANY_POSTS);
+        assert_eq!(call(&mut g, 0, ReleaseSemaphore, [semaphore, 2, page, 0]), Ok(1));
+        assert_eq!(g.mem.read_u32(page).unwrap(), 0);
+        assert_eq!(signaled(&mut g, semaphore, false), Some(true));
+
+        let mutex = call(&mut g, 0, CreateMutexW, [0, 1, 0, 0]).unwrap();
+        // its owner takes it again; the other thread neither takes nor releases it
+        assert_eq!(signaled(&mut g, mutex, true), Some(true));
+        g.switch_to(1);
+        assert_eq!(signaled(&mut g, mutex, true), Some(false));
+        assert_eq!(call(&mut g, 1, ReleaseMutex, [mutex, 0, 0, 0]), Ok(0));
+        assert_eq!(g.threads[1].last_error, ERROR_NOT_OWNER);
+        assert_eq!(call(&mut g, 0, ReleaseMutex, [mutex, 0, 0, 0]), Ok(1));
+        g.switch_to(1);
+        assert_eq!(signaled(&mut g, mutex, false), Some(false));
+        assert_eq!(call(&mut g, 0, ReleaseMutex, [mutex, 0, 0, 0]), Ok(1));
+        g.switch_to(1);
+        assert_eq!(signaled(&mut g, mutex, true), Some(true));
+    }
+
+    #[test]
+    fn a_wait_for_several_objects_takes_only_what_ends_it() {
+        let (mut g, page) = guest(1);
+        let auto = g.win.new_handle(Object::Event { signaled: false, manual: false });
+        let semaphore = g.win.new_handle(Object::Semaphore { count: 1, max: 1 });
+        g.mem.write_u64(page, auto).unwrap();
+        g.mem.write_u64(page + 8, semaphore).unwrap();
+        // all: the semaphore alone is not enough, and is not counted down by the try
+        assert_eq!(call(&mut g, 0, WaitForMultipleObjects, [2, page, 1, 0]), Ok(WAIT_TIMEOUT));
+        assert_eq!(signaled(&mut g, semaphore, false), Some(true));
+        // any: the second object ends it
+        assert_eq!(call(&mut g, 0, WaitForMultipleObjects, [2, page, 0, 0]), Ok(1));
+        assert_eq!(signaled(&mut g, semaphore, false), Some(false));
+        // a wait that has to wait is asked again, and ends once the event is set
+        assert_eq!(call(&mut g, 0, WaitForMultipleObjects, [2, page, 0, 100]), Err(Stop::Wait));
+        g.win.handles.insert(auto, Object::Event { signaled: true, manual: false });
+        assert_eq!(call(&mut g, 0, WaitForMultipleObjects, [2, page, 0, 100]), Ok(0));
+        assert_eq!(signaled(&mut g, auto, false), Some(false));
+        assert!(g.threads[0].wait.is_none());
+        assert_eq!(call(&mut g, 0, WaitForMultipleObjects, [2, page, 0, 5]), Err(Stop::Wait));
+        g.win.time_ns += 5_000_000;
+        assert_eq!(call(&mut g, 0, WaitForMultipleObjects, [2, page, 0, 5]), Ok(WAIT_TIMEOUT));
+        assert_eq!(call(&mut g, 0, WaitForMultipleObjects, [1, page + 16, 0, 0]), Ok(WAIT_FAILED));
+    }
+
+    #[test]
+    fn a_suspended_thread_gets_no_turn_until_it_is_resumed() {
+        let (mut g, _) = guest(2);
+        g.threads[1].suspended = true;
+        let handle = g.win.new_handle(Object::Thread(1));
+        assert_eq!(g.next_thread(), Some(0));
+        assert_eq!(call(&mut g, 0, ResumeThread, [handle, 0, 0, 0]), Ok(1));
+        assert_eq!(g.next_thread(), Some(1));
+        assert_eq!(call(&mut g, 0, ResumeThread, [handle, 0, 0, 0]), Ok(0));
     }
 
     #[test]
