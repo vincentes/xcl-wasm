@@ -21,6 +21,11 @@ impl Guest {
     /// Map the image `data` (a PE file) and bind its imports. Returns its index in `modules`.
     pub fn map_image(&mut self, name: &str, data: &[u8]) -> Result<usize, String> {
         let pe = Pe::parse(data, Layout::File).map_err(|e| e.to_string())?;
+        // the executable is a file of the game folder, as on the console: a title opens its own
+        // image (to read resources appended to it, or just as a file that is surely there)
+        if !pe.is_dll() && self.vfs.game_file(name).is_none() {
+            self.vfs.add_game_file(name, data.to_vec());
+        }
         let size = page_up(pe.size_of_image as u64);
         let mut base = pe.image_base;
         if self.mem.map(base, size, PROT_R | PROT_W | PROT_X).is_err() {
