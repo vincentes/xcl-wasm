@@ -215,3 +215,29 @@ fn the_vex_forms_load_and_store_mxcsr() {
     let (mut cpu, mut mem) = machine(&[0xC5, 0xF8, 0xAE, 0xD8, 0xC3]);
     assert!(matches!(cpu.run(&mut mem, 10), Exit::Undefined { .. }));
 }
+
+#[test]
+fn a_vector_table_probe_uses_the_extended_registers_it_names() {
+    // The group probe of a hash table, as a retail title has it, with its registers:
+    //   mov r12d,0x41; vmovd xmm0,r12d; vpbroadcastb xmm6,xmm0; mov rcx,DATA; xor r8d,r8d;
+    //   vmovdqa xmm0,[rcx+r8]; vpcmpeqb xmm1,xmm0,xmm6; vpmovmskb r9d,xmm1; tzcnt r10d,r9d;
+    //   blsr r9d,r9d; vpsignb xmm0,xmm0,xmm0; vpmovmskb r8d,xmm0; ret
+    let mut code = vec![0x41, 0xBC, 0x41, 0, 0, 0, 0xC4, 0xC1, 0x79, 0x6E, 0xC4, 0xC4, 0xE2, 0x79, 0x78, 0xF0, 0x48, 0xB9];
+    code.extend(DATA.to_le_bytes());
+    code.extend([0x45, 0x31, 0xC0, 0xC4, 0xA1, 0x79, 0x6F, 0x04, 0x01, 0xC5, 0xF9, 0x74, 0xCE, 0xC5, 0x79, 0xD7, 0xC9, 0xF3, 0x45, 0x0F, 0xBC, 0xD1]);
+    code.extend([0xC4, 0xC2, 0x30, 0xF3, 0xC9, 0xC4, 0xE2, 0x79, 0x08, 0xC0, 0xC5, 0x79, 0xD7, 0xC0, 0xC3]);
+    let (mut cpu, mut mem) = machine(&code);
+    // the control bytes of a group: the wanted one (0x41) at 3 and 9, an empty slot (0x80) at
+    // 5, a deleted one (0xFE) at 15, other entries elsewhere
+    let mut group = [0x10u8; 16];
+    (group[3], group[9], group[5], group[15]) = (0x41, 0x41, 0x80, 0xFE);
+    mem.write(DATA, &group).unwrap();
+    let stack = cpu.r[RSP];
+    assert_eq!(cpu.run(&mut mem, 100), Exit::Import(0), "rip {:#x}", cpu.rip);
+    // the matches were at 3 and 9: the first is taken (tzcnt), blsr leaves the second
+    assert_eq!((cpu.r[10], cpu.r[9]), (3, 1 << 9));
+    // only an empty slot keeps its sign under psignb with itself
+    assert_eq!(cpu.r[8], 1 << 5);
+    // … and none of the registers the instructions do not name was touched
+    assert_eq!((cpu.r[RCX], cpu.r[12], cpu.r[RSP]), (DATA, 0x41, stack + 8));
+}
