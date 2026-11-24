@@ -32,12 +32,21 @@ const STATUS_INVALID_HANDLE: u64 = 0xC000_0008;
 #[derive(Debug, Clone)]
 pub struct File {
     pub path: String,
+    /// its contents (empty for a file that is read on demand)
     pub data: Vec<u8>,
+    /// the size of a file of the game folder that is read on demand: `data` is not used
+    pub source_size: Option<u64>,
     pub position: u64,
     pub is_dir: bool,
     pub writable: bool,
     /// every write goes to the end
     pub append: bool,
+}
+
+impl File {
+    pub fn len(&self) -> u64 {
+        self.source_size.unwrap_or(self.data.len() as u64)
+    }
 }
 
 /// A directory listing in progress (FindFirstFile).
@@ -77,7 +86,7 @@ fn missing(g: &Guest, path: &str) -> u32 {
 
 /// Open (or create) `path`. `disposition`: CREATE_NEW 1, CREATE_ALWAYS 2, OPEN_EXISTING 3,
 /// OPEN_ALWAYS 4, TRUNCATE_EXISTING 5.
-fn open(g: &mut Guest, name: &str, access: u32, disposition: u32) -> Result<u64, u32> {
+pub(super) fn open(g: &mut Guest, name: &str, access: u32, disposition: u32) -> Result<u64, u32> {
     let path = vfs::resolve(name).ok_or(ERROR_PATH_NOT_FOUND)?;
     let kind = g.vfs.kind(&path);
     // GENERIC_WRITE, GENERIC_ALL, FILE_WRITE_DATA, FILE_APPEND_DATA
@@ -85,16 +94,23 @@ fn open(g: &mut Guest, name: &str, access: u32, disposition: u32) -> Result<u64,
     let append = access & 0x4 != 0 && access & (0x4000_0000 | 0x1000_0000 | 0x2) == 0;
     let file = match (kind, disposition) {
         (Some(_), 1) => return Err(ERROR_FILE_EXISTS),
-        (Some(Kind::Dir), 3 | 4) => File { path, data: Vec::new(), position: 0, is_dir: true, writable: false, append: false },
+        (Some(Kind::Dir), 3 | 4) => File { path, data: Vec::new(), source_size: None, position: 0, is_dir: true, writable: false, append: false },
         (Some(Kind::Dir), _) => return Err(ERROR_ACCESS_DENIED),
-        (Some(Kind::File(_)), 3 | 4) => File { data: g.vfs.read(&path).unwrap_or(&[]).to_vec(), path, position: 0, is_dir: false, writable, append },
+        // a file read on demand is opened as it is, to be read; its size keeps it out of the overlay
+        (Some(Kind::File(_)), 3 | 4) if g.vfs.source_size(&path).is_some() => {
+            if writable {
+                return Err(ERROR_ACCESS_DENIED);
+            }
+            File { source_size: g.vfs.source_size(&path), data: Vec::new(), path, position: 0, is_dir: false, writable: false, append: false }
+        }
+        (Some(Kind::File(_)), 3 | 4) => File { data: g.vfs.read(&path).unwrap_or(&[]).to_vec(), source_size: None, path, position: 0, is_dir: false, writable, append },
         (None, 3 | 5) => return Err(missing(g, &path)),
         // create, or truncate
         _ => {
             if !g.vfs.write(&path, Vec::new()) {
                 return Err(missing(g, &path));
             }
-            File { path, data: Vec::new(), position: 0, is_dir: false, writable: true, append }
+            File { path, data: Vec::new(), source_size: None, position: 0, is_dir: false, writable: true, append }
         }
     };
     // CREATE_ALWAYS / OPEN_ALWAYS on a file that was there: Windows reports it, and succeeds
@@ -129,10 +145,20 @@ fn file<'a>(g: &'a mut Guest, handle: u64) -> Option<&'a mut File> {
 /// Read up to `len` bytes at the file's position (or at `offset`) into guest memory.
 fn read(g: &mut Guest, handle: u64, at: u64, len: u64, offset: Option<u64>) -> Result<Option<u64>, Stop> {
     let Some(f) = file(g, handle) else { return Ok(None) };
-    let from = offset.unwrap_or(f.position).min(f.data.len() as u64) as usize;
-    let n = (f.data.len() - from).min(len as usize);
-    let bytes = f.data[from..from + n].to_vec();
-    f.position = (from + n) as u64;
+    let size = f.len();
+    let from = offset.unwrap_or(f.position).min(size);
+    let n = (size - from).min(len) as usize;
+    f.position = from + n as u64;
+    let bytes = if f.source_size.is_some() {
+        let path = f.path.clone();
+        let mut bytes = vec![0u8; n];
+        if g.vfs.read_at(&path, from, &mut bytes) != Some(n) {
+            return Ok(None);
+        }
+        bytes
+    } else {
+        f.data[from as usize..from as usize + n].to_vec()
+    };
     g.mem.write(at, &bytes)?;
     Ok(Some(n as u64))
 }
@@ -242,7 +268,7 @@ fn SetFilePointerEx(g: &mut Guest) -> H {
     let base = match method {
         0 => 0,
         1 => f.position as i64,
-        _ => f.data.len() as i64,
+        _ => f.len() as i64,
     };
     let Some(to) = base.checked_add(distance).filter(|&p| p >= 0) else {
         g.set_last_error(ERROR_INVALID_PARAMETER);
@@ -255,9 +281,22 @@ fn SetFilePointerEx(g: &mut Guest) -> H {
     Ok(1)
 }
 
+/// GetFileTime(handle, creation out, last access out, last write out): the one time files have.
+fn GetFileTime(g: &mut Guest) -> H {
+    let (handle, outs) = (g.arg(0)?, [g.arg(1)?, g.arg(2)?, g.arg(3)?]);
+    if file(g, handle).is_none() {
+        g.set_last_error(ERROR_INVALID_HANDLE);
+        return Ok(0);
+    }
+    for out in outs.into_iter().filter(|&o| o != 0) {
+        g.mem.write_u64(out, FILE_TIME)?;
+    }
+    Ok(1)
+}
+
 fn GetFileSizeEx(g: &mut Guest) -> H {
     let (handle, out) = (g.arg(0)?, g.arg(1)?);
-    let Some(size) = file(g, handle).map(|f| f.data.len() as u64) else {
+    let Some(size) = file(g, handle).map(|f| f.len()) else {
         g.set_last_error(ERROR_INVALID_HANDLE);
         return Ok(0);
     };
@@ -268,7 +307,7 @@ fn GetFileSizeEx(g: &mut Guest) -> H {
 /// BY_HANDLE_FILE_INFORMATION
 fn GetFileInformationByHandle(g: &mut Guest) -> H {
     let (handle, at) = (g.arg(0)?, g.arg(1)?);
-    let Some((size, is_dir)) = file(g, handle).map(|f| (f.data.len() as u64, f.is_dir)) else {
+    let Some((size, is_dir)) = file(g, handle).map(|f| (f.len(), f.is_dir)) else {
         g.set_last_error(ERROR_INVALID_HANDLE);
         return Ok(0);
     };
@@ -288,7 +327,7 @@ fn GetFileInformationByHandle(g: &mut Guest) -> H {
 /// FileStandardInfo (1), FileAttributeTagInfo (9)
 fn GetFileInformationByHandleEx(g: &mut Guest) -> H {
     let (handle, class, at, len) = (g.arg(0)?, g.arg(1)? as u32, g.arg(2)?, g.arg(3)? as u32);
-    let Some((size, is_dir)) = file(g, handle).map(|f| (f.data.len() as u64, f.is_dir)) else {
+    let Some((size, is_dir)) = file(g, handle).map(|f| (f.len(), f.is_dir)) else {
         g.set_last_error(ERROR_INVALID_HANDLE);
         return Ok(0);
     };
@@ -660,5 +699,5 @@ pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
     register!(map; GetFileInformationByHandle, GetFileInformationByHandleEx, SetFileInformationByHandle, GetFileAttributesW);
     register!(map; CreateDirectoryW, RemoveDirectoryW, DeleteFileW, MoveFileExW, FindFirstFileExW, FindFirstFileW, FindNextFileW, FindClose);
     register!(map; GetFullPathNameW, GetCurrentDirectoryW, GetFinalPathNameByHandleW, GetDiskFreeSpaceExW, GetDiskFreeSpaceW);
-    register!(map; fopen, fread, fwrite, fclose);
+    register!(map; fopen, fread, fwrite, fclose, GetFileTime);
 }

@@ -1,7 +1,9 @@
 //! The title's file system: the game folder (read-only) under an overlay that takes every
 //! change, as in XCL's Windows runtime – a write copies, a delete hides, the game's files are
-//! never touched. All of it is in memory here; the host puts the game folder in
-//! (`Vfs::add_game_file`) and can take the overlay out (`Vfs::overlay`).
+//! never touched. The overlay is in memory; the host puts the game folder in, a file whole
+//! (`Vfs::add_game_file`) or as something it reads ranges of when the title does
+//! (`Vfs::add_game_source`: a title's archives are far larger than memory), and can take the
+//! overlay out (`Vfs::overlay`).
 //!
 //! Console paths: `G:\`, `GAME:\` and `D:\` are the game folder (so is a relative path), `T:\`
 //! the title's scratch storage, `S:\` its persistent local storage, `U:\` the user's data
@@ -23,10 +25,19 @@ pub enum Kind {
     Dir,
 }
 
+/// A file of the game folder the host reads on demand: `read(offset, buffer)` fills the buffer
+/// from that offset of the file (the range is inside the file) and says whether it could.
+pub struct Source {
+    pub size: u64,
+    pub read: Box<dyn Fn(u64, &mut [u8]) -> bool>,
+}
+
 #[derive(Default)]
 pub struct Vfs {
     /// the game folder: lower-case path → (path as given, contents)
     game: BTreeMap<String, (String, Vec<u8>)>,
+    /// … and its files that are read on demand
+    sources: BTreeMap<String, (String, Source)>,
     /// what the title changed: lower-case path → (path as given, node)
     over: BTreeMap<String, (String, Node)>,
 }
@@ -77,6 +88,44 @@ impl Vfs {
         }
     }
 
+    /// A file of the game folder that is read on demand, by its path in it.
+    pub fn add_game_source(&mut self, relative: &str, source: Source) {
+        if let Some(path) = resolve(relative) {
+            self.sources.insert(path.to_ascii_lowercase(), (path, source));
+        }
+    }
+
+    /// The size of the file at `path` when it is one that is read on demand (and the title has
+    /// not replaced or deleted it).
+    pub fn source_size(&self, path: &str) -> Option<u64> {
+        let key = path.to_ascii_lowercase();
+        if self.over.contains_key(&key) {
+            return None;
+        }
+        self.sources.get(&key).map(|(_, s)| s.size)
+    }
+
+    /// Read the file at `path` from `offset` into `buffer`: the number of bytes there were
+    /// (fewer than the buffer at the file's end). Works for every file, however it is held.
+    pub fn read_at(&self, path: &str, offset: u64, buffer: &mut [u8]) -> Option<usize> {
+        let key = path.to_ascii_lowercase();
+        let whole = match self.over.get(&key) {
+            Some((_, Node::File(d))) => Some(d.as_slice()),
+            Some(_) => return None,
+            None => self.game.get(&key).map(|(_, d)| d.as_slice()),
+        };
+        if let Some(data) = whole {
+            let from = (offset as usize).min(data.len());
+            let n = buffer.len().min(data.len() - from);
+            buffer[..n].copy_from_slice(&data[from..from + n]);
+            return Some(n);
+        }
+        let (_, source) = self.sources.get(&key)?;
+        let from = offset.min(source.size);
+        let n = (buffer.len() as u64).min(source.size - from) as usize;
+        (n == 0 || (source.read)(from, &mut buffer[..n])).then_some(n)
+    }
+
     /// A file of the game folder as the host put it in (whatever the title did since).
     pub fn game_file(&self, relative: &str) -> Option<&[u8]> {
         self.game.get(&resolve(relative)?.to_ascii_lowercase()).map(|(_, d)| d.as_slice())
@@ -93,6 +142,7 @@ impl Vfs {
         let below = |k: &String| k.starts_with(&prefix);
         self.over.range(prefix.clone()..).take_while(|(k, _)| below(k)).any(|(_, (_, n))| *n != Node::Deleted)
             || self.game.range(prefix.clone()..).take_while(|(k, _)| below(k)).any(|(k, _)| !matches!(self.over.get(k), Some((_, Node::Deleted))))
+            || self.sources.range(prefix.clone()..).take_while(|(k, _)| below(k)).any(|(k, _)| !matches!(self.over.get(k), Some((_, Node::Deleted))))
     }
 
     /// What is at `path` (a resolved path).
@@ -109,6 +159,9 @@ impl Vfs {
         }
         if let Some((_, d)) = self.game.get(&key) {
             return Some(Kind::File(d.len() as u64));
+        }
+        if let Some((_, s)) = self.sources.get(&key) {
+            return Some(Kind::File(s.size));
         }
         self.has_children(&key).then_some(Kind::Dir)
     }
@@ -147,7 +200,7 @@ impl Vfs {
             Some(Kind::Dir) if self.has_children(&key) || ROOTS.contains(&key.as_str()) => return false,
             _ => {}
         }
-        if self.game.contains_key(&key) {
+        if self.game.contains_key(&key) || self.sources.contains_key(&key) {
             self.over.insert(key, (path.to_string(), Node::Deleted));
         } else {
             self.over.remove(&key);
@@ -166,7 +219,7 @@ impl Vfs {
         let key = path.to_ascii_lowercase();
         let prefix = if key.ends_with('\\') { key } else { format!("{key}\\") };
         let mut names: BTreeMap<String, String> = BTreeMap::new();
-        let all = self.game.iter().map(|(k, (p, _))| (k, p)).chain(self.over.iter().map(|(k, (p, _))| (k, p)));
+        let all = self.game.iter().map(|(k, (p, _))| (k, p)).chain(self.sources.iter().map(|(k, (p, _))| (k, p))).chain(self.over.iter().map(|(k, (p, _))| (k, p)));
         for (k, display) in all.filter(|(k, _)| k.starts_with(&prefix)) {
             let name = display[prefix.len()..].split('\\').next().unwrap_or("");
             if !name.is_empty() {
@@ -206,6 +259,45 @@ mod tests {
         assert_eq!(v.kind("G:\\"), Some(Kind::Dir));
         assert_eq!(v.kind("G:\\nothing"), None);
         assert_eq!(v.read("G:\\data\\sub\\nested.bin"), Some(&[1u8, 2][..]));
+    }
+
+    #[test]
+    fn a_file_read_on_demand_is_a_file_like_the_others() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut v = game();
+        // 1 TB that nobody holds: byte i is i modulo 251
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let log = asked.clone();
+        let read = move |offset: u64, buffer: &mut [u8]| {
+            log.borrow_mut().push((offset, buffer.len()));
+            for (i, b) in buffer.iter_mut().enumerate() {
+                *b = ((offset + i as u64) % 251) as u8;
+            }
+            true
+        };
+        v.add_game_source("pack/levels.rpf", Source { size: 1 << 40, read: Box::new(read) });
+        assert_eq!(v.kind("G:\\Pack\\LEVELS.rpf"), Some(Kind::File(1 << 40)));
+        assert_eq!(v.kind("G:\\pack"), Some(Kind::Dir));
+        assert_eq!(v.list("G:\\pack"), [("levels.rpf".to_string(), Kind::File(1 << 40))]);
+        assert_eq!((v.source_size("G:\\pack\\levels.rpf"), v.source_size("G:\\data\\hello.txt")), (Some(1 << 40), None));
+        assert_eq!(v.read("G:\\pack\\levels.rpf"), None, "not held whole");
+        let mut buffer = [0u8; 4];
+        let far = (1u64 << 40) - 2;
+        assert_eq!(v.read_at("G:\\pack\\levels.rpf", 500, &mut buffer), Some(4));
+        assert_eq!(buffer, [(500 % 251) as u8, (501 % 251) as u8, (502 % 251) as u8, (503 % 251) as u8]);
+        // at the end there are fewer bytes, past it none: only the range inside the file is asked for
+        assert_eq!(v.read_at("G:\\pack\\levels.rpf", far, &mut buffer), Some(2));
+        assert_eq!(v.read_at("G:\\pack\\levels.rpf", far + 9, &mut buffer), Some(0));
+        assert_eq!(*asked.borrow(), [(500, 4), (far, 2)]);
+        // the files held whole are read the same way
+        assert_eq!(v.read_at("G:\\data\\hello.txt", 3, &mut buffer), Some(2));
+        assert_eq!(&buffer[..2], b"lo");
+        assert_eq!(v.read_at("G:\\nothing", 0, &mut buffer), None);
+        // deleted, it is hidden like any file of the game folder
+        assert!(v.remove("G:\\pack\\levels.rpf"));
+        assert_eq!((v.kind("G:\\pack\\levels.rpf"), v.source_size("G:\\pack\\levels.rpf")), (None, None));
+        assert_eq!(v.read_at("G:\\pack\\levels.rpf", 0, &mut buffer), None);
     }
 
     #[test]
