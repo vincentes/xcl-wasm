@@ -15,6 +15,7 @@ pub mod gdk;
 pub mod heap;
 mod kernel32;
 mod kernelx;
+mod libc;
 pub mod seh;
 mod sync;
 mod text;
@@ -140,6 +141,7 @@ pub(crate) use register;
 pub fn handlers() -> HashMap<&'static str, Handler> {
     let mut map = HashMap::new();
     crt::register(&mut map);
+    libc::register(&mut map);
     kernel32::register(&mut map);
     seh::register(&mut map);
     sync::register(&mut map);
