@@ -29,6 +29,13 @@ pub(crate) struct Ctx<'a> {
     /// segment base added to memory operands (FS / GS)
     pub seg: u64,
     pub addr32: bool,
+    /// a VEX-encoded instruction: its second source register (`vvvv`) and vector length
+    pub vex: bool,
+    pub vvvv: u8,
+    pub l: bool,
+    /// which 128-bit half of the vector registers the SSE code works on (a 256-bit instruction
+    /// is run once per half)
+    pub half: u8,
 }
 
 #[inline]
@@ -66,7 +73,7 @@ pub(crate) fn run(cpu: &mut Cpu, mem: &mut Memory, max: u64) -> Exit {
             return Exit::Limit;
         }
         let start = cpu.rip;
-        let mut c = Ctx { cpu, mem, pc: start, rex: 0, opsz16: false, rep: 0, seg: 0, addr32: false };
+        let mut c = Ctx { cpu, mem, pc: start, rex: 0, opsz16: false, rep: 0, seg: 0, addr32: false, vex: false, vvvv: 0, l: false, half: 0 };
         match c.step() {
             Ok(()) => {
                 let pc = c.pc;
@@ -114,7 +121,7 @@ impl Ctx<'_> {
     }
 
     /// Immediate of an instruction with operand size `sz`: 8 / 16 / 32 bits, sign-extended.
-    fn imm(&mut self, sz: u8) -> R<u64> {
+    pub(crate) fn imm(&mut self, sz: u8) -> R<u64> {
         Ok(match sz {
             1 => self.fetch8()? as i8 as i64 as u64,
             2 => self.fetch16()? as i16 as i64 as u64,
@@ -247,14 +254,14 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    fn set_szp(&mut self, r: u64, sz: u8) {
+    pub(crate) fn set_szp(&mut self, r: u64, sz: u8) {
         let r = r & mask(sz);
         self.cpu.set_flag(ZF, r == 0);
         self.cpu.set_flag(SF, r & sign_bit(sz) != 0);
         self.cpu.set_flag(PF, (r as u8).count_ones() % 2 == 0);
     }
 
-    fn add(&mut self, a: u64, b: u64, carry: bool, sz: u8) -> u64 {
+    pub(crate) fn add(&mut self, a: u64, b: u64, carry: bool, sz: u8) -> u64 {
         let m = mask(sz);
         let (a, b) = (a & m, b & m);
         let wide = a as u128 + b as u128 + carry as u128;
@@ -277,7 +284,7 @@ impl Ctx<'_> {
         r
     }
 
-    fn logic(&mut self, r: u64, sz: u8) -> u64 {
+    pub(crate) fn logic(&mut self, r: u64, sz: u8) -> u64 {
         let r = r & mask(sz);
         self.cpu.rflags &= !(CF | OF | AF);
         self.set_szp(r, sz);
@@ -464,19 +471,32 @@ impl Ctx<'_> {
     fn cpuid(&mut self) {
         let leaf = self.cpu.r[RAX] as u32;
         let f = self.cpu.features;
-        let (a, b, c, d): (u32, u32, u32, u32) = match leaf {
+        let (a, b, c, d): (u32, u32, u32, u32) = match (leaf, self.cpu.r[RCX] as u32) {
             // "AuthenticAMD"
-            0 => (7, 0x6874_7541, 0x444D_4163, 0x6974_6E65),
-            1 => {
-                let c = (f.sse3 as u32) | (f.ssse3 as u32) << 9 | 1 << 13 | (f.sse41 as u32) << 19 | (f.sse42 as u32) << 20 | (f.popcnt as u32) << 23;
+            (0, _) => (7, 0x6874_7541, 0x444D_4163, 0x6974_6E65),
+            (1, _) => {
+                let c = (f.sse3 as u32)
+                    | (f.ssse3 as u32) << 9
+                    | (f.fma as u32) << 12
+                    | 1 << 13
+                    | (f.sse41 as u32) << 19
+                    | (f.sse42 as u32) << 20
+                    | (f.movbe as u32) << 22
+                    | (f.popcnt as u32) << 23
+                    // xsave and osxsave go with AVX: the guest asks XCR0 whether YMM is saved
+                    | (f.avx as u32) << 26
+                    | (f.avx as u32) << 27
+                    | (f.avx as u32) << 28
+                    | (f.f16c as u32) << 29;
                 // fpu tsc cx8 cmov clfsh mmx fxsr sse sse2
                 let d = 1 | 1 << 4 | 1 << 8 | 1 << 15 | 1 << 19 | 1 << 23 | 1 << 24 | 1 << 25 | 1 << 26;
                 (0x0087_0F10, 0x0000_0800, c, d)
             }
-            0x8000_0000 => (0x8000_0008, 0x6874_7541, 0x444D_4163, 0x6974_6E65),
-            // lahf/sahf; syscall, nx, long mode
-            0x8000_0001 => (0x0087_0F10, 0, 1, 1 << 11 | 1 << 20 | 1 << 29),
-            0x8000_0008 => (0x3030, 0, 0, 0),
+            (7, 0) => (0, (f.bmi1 as u32) << 3 | (f.avx2 as u32) << 5 | (f.bmi2 as u32) << 8 | (f.adx as u32) << 19, 0, 0),
+            (0x8000_0000, _) => (0x8000_0008, 0x6874_7541, 0x444D_4163, 0x6974_6E65),
+            // lahf/sahf, lzcnt; syscall, nx, long mode
+            (0x8000_0001, _) => (0x0087_0F10, 0, 1 | (f.lzcnt as u32) << 5, 1 << 11 | 1 << 20 | 1 << 29),
+            (0x8000_0008, _) => (0x3030, 0, 0, 0),
             _ => (0, 0, 0, 0),
         };
         self.cpu.r[RAX] = a as u64;
@@ -612,6 +632,9 @@ impl Ctx<'_> {
         if op & 0xF0 == 0x40 {
             self.rex = op;
             op = self.fetch8()?;
+        }
+        if op == 0xC4 || op == 0xC5 {
+            return self.vex_prefix(op);
         }
         let osz = self.opsize();
         match op {
@@ -917,16 +940,51 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// A VEX prefix (C5: two bytes, C4: three): it stands for REX, the mandatory prefix and the
+    /// opcode map, and carries a register and the vector length.
+    fn vex_prefix(&mut self, first: u8) -> R<()> {
+        let b1 = self.fetch8()?;
+        let (map, b2) = if first == 0xC5 { (1, b1) } else { (b1 & 0x1F, self.fetch8()?) };
+        // R, X, B are stored inverted; W is in the second byte of the long form
+        let mut rex = 0x40 | ((!b1 >> 7) & 1) << 2;
+        if first == 0xC4 {
+            rex |= ((!b1 >> 6) & 1) << 1 | ((!b1 >> 5) & 1) | (b2 >> 7) << 3;
+        }
+        self.rex = rex;
+        self.vex = true;
+        self.vvvv = (!b2 >> 3) & 0xF;
+        self.l = b2 & 4 != 0;
+        match b2 & 3 {
+            1 => self.opsz16 = true,
+            2 => self.rep = 0xF3,
+            3 => self.rep = 0xF2,
+            _ => {}
+        }
+        let op = self.fetch8()?;
+        if !crate::avx::exec(self, map, op)? {
+            return Err(self.undefined());
+        }
+        Ok(())
+    }
+
     fn two_byte(&mut self) -> R<()> {
         let op = self.fetch8()?;
         let osz = self.opsize();
         match op {
-            // xgetbv: XCR0 = x87 | SSE
+            // the three-byte maps: SSSE3, SSE4, MOVBE, CRC32, ADCX / ADOX
+            0x38 | 0x3A => {
+                let map = if op == 0x38 { 2 } else { 3 };
+                let op = self.fetch8()?;
+                if !crate::avx::exec(self, map, op)? {
+                    return Err(self.undefined());
+                }
+            }
+            // xgetbv: XCR0 = x87 | SSE (| AVX)
             0x01 => {
                 if self.fetch8()? != 0xD0 {
                     return Err(self.undefined());
                 }
-                self.cpu.r[RAX] = 3;
+                self.cpu.r[RAX] = if self.cpu.features.avx { 7 } else { 3 };
                 self.cpu.r[RDX] = 0;
             }
             0x0B => return Err(Exit::Halt),

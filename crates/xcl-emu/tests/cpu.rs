@@ -127,6 +127,19 @@ fn string_instructions_and_atomics() {
 }
 
 #[test]
+fn adx_adds_with_one_flag_as_the_carry() {
+    // (ADX is not in the recorded CPU results: Rosetta 2 does not have it)
+    // stc; mov rax,-1; mov ecx,1; adcx rax,rcx; ret       → 1, carry out
+    let (cpu, _) = run(&[0xF9, 0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xB9, 1, 0, 0, 0, 0x66, 0x48, 0x0F, 0x38, 0xF6, 0xC1, 0xC3]);
+    assert_eq!(cpu.r[RAX], 1);
+    assert!(cpu.flag(CF) && !cpu.flag(OF));
+    // stc; mov eax,5; mov ecx,1; adox eax,ecx; ret         → 6: OF is the carry in (clear), CF stays
+    let (cpu, _) = run(&[0xF9, 0xB8, 5, 0, 0, 0, 0xB9, 1, 0, 0, 0, 0xF3, 0x0F, 0x38, 0xF6, 0xC1, 0xC3]);
+    assert_eq!(cpu.r[RAX], 6);
+    assert!(cpu.flag(CF) && !cpu.flag(OF));
+}
+
+#[test]
 fn sse2_integer_and_floating_point() {
     // mov eax,3; movd xmm0,eax; paddd xmm0,xmm0; movd eax,xmm0; ret
     assert_eq!(run(&[0xB8, 3, 0, 0, 0, 0x66, 0x0F, 0x6E, 0xC0, 0x66, 0x0F, 0xFE, 0xC0, 0x66, 0x0F, 0x7E, 0xC0, 0xC3]).0.r[RAX], 6);

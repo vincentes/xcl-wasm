@@ -173,20 +173,36 @@ fn shift_lanes(a: u128, w: u32, count: u64, kind: u8) -> u128 {
 }
 
 impl Ctx<'_> {
+    /// The 128 bits of vector register `r` the instruction works on (see `Ctx::half`).
     #[inline]
-    fn x(&self, r: u8) -> u128 {
+    pub(crate) fn x(&self, r: u8) -> u128 {
         let v = &self.cpu.v[r as usize];
-        v[0] as u128 | (v[1] as u128) << 64
+        let h = self.half as usize * 2;
+        v[h] as u128 | (v[h + 1] as u128) << 64
     }
 
+    /// Write them. A VEX instruction on XMM registers clears the upper half of the YMM register.
     #[inline]
-    fn set_x(&mut self, r: u8, v: u128) {
-        self.cpu.v[r as usize][0] = v as u64;
-        self.cpu.v[r as usize][1] = (v >> 64) as u64;
+    pub(crate) fn set_x(&mut self, r: u8, v: u128) {
+        let h = self.half as usize * 2;
+        let reg = &mut self.cpu.v[r as usize];
+        reg[h] = v as u64;
+        reg[h + 1] = (v >> 64) as u64;
+        if self.vex && !self.l {
+            reg[2] = 0;
+            reg[3] = 0;
+        }
+    }
+
+    /// The first source of a two-source instruction: the destination itself, or the register a
+    /// VEX prefix names.
+    #[inline]
+    pub(crate) fn src1(&self, reg: u8) -> u128 {
+        self.x(if self.vex { self.vvvv } else { reg })
     }
 
     /// An XMM or memory operand, `bytes` wide in memory (zero-extended).
-    fn rd_x(&self, rm: Rm, bytes: u8) -> R<u128> {
+    pub(crate) fn rd_x(&self, rm: Rm, bytes: u8) -> R<u128> {
         Ok(match rm {
             Rm::Reg(r) => self.x(r),
             _ => {
@@ -194,13 +210,21 @@ impl Ctx<'_> {
                 match bytes {
                     4 => self.mem.read_u32(a)? as u128,
                     8 => self.mem.read_u64(a)? as u128,
-                    _ => u128::from_le_bytes(self.mem.read_n(a)?),
+                    _ => u128::from_le_bytes(self.mem.read_n(a + 16 * self.half as u64)?),
                 }
             }
         })
     }
 
-    fn wr_x(&mut self, rm: Rm, bytes: u8, v: u128) -> R<()> {
+    /// The low 128 bits of an operand whichever half is worked on (a shift count).
+    fn rd_x_low(&mut self, rm: Rm) -> R<u128> {
+        let half = std::mem::take(&mut self.half);
+        let v = self.rd_x(rm, 16);
+        self.half = half;
+        v
+    }
+
+    pub(crate) fn wr_x(&mut self, rm: Rm, bytes: u8, v: u128) -> R<()> {
         match rm {
             Rm::Reg(r) => self.set_x(r, v),
             _ => {
@@ -208,7 +232,7 @@ impl Ctx<'_> {
                 match bytes {
                     4 => self.mem.write_u32(a, v as u32)?,
                     8 => self.mem.write_u64(a, v as u64)?,
-                    _ => self.mem.write(a, &v.to_le_bytes())?,
+                    _ => self.mem.write(a + 16 * self.half as u64, &v.to_le_bytes())?,
                 }
             }
         }
@@ -250,7 +274,7 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
                 let v = c.rd_x(rm, scalar)?;
                 let keep = if f3 { LOW32 } else { LOW64 };
                 let r = match rm {
-                    Rm::Reg(_) => (c.x(reg) & !keep) | (v & keep),
+                    Rm::Reg(_) => (c.src1(reg) & !keep) | (v & keep),
                     _ => v,
                 };
                 c.set_x(reg, r);
@@ -270,7 +294,7 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
                 let keep = if f3 { LOW32 } else { LOW64 };
                 match rm {
                     Rm::Reg(r) => {
-                        let merged = (c.x(r) & !keep) | (v & keep);
+                        let merged = (if c.vex { c.x(c.vvvv) } else { c.x(r) } & !keep) | (v & keep);
                         c.set_x(r, merged);
                     }
                     _ => c.wr_x(rm, scalar, v)?,
@@ -286,7 +310,7 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
                 Rm::Reg(r) => c.x(r) >> 64,
                 _ => c.rd_x(rm, 8)?,
             };
-            let v = (c.x(reg) & !LOW64) | (lo & LOW64);
+            let v = (c.src1(reg) & !LOW64) | (lo & LOW64);
             c.set_x(reg, v);
         }
         0x13 if none || p66 => {
@@ -298,14 +322,14 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
         0x14 | 0x15 if none || p66 => {
             let (reg, rm) = c.modrm()?;
             let b = c.rd_x(rm, 16)?;
-            let v = unpack(c.x(reg), b, if p66 { 8 } else { 4 }, op == 0x15);
+            let v = unpack(c.src1(reg), b, if p66 { 8 } else { 4 }, op == 0x15);
             c.set_x(reg, v);
         }
         // movhps / movhpd load (register form: movlhps)
         0x16 if none || p66 => {
             let (reg, rm) = c.modrm()?;
             let hi = c.rd_x(rm, 8)? & LOW64;
-            let v = (c.x(reg) & LOW64) | hi << 64;
+            let v = (c.src1(reg) & LOW64) | hi << 64;
             c.set_x(reg, v);
         }
         0x17 if none || p66 => {
@@ -318,7 +342,7 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
             let sz = if c.rex & 8 != 0 { 8 } else { 4 };
             let (reg, rm) = c.modrm()?;
             let i = crate::exec::sx(c.rd_rm(rm, sz)?, sz) as i64;
-            let old = c.x(reg);
+            let old = c.src1(reg);
             let v = if f3 { (old & !LOW32) | (i as f32).to_bits() as u128 } else { (old & !LOW64) | (i as f64).to_bits() as u128 };
             c.set_x(reg, v);
         }
@@ -350,6 +374,8 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
             let Rm::Reg(r) = rm else { return Ok(false) };
             let v = c.x(r);
             let m = if p66 { (v >> 63) as u64 & 1 | ((v >> 127) as u64 & 1) << 1 } else { (0..4).fold(0, |m, i| m | ((v >> (i * 32 + 31)) as u64 & 1) << i) };
+            // the upper half of a YMM source: its bits above the lower half's
+            let m = if c.half == 1 { c.greg(reg, 8) | m << if p66 { 2 } else { 4 } } else { m };
             c.sreg(reg, 8, m);
         }
         // sqrt, rsqrt (ps / ss), rcp (ps / ss)
@@ -363,7 +389,7 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
                 0x52 => 1.0 / x.sqrt(),
                 _ => 1.0 / x,
             };
-            let old = c.x(reg);
+            let old = c.src1(reg);
             let v = if none {
                 from_ps(ps(c.rd_x(rm, 16)?).map(single))
             } else if p66 {
@@ -382,7 +408,7 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
             }
             let (reg, rm) = c.modrm()?;
             let b = c.rd_x(rm, 16)?;
-            let a = c.x(reg);
+            let a = c.src1(reg);
             let v = match op {
                 0x54 | 0xDB => a & b,
                 0x55 | 0xDF => !a & b,
@@ -394,7 +420,7 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
         // add mul sub min div max
         0x58 | 0x59 | 0x5C..=0x5F => {
             let (reg, rm) = c.modrm()?;
-            let a = c.x(reg);
+            let a = c.src1(reg);
             let v = if none {
                 let (x, y) = (ps(a), ps(c.rd_x(rm, 16)?));
                 from_ps(std::array::from_fn(|i| arith32(op, x[i], y[i])))
@@ -413,7 +439,7 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
         // cvtps2pd cvtpd2ps cvtss2sd cvtsd2ss
         0x5A => {
             let (reg, rm) = c.modrm()?;
-            let a = c.x(reg);
+            let a = c.src1(reg);
             let v = if none {
                 let x = ps(c.rd_x(rm, 8)?);
                 from_pd([x[0] as f64, x[1] as f64])
@@ -442,7 +468,7 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
         0x60..=0x6D if p66 => {
             let (reg, rm) = c.modrm()?;
             let b = c.rd_x(rm, 16)?;
-            let a = c.x(reg);
+            let a = c.src1(reg);
             let v = match op {
                 0x60..=0x62 => unpack(a, b, 1 << (op - 0x60), false),
                 0x63 => pack(a, b, 2, false),
@@ -489,6 +515,8 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
             let Rm::Reg(r) = rm else { return Ok(false) };
             let count = c.fetch8()? as u64;
             let w = 2 << (op - 0x71);
+            // the VEX form writes the register the prefix names
+            let dst = if c.vex { c.vvvv } else { r };
             let a = c.x(r);
             let v = match reg & 7 {
                 2 => shift_lanes(a, w, count, 1),
@@ -510,13 +538,13 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
                 }
                 _ => return Ok(false),
             };
-            c.set_x(r, v);
+            c.set_x(dst, v);
         }
         // pcmpeqb / w / d
         0x74..=0x76 if p66 => {
             let (reg, rm) = c.modrm()?;
             let b = c.rd_x(rm, 16)?;
-            let v = lanes(c.x(reg), b, 1 << (op - 0x74), |x, y| if x == y { !0 } else { 0 });
+            let v = lanes(c.src1(reg), b, 1 << (op - 0x74), |x, y| if x == y { !0 } else { 0 });
             c.set_x(reg, v);
         }
         // emms
@@ -537,7 +565,7 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
         0xC2 => {
             let (reg, rm) = c.modrm()?;
             let p = c.fetch8()?;
-            let a = c.x(reg);
+            let a = c.src1(reg);
             let v = if none {
                 let (x, y) = (ps(a), ps(c.rd_x(rm, 16)?));
                 (0..4).fold(0u128, |r, i| r | if compare(p, x[i], y[i]) { LOW32 << (i * 32) } else { 0 })
@@ -561,7 +589,7 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
                 Rm::Reg(r) => c.greg(r, 2),
                 _ => c.rd_rm(rm, 2)?,
             } as u128;
-            let v = (c.x(reg) & !(0xFFFF << i)) | w << i;
+            let v = (c.src1(reg) & !(0xFFFF << i)) | w << i;
             c.set_x(reg, v);
         }
         0xC5 if p66 => {
@@ -576,7 +604,7 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
             let (reg, rm) = c.modrm()?;
             let order = c.fetch8()? as u32;
             let b = c.rd_x(rm, 16)?;
-            let a = c.x(reg);
+            let a = c.src1(reg);
             let v = if p66 {
                 ((a >> ((order & 1) * 64)) & LOW64) | ((b >> (((order >> 1) & 1) * 64)) & LOW64) << 64
             } else {
@@ -600,6 +628,7 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
             let Rm::Reg(r) = rm else { return Ok(false) };
             let v = c.x(r);
             let m = (0..16).fold(0u64, |m, i| m | ((v >> (i * 8 + 7)) as u64 & 1) << i);
+            let m = if c.half == 1 { c.greg(reg, 8) | m << 16 } else { m };
             c.sreg(reg, 8, m);
         }
         // cvttpd2dq / cvtdq2pd / cvtpd2dq
@@ -618,8 +647,9 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
         0xD1..=0xFE if p66 => {
             let (reg, rm) = c.modrm()?;
             let b = c.rd_x(rm, 16)?;
-            let a = c.x(reg);
-            let count = b as u64;
+            let a = c.src1(reg);
+            // a shift's count is the low quadword of its operand, for both halves
+            let count = c.rd_x_low(rm)? as u64;
             let v = match op {
                 0xD1..=0xD3 => shift_lanes(a, 2 << (op - 0xD1), count, 1),
                 0xE1 | 0xE2 => shift_lanes(a, 2 << (op - 0xE1), count, 2),

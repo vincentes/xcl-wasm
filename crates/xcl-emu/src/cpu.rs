@@ -45,7 +45,8 @@ impl From<Fault> for Exit {
     }
 }
 
-/// What `cpuid` reports: the instruction sets the guest may use.
+/// What `cpuid` reports: the instruction sets the guest may use. The interpreter executes all of
+/// them either way; a title that asks takes the paths for what it is told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Features {
     pub sse3: bool,
@@ -53,6 +54,21 @@ pub struct Features {
     pub sse41: bool,
     pub sse42: bool,
     pub popcnt: bool,
+    pub lzcnt: bool,
+    pub movbe: bool,
+    pub avx: bool,
+    pub avx2: bool,
+    pub fma: bool,
+    pub f16c: bool,
+    pub bmi1: bool,
+    pub bmi2: bool,
+    pub adx: bool,
+}
+
+impl Features {
+    /// x86-64 as it started: SSE2 (and POPCNT).
+    pub const BASELINE: Features =
+        Features { sse3: false, ssse3: false, sse41: false, sse42: false, popcnt: true, lzcnt: false, movbe: false, avx: false, avx2: false, fma: false, f16c: false, bmi1: false, bmi2: false, adx: false };
 }
 
 #[derive(Clone)]
@@ -96,7 +112,7 @@ impl Cpu {
             mxcsr: 0x1F80,
             fcw: 0x027F,
             icount: 0,
-            features: Features { sse3: false, ssse3: false, sse41: false, sse42: false, popcnt: true },
+            features: Features::BASELINE,
             trap_base: 0,
             trap_end: 0,
         }

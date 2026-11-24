@@ -306,3 +306,113 @@ f2 0f 2a c1          | - | - | cvtsi2sd xmm0, ecx
 f2 48 0f 2a c1       | - | - | cvtsi2sd xmm0, rcx
 0f 5b c1             | - | - | cvtdq2ps xmm0, xmm1
 f3 0f e6 c1          | - | - | cvtdq2pd xmm0, xmm1
+
+# --- BMI1, BMI2, LZCNT / TZCNT, MOVBE, CRC32 (ADX is not here: Rosetta 2 does not have it)
+c4 e2 f0 f2 c2       | pa | - | andn rax, rcx, rdx
+c4 e2 70 f2 c2       | pa | - | andn eax, ecx, edx
+c4 e2 f8 f3 c9       | pa | - | blsr rax, rcx
+c4 e2 f8 f3 d1       | pa | - | blsmsk rax, rcx
+c4 e2 f8 f3 d9       | pa | - | blsi rax, rcx
+c4 e2 78 f3 d9       | pa | - | blsi eax, ecx
+c4 e2 e8 f5 c1       | pa | - | bzhi rax, rcx, rdx
+c4 e2 68 f5 c1       | pa | - | bzhi eax, ecx, edx
+c4 e2 f2 f5 c2       | - | - | pext rax, rcx, rdx
+c4 e2 f3 f5 c2       | - | - | pdep rax, rcx, rdx
+c4 e2 73 f5 c2       | - | - | pdep eax, ecx, edx
+c4 e2 f3 f6 c1       | - | - | mulx rax, rcx(vvvv), rcx  [rdx implicit]
+c4 e2 e3 f6 c1       | - | - | mulx rax, rbx, rcx
+c4 e2 63 f6 c1       | - | - | mulx eax, ebx, ecx
+c4 e2 e8 f7 c1       | pas | - | bextr rax, rcx, rdx
+c4 e2 e9 f7 c1       | - | - | shlx rax, rcx, rdx
+c4 e2 ea f7 c1       | - | - | sarx rax, rcx, rdx
+c4 e2 eb f7 c1       | - | - | shrx rax, rcx, rdx
+c4 e2 6a f7 c1       | - | - | sarx eax, ecx, edx
+c4 e3 fb f0 c1 0d    | - | - | rorx rax, rcx, 13
+c4 e3 7b f0 c1 1f    | - | - | rorx eax, ecx, 31
+f3 48 0f bc c1       | paso | - | tzcnt rax, rcx
+f3 0f bc c1          | paso | - | tzcnt eax, ecx
+f3 48 0f bd c1       | paso | - | lzcnt rax, rcx
+f3 0f bd c1          | paso | - | lzcnt eax, ecx
+66 f3 0f bd c1       | paso | - | lzcnt ax, cx
+48 0f 38 f0 07       | - | - | movbe rax, [rdi]
+0f 38 f1 07          | - | - | movbe [rdi], eax
+66 0f 38 f0 07       | - | - | movbe ax, [rdi]
+f2 0f 38 f0 c1       | - | - | crc32 eax, cl
+f2 48 0f 38 f1 c1    | - | - | crc32 rax, rcx
+f2 0f 38 f1 07       | - | - | crc32 eax, dword [rdi]
+
+# --- AVX: the SSE instructions with a VEX prefix (three operands; XMM forms clear the upper half)
+c5 f8 10 07          | - | - | vmovups xmm0, [rdi]
+c5 fc 10 07          | - | - | vmovups ymm0, [rdi]
+c5 fc 11 0f          | - | - | vmovups [rdi], ymm1
+c5 fd 6f c1          | - | - | vmovdqa ymm0, ymm1
+c5 fe 7f 0f          | - | - | vmovdqu [rdi], ymm1
+c5 fa 6f 07          | - | - | vmovdqu xmm0, [rdi]
+c5 ea 10 c1          | - | - | vmovss xmm0, xmm2, xmm1
+c5 fa 10 07          | - | - | vmovss xmm0, [rdi]
+c5 eb 10 c1          | - | - | vmovsd xmm0, xmm2, xmm1
+c5 ea 11 c8          | - | - | vmovss xmm0, xmm2, xmm1 (store form)
+c5 f9 6e c1          | - | - | vmovd xmm0, ecx
+c4 e1 f9 6e c1       | - | - | vmovq xmm0, rcx
+c4 e1 f9 7e c8       | - | - | vmovq rax, xmm1
+c5 fa 7e c1          | - | - | vmovq xmm0, xmm1
+c5 e8 12 c1          | - | - | vmovhlps xmm0, xmm2, xmm1
+c5 e8 16 c1          | - | - | vmovlhps xmm0, xmm2, xmm1
+c5 e8 12 07          | - | - | vmovlps xmm0, xmm2, [rdi]
+c5 e8 16 07          | - | - | vmovhps xmm0, xmm2, [rdi]
+c5 fc 50 c1          | - | - | vmovmskps eax, ymm1
+c5 fd 50 c1          | - | - | vmovmskpd eax, ymm1
+c5 fd d7 c1          | - | - | vpmovmskb eax, ymm1
+c5 f9 d7 c1          | - | - | vpmovmskb eax, xmm1
+c5 e9 fc c1          | - | - | vpaddb xmm0, xmm2, xmm1
+c5 ed fc c1          | - | - | vpaddb ymm0, ymm2, ymm1
+c5 ed fe 07          | - | - | vpaddd ymm0, ymm2, [rdi]
+c5 ed d4 c1          | - | - | vpaddq ymm0, ymm2, ymm1
+c5 ed f8 c1          | - | - | vpsubb ymm0, ymm2, ymm1
+c5 ed ec c1          | - | - | vpaddsb ymm0, ymm2, ymm1
+c5 ed dd c1          | - | - | vpaddusw ymm0, ymm2, ymm1
+c5 ed d5 c1          | - | - | vpmullw ymm0, ymm2, ymm1
+c5 ed e5 c1          | - | - | vpmulhw ymm0, ymm2, ymm1
+c5 ed f4 c1          | - | - | vpmuludq ymm0, ymm2, ymm1
+c5 ed f5 c1          | - | - | vpmaddwd ymm0, ymm2, ymm1
+c5 ed f6 c1          | - | - | vpsadbw ymm0, ymm2, ymm1
+c5 ed e0 c1          | - | - | vpavgb ymm0, ymm2, ymm1
+c5 ed da c1          | - | - | vpminub ymm0, ymm2, ymm1
+c5 ed ee c1          | - | - | vpmaxsw ymm0, ymm2, ymm1
+c5 ed 74 c1          | - | - | vpcmpeqb ymm0, ymm2, ymm1
+c5 ed 66 c1          | - | - | vpcmpgtd ymm0, ymm2, ymm1
+c5 ed db c1          | - | - | vpand ymm0, ymm2, ymm1
+c5 ed df c1          | - | - | vpandn ymm0, ymm2, ymm1
+c5 ed ef c1          | - | - | vpxor ymm0, ymm2, ymm1
+c5 e9 ef c1          | - | - | vpxor xmm0, xmm2, xmm1
+c5 ec 57 c1          | - | - | vxorps ymm0, ymm2, ymm1
+c5 ed 54 c1          | - | - | vandpd ymm0, ymm2, ymm1
+c5 ed 60 c1          | - | - | vpunpcklbw ymm0, ymm2, ymm1
+c5 ed 6a c1          | - | - | vpunpckhdq ymm0, ymm2, ymm1
+c5 ed 6c c1          | - | - | vpunpcklqdq ymm0, ymm2, ymm1
+c5 ed 63 c1          | - | - | vpacksswb ymm0, ymm2, ymm1
+c5 ed 67 c1          | - | - | vpackuswb ymm0, ymm2, ymm1
+c5 ed 6b c1          | - | - | vpackssdw ymm0, ymm2, ymm1
+c5 fd 70 c1 1b       | - | - | vpshufd ymm0, ymm1, 0x1b
+c5 fe 70 c1 4e       | - | - | vpshufhw ymm0, ymm1, 0x4e
+c5 ff 70 c1 93       | - | - | vpshuflw ymm0, ymm1, 0x93
+c5 fd 71 d1 03       | - | - | vpsrlw ymm0, ymm1, 3
+c5 fd 72 e1 07       | - | - | vpsrad ymm0, ymm1, 7
+c5 fd 73 f1 21       | - | - | vpsllq ymm0, ymm1, 33
+c5 fd 73 d9 05       | - | - | vpsrldq ymm0, ymm1, 5
+c5 fd 73 f9 0b       | - | - | vpslldq ymm0, ymm1, 11
+c5 f9 72 f1 05       | - | - | vpslld xmm0, xmm1, 5
+c5 ed d2 c1          | - | - | vpsrld ymm0, ymm2, xmm1
+c5 ed f3 c1          | - | - | vpsllq ymm0, ymm2, xmm1
+c5 ed e1 c1          | - | - | vpsraw ymm0, ymm2, xmm1
+c5 ec c6 c1 b1       | - | - | vshufps ymm0, ymm2, ymm1, 0xb1
+c5 ed c6 c1 0a       | - | - | vshufpd ymm0, ymm2, ymm1, 0xa
+c5 ec 14 c1          | - | - | vunpcklps ymm0, ymm2, ymm1
+c5 ed 15 c1          | - | - | vunpckhpd ymm0, ymm2, ymm1
+c5 e9 c4 c1 05       | - | - | vpinsrw xmm0, xmm2, ecx, 5
+c5 f9 c5 c1 06       | - | - | vpextrw eax, xmm1, 6
+c5 ea 2a c1          | - | - | vcvtsi2ss xmm0, xmm2, ecx
+c4 e1 eb 2a c1       | - | - | vcvtsi2sd xmm0, xmm2, rcx
+c5 fc 5b c1          | - | - | vcvtdq2ps ymm0, ymm1
+c5 f8 77             | - | - | vzeroupper
+c5 fc 77             | - | - | vzeroall

@@ -11,6 +11,7 @@
 //!   with [`abi::ret`].
 
 pub mod abi;
+mod avx;
 pub mod cpu;
 mod exec;
 pub mod mem;
