@@ -2,7 +2,6 @@
 //! and the thread's stack and TEB.
 
 use xcl::pe::{ImportName, Layout, Pe};
-use xcl_emu::abi;
 use xcl_emu::cpu::RSP;
 use xcl_emu::mem::{page_up, PROT_R, PROT_W, PROT_X};
 
@@ -72,11 +71,10 @@ impl Guest {
         let f = |e| format!("thread setup: {e:?}");
         let stack = self.mem.alloc(page_up(stack_size), PROT_R | PROT_W).map_err(f)?;
         let top = stack + page_up(stack_size);
-        self.win.setup_thread(&mut self.cpu, &mut self.mem, stack, top).map_err(|e| format!("thread setup: {e:?}"))?;
-        self.cpu.r[RSP] = top - 0x40;
         let entry = self.modules[index].entry;
-        let ret = self.cpu.trap_address(SLOT_ENTRY_RETURN);
-        abi::call(&mut self.cpu, &mut self.mem, entry, &[], ret).map_err(|e| format!("thread setup: {e:?}"))?;
+        let main = self.add_thread(stack, top, entry, 0, SLOT_ENTRY_RETURN).map_err(|e| format!("thread setup: {e:?}"))?;
+        self.current = main;
+        self.cpu = self.threads[main].cpu.clone();
         // TLS callbacks run before the entry point (DLL_PROCESS_ATTACH)
         let entry_state = (self.cpu.r[RSP], self.cpu.rip);
         for t in self.win.tls_templates.clone() {

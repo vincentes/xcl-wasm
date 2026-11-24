@@ -43,12 +43,12 @@ fn GetCurrentProcessId(_: &mut Guest) -> H {
     Ok(0x1000)
 }
 
-fn GetCurrentThreadId(_: &mut Guest) -> H {
-    Ok(0x1004)
+fn GetCurrentThreadId(g: &mut Guest) -> H {
+    Ok(g.thread().id as u64)
 }
 
 fn GetLastError(g: &mut Guest) -> H {
-    Ok(g.win.last_error as u64)
+    Ok(g.thread().last_error as u64)
 }
 
 fn SetLastError(g: &mut Guest) -> H {
@@ -58,7 +58,10 @@ fn SetLastError(g: &mut Guest) -> H {
 }
 
 fn GetCommandLineW(g: &mut Guest) -> H {
-    g.static_block("command line", |g| g.alloc_wstr("title.exe"))
+    g.static_block("command line", |g| {
+        let line = g.command_line.clone();
+        g.alloc_wstr(&line)
+    })
 }
 
 fn GetEnvironmentStringsW(g: &mut Guest) -> H {
@@ -73,25 +76,280 @@ fn GetEnvironmentVariableW(g: &mut Guest) -> H {
 // --- thread-local and fiber-local storage -----------------------------------------------------
 
 fn TlsAlloc(g: &mut Guest) -> H {
-    g.win.tls_slots.push(0);
-    Ok(g.win.tls_slots.len() as u64 - 1)
+    g.win.tls_count += 1;
+    Ok(g.win.tls_count as u64 - 1)
 }
 
 fn TlsGetValue(g: &mut Guest) -> H {
     let i = g.arg(0)? as usize;
     g.set_last_error(0);
-    Ok(g.win.tls_slots.get(i).copied().unwrap_or(0))
+    Ok(g.thread().tls_slots.get(i).copied().unwrap_or(0))
 }
 
 fn TlsSetValue(g: &mut Guest) -> H {
     let (i, v) = (g.arg(0)? as usize, g.arg(1)?);
-    match g.win.tls_slots.get_mut(i) {
-        Some(slot) => {
-            *slot = v;
+    if i >= g.win.tls_count {
+        return Ok(0);
+    }
+    let slots = &mut g.thread_mut().tls_slots;
+    if slots.len() <= i {
+        slots.resize(i + 1, 0);
+    }
+    slots[i] = v;
+    Ok(1)
+}
+
+// --- threads and waiting --------------------------------------------------------------------
+
+const INFINITE: u32 = u32::MAX;
+
+/// CreateThread(security, stack size, start, parameter, flags, id out)
+fn CreateThread(g: &mut Guest) -> H {
+    let (stack_size, start, parameter, id_out) = (g.arg(1)?, g.arg(2)?, g.arg(3)?, g.arg(5)?);
+    let size = xcl_emu::mem::page_up(if stack_size == 0 { 1 << 20 } else { stack_size.max(0x1_0000) });
+    let Ok(stack) = g.mem.alloc(size, PROT_R | PROT_W) else { return Ok(0) };
+    let index = g.add_thread(stack, stack + size, start, parameter, crate::SLOT_THREAD_RETURN)?;
+    if id_out != 0 {
+        g.mem.write_u32(id_out, g.threads[index].id)?;
+    }
+    Ok(g.win.new_handle(Object::Thread(index)))
+}
+
+/// The wait of the running thread: `ready` says whether what it waits for has happened. `Ok`:
+/// it has (true) or the timeout passed (false); `Err(Stop::Wait)`: ask again at the next turn.
+fn wait(g: &mut Guest, ready: bool, timeout_ms: u32) -> Result<bool, Stop> {
+    let now = g.now_ns();
+    if ready {
+        g.thread_mut().wait = None;
+        return Ok(true);
+    }
+    match &g.thread().wait {
+        None if timeout_ms == 0 => Ok(false),
+        None => {
+            let deadline = (timeout_ms != INFINITE).then(|| now + timeout_ms as u64 * 1_000_000);
+            g.thread_mut().wait = Some(crate::Wait { deadline, address: 0, woken: false });
+            Err(Stop::Wait)
+        }
+        Some(w) if w.deadline.is_some_and(|d| now >= d) => {
+            g.thread_mut().wait = None;
+            Ok(false)
+        }
+        Some(_) => Err(Stop::Wait),
+    }
+}
+
+fn Sleep(g: &mut Guest) -> H {
+    let ms = g.arg(0)? as u32;
+    if g.thread().wait.is_none() && ms == 0 {
+        // give the other threads a turn, once
+        g.thread_mut().wait = Some(crate::Wait { deadline: Some(g.now_ns()), address: 0, woken: false });
+        return Err(Stop::Wait);
+    }
+    wait(g, false, ms)?;
+    Ok(0)
+}
+
+fn SwitchToThread(g: &mut Guest) -> H {
+    if g.thread().wait.is_none() {
+        g.thread_mut().wait = Some(crate::Wait { deadline: Some(g.now_ns()), address: 0, woken: false });
+        return Err(Stop::Wait);
+    }
+    g.thread_mut().wait = None;
+    Ok(1)
+}
+
+/// Whether the object behind `handle` is signaled; an auto-reset one is taken by this.
+fn signaled(g: &mut Guest, handle: u64) -> Option<bool> {
+    let now = g.now_ns();
+    Some(match g.win.handles.get_mut(&handle)? {
+        Object::Thread(i) => {
+            let i = *i;
+            g.threads[i].exit_code.is_some()
+        }
+        Object::Event { signaled, manual } => {
+            let was = *signaled;
+            if !*manual {
+                *signaled = false;
+            }
+            was
+        }
+        Object::Timer { due, manual } => {
+            let fired = due.is_some_and(|d| now >= d);
+            if fired && !*manual {
+                *due = None;
+            }
+            fired
+        }
+    })
+}
+
+/// Guest time at which the object behind `handle` becomes signaled by itself (a timer).
+fn due(g: &Guest, handle: u64) -> Option<u64> {
+    match g.win.handles.get(&handle)? {
+        Object::Timer { due, .. } => *due,
+        _ => None,
+    }
+}
+
+fn WaitForSingleObject(g: &mut Guest) -> H {
+    let (handle, ms) = (g.arg(0)?, g.arg(1)? as u32);
+    let Some(ready) = signaled(g, handle) else {
+        g.set_last_error(ERROR_INVALID_HANDLE);
+        return Ok(u32::MAX as u64);
+    };
+    let waited = wait(g, ready, ms);
+    if matches!(waited, Err(Stop::Wait)) {
+        // a timer ends the wait by itself
+        if let (Some(d), Some(w)) = (due(g, handle), g.thread_mut().wait.as_mut()) {
+            w.deadline = Some(w.deadline.map_or(d, |own| own.min(d)));
+        }
+    }
+    Ok(if waited? { 0 } else { WAIT_TIMEOUT })
+}
+
+fn CreateEventW(g: &mut Guest) -> H {
+    let (manual, initial) = (g.arg(1)? as u32 != 0, g.arg(2)? as u32 != 0);
+    Ok(g.win.new_handle(Object::Event { signaled: initial, manual }))
+}
+
+fn set_event(g: &mut Guest, to: bool) -> H {
+    let handle = g.arg(0)?;
+    match g.win.handles.get_mut(&handle) {
+        Some(Object::Event { signaled, .. }) => {
+            *signaled = to;
             Ok(1)
         }
-        None => Ok(0),
+        _ => {
+            g.set_last_error(ERROR_INVALID_HANDLE);
+            Ok(0)
+        }
     }
+}
+
+fn SetEvent(g: &mut Guest) -> H {
+    set_event(g, true)
+}
+
+fn ResetEvent(g: &mut Guest) -> H {
+    set_event(g, false)
+}
+
+/// CreateWaitableTimerExW(security, name, flags, access); flag 1: manual reset
+fn CreateWaitableTimerExW(g: &mut Guest) -> H {
+    let manual = g.arg(2)? & 1 != 0;
+    Ok(g.win.new_handle(Object::Timer { due: None, manual }))
+}
+
+/// SetWaitableTimer(timer, due time *, period, …): a negative due time is relative, in 100 ns.
+fn SetWaitableTimer(g: &mut Guest) -> H {
+    let (handle, due_at) = (g.arg(0)?, g.arg(1)?);
+    let t = g.mem.read_u64(due_at)? as i64;
+    let now = g.now_ns();
+    // an absolute time is a FILETIME: taken as "now" (the guest clock has no calendar)
+    let at = if t < 0 { now + t.unsigned_abs() * 100 } else { now };
+    match g.win.handles.get_mut(&handle) {
+        Some(Object::Timer { due, .. }) => {
+            *due = Some(at);
+            Ok(1)
+        }
+        _ => {
+            g.set_last_error(ERROR_INVALID_HANDLE);
+            Ok(0)
+        }
+    }
+}
+
+// CRITICAL_SECTION in guest memory: RecursionCount at +12, OwningThread at +16.
+
+fn InitializeCriticalSection(g: &mut Guest) -> H {
+    let cs = g.arg(0)?;
+    g.mem.write(cs, &[0u8; 40])?;
+    Ok(1)
+}
+
+fn enter_critical_section(g: &mut Guest, block: bool) -> H {
+    let cs = g.arg(0)?;
+    let me = g.thread().id as u64;
+    let owner = g.mem.read_u64(cs + 16)?;
+    if owner != 0 && owner != me {
+        if !block {
+            return Ok(0);
+        }
+        // asked again at this thread's next turn
+        g.thread_mut().wait = Some(crate::Wait::default());
+        return Err(Stop::Wait);
+    }
+    g.thread_mut().wait = None;
+    let count = g.mem.read_u32(cs + 12)?;
+    g.mem.write_u32(cs + 12, count + 1)?;
+    g.mem.write_u64(cs + 16, me)?;
+    Ok(1)
+}
+
+fn EnterCriticalSection(g: &mut Guest) -> H {
+    enter_critical_section(g, true)
+}
+
+fn TryEnterCriticalSection(g: &mut Guest) -> H {
+    enter_critical_section(g, false)
+}
+
+fn LeaveCriticalSection(g: &mut Guest) -> H {
+    let cs = g.arg(0)?;
+    let count = g.mem.read_u32(cs + 12)?.saturating_sub(1);
+    g.mem.write_u32(cs + 12, count)?;
+    if count == 0 {
+        g.mem.write_u64(cs + 16, 0)?;
+    }
+    Ok(0)
+}
+
+fn CloseHandle(g: &mut Guest) -> H {
+    let handle = g.arg(0)?;
+    g.win.handles.remove(&handle);
+    Ok(1)
+}
+
+/// WaitOnAddress(address, compare address, size, timeout): returns once the value differs from
+/// the one compared and the thread was woken, or at the timeout.
+fn WaitOnAddress(g: &mut Guest) -> H {
+    let (address, compare, size, ms) = (g.arg(0)?, g.arg(1)?, g.arg(2)? as u8, g.arg(3)? as u32);
+    let woken = g.thread().wait.as_ref().is_some_and(|w| w.woken);
+    let differs = g.mem.read_sized(address, size)? != g.mem.read_sized(compare, size)?;
+    match wait(g, woken || (differs && g.thread().wait.is_none()), ms) {
+        Ok(true) => Ok(1),
+        Ok(false) => {
+            g.set_last_error(ERROR_TIMEOUT);
+            Ok(0)
+        }
+        Err(stop) => {
+            if let Some(w) = g.thread_mut().wait.as_mut() {
+                w.address = address;
+            }
+            Err(stop)
+        }
+    }
+}
+
+fn wake(g: &mut Guest, all: bool) -> H {
+    let address = g.arg(0)?;
+    for t in g.threads.iter_mut().filter(|t| t.exit_code.is_none()) {
+        if let Some(w) = t.wait.as_mut().filter(|w| w.address == address && !w.woken) {
+            w.woken = true;
+            if !all {
+                break;
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn WakeByAddressSingle(g: &mut Guest) -> H {
+    wake(g, false)
+}
+
+fn WakeByAddressAll(g: &mut Guest) -> H {
+    wake(g, true)
 }
 
 // --- memory -------------------------------------------------------------------------------
@@ -255,14 +513,6 @@ fn GetSystemTimePreciseAsFileTime(g: &mut Guest) -> H {
     Ok(0)
 }
 
-fn Sleep(g: &mut Guest) -> H {
-    let ms = g.arg(0)? as u32;
-    if ms != u32::MAX {
-        g.win.slept_ns += ms as u64 * 1_000_000;
-    }
-    Ok(0)
-}
-
 // --- handles and the console ------------------------------------------------------------------
 
 fn GetStdHandle(g: &mut Guest) -> H {
@@ -396,6 +646,24 @@ fn GetModuleHandleA(g: &mut Guest) -> H {
     Ok(module_handle(g, name))
 }
 
+/// GetModuleHandleExW(flags, name or address, module out); flag 4: by an address inside it
+fn GetModuleHandleExW(g: &mut Guest) -> H {
+    let (flags, what, out) = (g.arg(0)? as u32, g.arg(1)?, g.arg(2)?);
+    let base = if flags & 4 != 0 {
+        g.modules.iter().find(|m| what >= m.base && what < m.base + m.size).map_or(0, |m| m.base)
+    } else {
+        let name = if what == 0 { None } else { Some(g.mem.wstr(what, 520)?) };
+        module_handle(g, name)
+    };
+    if base == 0 {
+        g.set_last_error(ERROR_MOD_NOT_FOUND);
+    }
+    if out != 0 {
+        g.mem.write_u64(out, base)?;
+    }
+    Ok((base != 0) as u64)
+}
+
 fn LoadLibraryW(g: &mut Guest) -> H {
     GetModuleHandleW(g)
 }
@@ -422,7 +690,7 @@ fn GetProcAddress(g: &mut Guest) -> H {
 
 fn GetModuleFileNameW(g: &mut Guest) -> H {
     let (at, size) = (g.arg(1)?, g.arg(2)?);
-    let path: Vec<u16> = "G:\\title.exe".encode_utf16().collect();
+    let path: Vec<u16> = format!("G:\\{}", g.modules.first().map_or("title.exe", |m| m.name.as_str())).encode_utf16().collect();
     if (path.len() as u64) >= size {
         g.set_last_error(ERROR_INSUFFICIENT_BUFFER);
         return Ok(size);
@@ -463,17 +731,22 @@ pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
     register!(map; GetLastError, SetLastError, GetCommandLineW, GetEnvironmentStringsW, GetEnvironmentVariableW);
     register!(map; TlsAlloc, TlsGetValue, TlsSetValue, GetProcessHeap, HeapAlloc, HeapReAlloc, HeapFree);
     register!(map; VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery, GetSystemInfo);
-    register!(map; QueryPerformanceCounter, QueryPerformanceFrequency, GetSystemTimePreciseAsFileTime, Sleep);
+    register!(map; QueryPerformanceCounter, QueryPerformanceFrequency, GetSystemTimePreciseAsFileTime, Sleep, SwitchToThread);
+    register!(map; CreateThread, WaitForSingleObject, CreateEventW, SetEvent, ResetEvent, CreateWaitableTimerExW, SetWaitableTimer, CloseHandle);
+    register!(map; WaitOnAddress, WakeByAddressSingle, WakeByAddressAll);
     register!(map; GetStdHandle, GetConsoleMode, WriteConsoleW, WriteFile, NtWriteFile, NtQueryVolumeInformationFile, RtlNtStatusToDosError);
-    register!(map; GetModuleHandleW, GetModuleHandleA, LoadLibraryW, LoadLibraryExA, GetProcAddress, GetModuleFileNameW, lstrlenW, ProcessPrng);
+    register!(map; GetModuleHandleW, GetModuleHandleA, GetModuleHandleExW, LoadLibraryW, LoadLibraryExA, GetProcAddress, GetModuleFileNameW, lstrlenW, ProcessPrng);
     map.insert("FlsAlloc", TlsAlloc as Handler);
     map.insert("FlsGetValue", TlsGetValue as Handler);
     map.insert("FlsSetValue", TlsSetValue as Handler);
-    // one thread: locks are never contended, nothing waits
-    for name in ["InitializeCriticalSection", "EnterCriticalSection", "LeaveCriticalSection", "DeleteCriticalSection", "SetUnhandledExceptionFilter", "IsThreadAFiber", "SwitchToThread", "SleepEx"] {
+    map.insert("SleepEx", Sleep as Handler);
+    register!(map; InitializeCriticalSection, EnterCriticalSection, TryEnterCriticalSection, LeaveCriticalSection);
+    map.insert("InitializeCriticalSectionEx", InitializeCriticalSection as Handler);
+    map.insert("InitializeCriticalSectionAndSpinCount", InitializeCriticalSection as Handler);
+    for name in ["DeleteCriticalSection", "SetUnhandledExceptionFilter", "IsThreadAFiber"] {
         map.insert(name, ok as Handler);
     }
-    for name in ["AddVectoredExceptionHandler", "SetThreadStackGuarantee", "FreeEnvironmentStringsW", "SetEnvironmentVariableW", "CloseHandle", "FlsFree", "TlsFree", "FreeLibrary", "WakeByAddressSingle", "WakeByAddressAll", "WaitOnAddress"] {
+    for name in ["AddVectoredExceptionHandler", "SetThreadStackGuarantee", "FreeEnvironmentStringsW", "SetEnvironmentVariableW", "FlsFree", "TlsFree", "FreeLibrary"] {
         map.insert(name, yes as Handler);
     }
 }

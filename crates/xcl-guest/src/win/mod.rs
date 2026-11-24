@@ -31,13 +31,14 @@ pub struct State {
     pub exit_code: Option<u32>,
     /// nesting of `Guest::call`
     pub call_depth: u32,
-    pub teb: u64,
-    pub last_error: u32,
     pub heap: heap::Heap,
-    /// TlsAlloc / FlsAlloc slots of the (one) thread
-    pub tls_slots: Vec<u64>,
-    /// time the title spent in Sleep and waits (see `Guest::now_ns`)
-    pub slept_ns: u64,
+    /// TlsAlloc / FlsAlloc slots handed out
+    pub tls_count: usize,
+    /// guest time (see `Guest::now_ns`)
+    pub time_ns: u64,
+    /// kernel objects by handle
+    pub handles: HashMap<u64, Object>,
+    pub next_handle: u64,
     /// small guest blocks handed out once (`__p___argc`, the command line …), by name
     pub statics: HashMap<&'static str, u64>,
     /// functions registered with `_crt_atexit`
@@ -45,9 +46,19 @@ pub struct State {
     pub prng: u64,
 }
 
+/// A kernel object behind a handle.
+#[derive(Debug, Clone)]
+pub enum Object {
+    /// index into `Guest::threads`
+    Thread(usize),
+    Event { signaled: bool, manual: bool },
+    /// a waitable timer: signaled from guest time `due` on
+    Timer { due: Option<u64>, manual: bool },
+}
+
 impl State {
-    /// A thread's TEB and static TLS blocks; GS points at the TEB.
-    pub fn setup_thread(&mut self, cpu: &mut Cpu, mem: &mut Memory, stack_base: u64, stack_top: u64) -> Result<(), Fault> {
+    /// A thread's TEB and static TLS blocks; GS points at the TEB. Returns the TEB.
+    pub fn setup_thread(&mut self, cpu: &mut Cpu, mem: &mut Memory, stack_base: u64, stack_top: u64, id: u32) -> Result<u64, Fault> {
         let fault = |_| Fault { addr: 0, write: true };
         let teb = mem.alloc(0x2000, PROT_R | PROT_W).map_err(fault)?;
         // NT_TIB: stack base (+8) and limit (+0x10), self (+0x30); PEB (+0x60)
@@ -57,7 +68,7 @@ impl State {
         mem.write_u64(teb + 0x60, teb + 0x1000)?;
         // process and thread id
         mem.write_u64(teb + 0x40, 0x1000)?;
-        mem.write_u64(teb + 0x48, 0x1004)?;
+        mem.write_u64(teb + 0x48, id as u64)?;
         // ThreadLocalStoragePointer (+0x58): one block per module with static TLS
         let slots = mem.alloc(8 * self.tls_templates.len().max(1) as u64, PROT_R | PROT_W).map_err(fault)?;
         mem.write_u64(teb + 0x58, slots)?;
@@ -70,8 +81,14 @@ impl State {
             mem.write_u32(t.index_address, i as u32)?;
         }
         cpu.gs_base = teb;
-        self.teb = teb;
-        Ok(())
+        Ok(teb)
+    }
+
+    pub fn new_handle(&mut self, object: Object) -> u64 {
+        self.next_handle += 4;
+        let h = 0x100 + self.next_handle;
+        self.handles.insert(h, object);
+        h
     }
 }
 
@@ -95,6 +112,8 @@ pub(crate) const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 pub(crate) const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
 pub(crate) const ERROR_MOD_NOT_FOUND: u32 = 126;
 pub(crate) const ERROR_PROC_NOT_FOUND: u32 = 127;
+pub(crate) const ERROR_TIMEOUT: u32 = 1460;
+pub(crate) const WAIT_TIMEOUT: u64 = 258;
 
 /// The standard handles the title gets from GetStdHandle.
 pub(crate) const STDIN: u64 = 0x20;
@@ -102,16 +121,17 @@ pub(crate) const STDOUT: u64 = 0x24;
 pub(crate) const STDERR: u64 = 0x28;
 
 impl Guest {
-    /// Guest time in nanoseconds. Until the host supplies a clock it is the work done: one
-    /// instruction is a nanosecond, plus what the title slept.
+    /// Guest time in nanoseconds. Until the host supplies a clock it is the work done: an
+    /// instruction of any thread is a nanosecond, and waiting skips ahead to the first deadline.
     pub fn now_ns(&self) -> u64 {
-        self.cpu.icount + self.win.slept_ns
+        self.win.time_ns
     }
 
     pub(crate) fn set_last_error(&mut self, code: u32) {
-        self.win.last_error = code;
+        let teb = self.thread().teb;
+        self.thread_mut().last_error = code;
         // TEB.LastErrorValue
-        let _ = self.mem.write_u32(self.win.teb + 0x68, code);
+        let _ = self.mem.write_u32(teb + 0x68, code);
     }
 
     /// A zeroed heap block (never freed by the host).

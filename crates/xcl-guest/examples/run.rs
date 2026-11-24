@@ -14,6 +14,7 @@ fn main() {
     g.strict = !args.iter().any(|a| a == "--lenient");
     g.trace_len = 12;
     let name = std::path::Path::new(path).file_name().unwrap().to_string_lossy().into_owned();
+    g.command_line = format!("{name} --hello");
     let exe = g.map_image(&name, &data).expect("map the image");
     g.start(exe, 0x10_0000).expect("start");
     let stop = g.run(max);
