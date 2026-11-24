@@ -58,6 +58,8 @@ const PASSES: &[&str] = &[
     "XTaskQueue composite + XNetworking + advapi32legacy LSA fallback",
     "storage: save folder + persistent local storage",
     "XPersistentLocalStorage: a drive root, as on the console",
+    // on the null device: nothing is rendered, the fence completes at once
+    "D3D12.X: queue + fence signal on the GPU",
 ];
 
 #[test]
@@ -88,7 +90,8 @@ fn the_test_title_passes_its_checks_up_to_where_the_guest_gets() {
     println!("{output}--- stopped: {stop:x?} after {} instructions of the main thread", g.cpu.icount);
     let lines: Vec<&str> = output.lines().collect();
     assert_eq!(lines.first(), Some(&"xcl_testtitle: start"));
-    // every check up to the graphics ones passes (those fail: there is no D3D12.X yet)
+    // every check up to the graphics ones passes; those need a GPU (and an HLSL compiler), which
+    // the null device is not, and fail
     let checks: Vec<&str> = lines.iter().skip(1).copied().filter(|l| l.starts_with("[PASS] ") || l.starts_with("[FAIL] ")).collect();
     assert!(checks.len() >= PASSES.len(), "only {} checks ran", checks.len());
     for (line, name) in checks.iter().zip(PASSES) {

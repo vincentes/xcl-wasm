@@ -619,7 +619,7 @@ fn module_handle(g: &mut Guest, name: Option<String>) -> u64 {
         return base;
     }
     let file = name.rsplit(['\\', '/']).next().unwrap_or(&name).to_ascii_lowercase();
-    let known = ["kernel32", "kernelbase", "ntdll", "kernelx", "api-ms-win-", "ext-ms-win-", "xgameruntime", "ucrtbase", "msvcrt", "user32", "minuserx", "gameinput", "advapi32"];
+    let known = ["kernel32", "kernelbase", "ntdll", "kernelx", "api-ms-win-", "ext-ms-win-", "xgameruntime", "ucrtbase", "msvcrt", "user32", "minuserx", "gameinput", "advapi32", "d3d12", "d3d10"];
     if known.iter().any(|k| file.starts_with(k)) {
         return SYSTEM_MODULE;
     }
