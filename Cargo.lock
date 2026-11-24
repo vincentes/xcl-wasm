@@ -561,6 +561,14 @@ name = "xcl-emu"
 version = "0.1.0"
 
 [[package]]
+name = "xcl-guest"
+version = "0.1.0"
+dependencies = [
+ "xcl",
+ "xcl-emu",
+]
+
+[[package]]
 name = "xcl-testtitle"
 version = "0.1.0"
 dependencies = [

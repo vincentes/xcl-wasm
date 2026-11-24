@@ -826,6 +826,23 @@ impl Ctx<'_> {
                 self.cpu.r[RBP] = self.pop()?;
             }
             0xCC => return Err(Exit::Breakpoint),
+            // fwait
+            0x9B => {}
+            // x87: only its control word (fninit, fnclex, fldcw, fnstcw); no x87 stack yet
+            0xD9 | 0xDB => {
+                let (reg, rm) = self.modrm()?;
+                match (op, reg & 7, rm) {
+                    // fninit (DB E3), fnclex (DB E2)
+                    (0xDB, 4, Rm::Reg(3)) => self.cpu.fcw = 0x037F,
+                    (0xDB, 4, Rm::Reg(2)) => {}
+                    (0xD9, 5, Rm::Mem(_) | Rm::Rip(_)) => self.cpu.fcw = self.rd_rm(rm, 2)? as u16,
+                    (0xD9, 7, Rm::Mem(_) | Rm::Rip(_)) => {
+                        let v = self.cpu.fcw as u64;
+                        self.wr_rm(rm, 2, v)?;
+                    }
+                    _ => return Err(self.undefined()),
+                }
+            }
             // jrcxz
             0xE3 => {
                 let d = self.fetch8()? as i8 as i64 as u64;

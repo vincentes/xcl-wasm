@@ -1,0 +1,15 @@
+[package]
+name = "xcl-guest"
+description = "Runs a title on the x86-64 guest (xcl-emu): PE loader for guest memory and the system functions the title imports."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "xcl_guest"
+path = "src/lib.rs"
+
+[dependencies]
+xcl = { path = "../xcl" }
+xcl-emu = { path = "../xcl-emu" }
