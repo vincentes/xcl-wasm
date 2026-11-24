@@ -15,6 +15,7 @@ mod kernel32;
 mod kernelx;
 pub mod seh;
 mod sync;
+mod threadpool;
 mod user;
 pub mod xgameruntime;
 
@@ -41,6 +42,7 @@ pub struct State {
     pub xmem: kernelx::XMem,
     pub window_classes: u32,
     pub xgr: xgameruntime::State,
+    pub pool: threadpool::Pool,
     /// COM objects the host made, by interface: one vtable each
     pub vtables: HashMap<&'static str, u64>,
     /// TlsAlloc / FlsAlloc slots handed out
@@ -124,6 +126,7 @@ pub fn handlers() -> HashMap<&'static str, Handler> {
     kernel32::register(&mut map);
     seh::register(&mut map);
     sync::register(&mut map);
+    threadpool::register(&mut map);
     user::register(&mut map);
     xgameruntime::register(&mut map);
     // after kernel32 and crt: the file functions also take the standard handles

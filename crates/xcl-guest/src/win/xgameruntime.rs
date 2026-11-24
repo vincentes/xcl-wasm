@@ -224,7 +224,7 @@ fn XTaskQueueCloseHandle(g: &mut Guest) -> H {
 }
 
 /// The thread that runs thread-pool callbacks: made when the first thread-pool port is.
-fn ensure_worker(g: &mut Guest) -> Result<(), Stop> {
+pub(super) fn ensure_worker(g: &mut Guest) -> Result<(), Stop> {
     if g.win.xgr.worker.is_none() {
         let size = 1u64 << 20;
         let stack = g.mem.alloc(size, xcl_emu::mem::PROT_R | xcl_emu::mem::PROT_W).map_err(|_| Stop::Deadlock)?;
@@ -235,12 +235,25 @@ fn ensure_worker(g: &mut Guest) -> Result<(), Stop> {
     Ok(())
 }
 
+/// Whether the running thread is the worker.
+pub(super) fn is_worker(g: &Guest) -> bool {
+    g.win.xgr.worker == Some(g.current)
+}
+
 impl Guest {
     /// The worker thread is at its slot: give it the next thread-pool callback that is due
     /// (`Ok(true)`), or say until when it has nothing to do.
     pub(crate) fn worker_turn(&mut self) -> Result<bool, Stop> {
         let now = self.now_ns();
-        let mut next: Option<u64> = None;
+        // the Win32 thread pool's callbacks first, then the task queues'
+        let mut next = match super::threadpool::take(self, now) {
+            Ok((callback, args)) => {
+                self.thread_mut().wait = None;
+                self.host_thread_call(callback, &args)?;
+                return Ok(true);
+            }
+            Err(due) => due,
+        };
         let mut found = None;
         for port in self.win.xgr.ports.values_mut().filter(|p| p.mode != MANUAL && p.mode != IMMEDIATE) {
             match take_due(port, now) {
