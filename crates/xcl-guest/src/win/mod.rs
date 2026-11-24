@@ -16,6 +16,7 @@ pub mod gdk;
 pub mod heap;
 mod kernel32;
 mod kernelx;
+pub mod media;
 mod libc;
 pub mod seh;
 mod stdio;
@@ -52,6 +53,7 @@ pub struct State {
     pub xgr: xgameruntime::State,
     pub xg: xg::State,
     pub audio: xaudio2::State,
+    pub media: media::State,
     /// guest functions for the host-driven thread to call: (function, arguments)
     pub host_calls: std::collections::VecDeque<(u64, Vec<u64>)>,
     pub d3d: d3d12x::State,
@@ -162,6 +164,7 @@ pub fn handlers() -> HashMap<&'static str, Handler> {
     xgameruntime::register(&mut map);
     xg::register(&mut map);
     xaudio2::register(&mut map);
+    media::register(&mut map);
     gdk::register(&mut map);
     d3d12x::register(&mut map);
     // after kernel32 and crt: the file functions also take the standard handles
