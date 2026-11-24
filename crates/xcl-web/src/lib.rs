@@ -8,6 +8,8 @@
 
 use std::sync::Mutex;
 
+mod session;
+
 static OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// the game folder for the next `xcl_run`: (path in the folder, contents)
 static GAME: Mutex<Vec<(String, Vec<u8>)>> = Mutex::new(Vec::new());

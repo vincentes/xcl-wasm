@@ -46,6 +46,9 @@ pub enum Stop {
     Limit,
     /// Every thread waits for something that cannot happen any more.
     Deadlock,
+    /// (with `Guest::real_time`) every thread waits; the first wait ends at guest time `until`.
+    /// Give the guest the time (`Guest::set_time`) and `run` again.
+    Idle { until: u64 },
     /// (between a system function and the scheduler) the calling thread has to wait: ask again
     /// at its next turn
     Wait,
@@ -138,6 +141,10 @@ pub struct Guest {
     pub command_line: String,
     /// game DLLs being mapped (they import each other?)
     loading: Vec<String>,
+    /// The host keeps the guest's clock (`set_time`): instructions take no guest time, and when
+    /// every thread waits `run` returns `Stop::Idle` instead of skipping ahead. Off, the guest's
+    /// time is the work it does and waiting costs nothing – the same every run.
+    pub real_time: bool,
     /// stop at a function the host does not implement (otherwise: log it once, return 0)
     pub strict: bool,
     /// what the title wrote to its standard output and error
@@ -178,6 +185,7 @@ impl Guest {
             handlers: win::handlers(),
             command_line: "title.exe".into(),
             loading: Vec::new(),
+            real_time: false,
             strict: false,
             output: Vec::new(),
             log: Vec::new(),
@@ -266,6 +274,12 @@ impl Guest {
         (1..=n).map(|k| (self.current + k) % n).find(|&i| self.threads[i].exit_code.is_none() && !self.threads[i].suspended)
     }
 
+    /// The host's clock, in nanoseconds since it started the guest (`real_time`); it never
+    /// goes back.
+    pub fn set_time(&mut self, ns: u64) {
+        self.win.time_ns = self.win.time_ns.max(ns);
+    }
+
     /// Run the title: at most `max_instructions`, until it stops.
     pub fn run(&mut self, max_instructions: u64) -> Stop {
         self.run_until(0, SLOT_ENTRY_RETURN, max_instructions)
@@ -304,7 +318,9 @@ impl Guest {
             let before = self.cpu.icount;
             let exit = self.cpu.run(&mut self.mem, left.min(SLICE));
             let ran = self.cpu.icount - before;
-            self.win.time_ns += ran;
+            if !self.real_time {
+                self.win.time_ns += ran;
+            }
             left = left.saturating_sub(ran);
             if ran != 0 {
                 idle = 0;
@@ -366,6 +382,9 @@ impl Guest {
                     // nobody can run: time passes until the first wait gives up
                     let now = self.now_ns();
                     match self.threads.iter().filter(|t| t.exit_code.is_none()).filter_map(|t| t.wait.as_ref()?.deadline).min() {
+                        // the host's clock decides when that is (not inside a host call, which
+                        // cannot be left and come back to)
+                        Some(deadline) if self.real_time && self.win.call_depth == 0 && deadline > now => return Stop::Idle { until: deadline },
                         Some(deadline) => self.win.time_ns += deadline.saturating_sub(now),
                         None => return Stop::Deadlock,
                     }
@@ -421,5 +440,48 @@ impl Guest {
         };
         abi::ret(&mut self.cpu, &self.mem, value)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use xcl_emu::mem::{PROT_R, PROT_W, PROT_X};
+
+    use super::*;
+
+    /// A guest whose one thread runs: Sleep(10); return 0.
+    fn sleeper() -> Guest {
+        let mut g = Guest::new();
+        let code = g.mem.alloc(0x1000, PROT_R | PROT_X).unwrap();
+        let sleep = g.import_address("kernel32.dll", "Sleep");
+        // mov ecx,10; sub rsp,0x28; call [rip+10]; add rsp,0x28; xor eax,eax; ret; (pad) slot
+        let mut bytes = vec![0xB9, 10, 0, 0, 0, 0x48, 0x83, 0xEC, 0x28, 0xFF, 0x15, 10, 0, 0, 0, 0x48, 0x83, 0xC4, 0x28, 0x31, 0xC0, 0xC3, 0, 0, 0];
+        bytes.extend_from_slice(&sleep.to_le_bytes());
+        g.mem.write(code, &bytes).unwrap();
+        let stack = g.mem.alloc(0x1_0000, PROT_R | PROT_W).unwrap();
+        let t = g.add_thread(stack, stack + 0x1_0000, code, 0, SLOT_ENTRY_RETURN).unwrap();
+        g.current = t;
+        g.cpu = g.threads[t].cpu.clone();
+        g
+    }
+
+    #[test]
+    fn guest_time_skips_a_wait_unless_the_host_keeps_the_clock() {
+        // on its own, waiting costs nothing: the sleep is over at once, 10 ms later on the clock
+        let mut g = sleeper();
+        assert_eq!(g.run(1_000_000), Stop::Exit(0));
+        assert!(g.now_ns() >= 10_000_000 && g.now_ns() < 10_100_000, "{}", g.now_ns());
+
+        // with the host's clock the guest says until when it has nothing to do
+        let mut g = sleeper();
+        g.real_time = true;
+        assert_eq!(g.run(1_000_000), Stop::Idle { until: 10_000_000 });
+        assert_eq!(g.now_ns(), 0, "instructions take no time");
+        g.set_time(4_000_000);
+        assert_eq!(g.run(1_000_000), Stop::Idle { until: 10_000_000 });
+        g.set_time(10_000_000);
+        g.set_time(1);
+        assert_eq!(g.now_ns(), 10_000_000, "the clock does not go back");
+        assert_eq!(g.run(1_000_000), Stop::Exit(0));
     }
 }

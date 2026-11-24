@@ -108,4 +108,34 @@ if (titlePath) {
   ran = `test title ran to its end: ${passes} checks passed, ${fails} failed, in ${Math.round(performance.now() - t0)} ms`;
 }
 
+// the same title as a session: stepped with a clock the test keeps (it jumps to where the
+// guest says it waits until), 2 million instructions at a time
+if (titlePath) {
+  const folder = new URL("../../../tests/data/testgame/", import.meta.url);
+  xcl.gameFile("MicrosoftGame.config", readFileSync(new URL("MicrosoftGame.config", folder)));
+  for (const f of ["hello.txt", "delete_me.txt", "sub/nested.bin"]) xcl.gameFile("data\\" + f.replace("/", "\\"), readFileSync(new URL("data/" + f, folder)));
+  xcl.gameFile("testgame_mw.dll", readFileSync(titlePath.replace(/[^\\/]+$/, "testgame_mw.dll")));
+  xcl.start("xcl_testtitle.exe", readFileSync(titlePath), "xcl_testtitle.exe --hello");
+  let [now, text, steps, idles, samples, step] = [0, "", 0, 0, 0, null];
+  do {
+    step = xcl.step(now);
+    text += step.output;
+    samples += xcl.audio().length;
+    steps += 1;
+    if (step.state === "idle") {
+      assert.ok(step.until > now, "an idle step says when the wait ends");
+      now = step.until;
+      idles += 1;
+    } else now += 1;
+    assert.ok(steps < 20000, "the session does not end");
+  } while (step.state !== "ended");
+  xcl.clearGame();
+  assert.match(step.why, /^Exit\(/);
+  const passed = text.split("\n").filter((l) => l.startsWith("[PASS] ")).length;
+  assert.ok(passed >= 44, `only ${passed} checks passed in the session:\n${text}`);
+  assert.ok(idles > 5 && samples > 0, `${idles} idle steps, ${samples} audio samples`);
+  assert.deepEqual([xcl.frame()?.width, xcl.frame()?.height], [640, 360]);
+  ran += `; as a session: ${passed} passed in ${steps} steps (${idles} idle), ${samples / 2} audio frames`;
+}
+
 console.log(`xcl-web smoke: ok (${xcl.version()}, ${wasm.length} B; ${ran})`);

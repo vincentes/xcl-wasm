@@ -46,6 +46,22 @@ export async function load(source) {
     clearGame: () => call(x.xcl_game_file, "", new Uint8Array(0)),
     /** Run a title on the x86-64 guest: its output, then a `--- stopped: …` line. */
     run: (name, data, commandLine = "", maxInstructions = 0) => call(x.xcl_run, name, data, commandLine, BigInt(maxInstructions)),
+    /** Start a title that keeps running (`step`); the game folder is `gameFile`'s. */
+    start: (name, data, commandLine = "") => call(x.xcl_session_start, name, data, commandLine),
+    /**
+     * Let the started title run: `nowMs` is the page's clock (milliseconds since `start`), at
+     * most `maxInstructions` are executed. Returns { state: "running" | "idle" | "ended",
+     * until (ms, when idle: the first wait ends then), why (when ended), output (what the
+     * title wrote since the last step) }. `frame()` and `audio()` are the session's.
+     */
+    step: (nowMs, maxInstructions = 3_000_000) => {
+      const text = call(x.xcl_session_step, BigInt(Math.max(0, Math.round(nowMs * 1e6))), BigInt(maxInstructions));
+      const end = text.indexOf("\n");
+      const [state, ...rest] = text.slice(0, end).split(" ");
+      return { state, until: state === "idle" ? Number(rest[0]) / 1e6 : undefined, why: state === "ended" ? rest.join(" ") : undefined, output: text.slice(end + 1) };
+    },
+    /** What the session's voices played since the last call: Int16Array, 48 kHz stereo. */
+    audio: () => new Int16Array(x.memory.buffer, Number(x.xcl_session_audio_ptr()), Number(x.xcl_session_audio())).slice(),
     /**
      * The frame the last run presented last, or null: { width, height, format (a DXGI_FORMAT:
      * 28 R8G8B8A8, 87 B8G8R8A8), presented (frames so far), pixels (4 bytes each, top down) }.
