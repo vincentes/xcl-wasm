@@ -11,6 +11,7 @@ use crate::{Guest, Handler, Stop};
 mod crt;
 pub mod d3d12_null;
 pub mod files;
+pub mod gdk;
 pub mod heap;
 mod kernel32;
 mod kernelx;
@@ -46,6 +47,8 @@ pub struct State {
     pub xgr: xgameruntime::State,
     pub d3d: d3d12_null::State,
     pub pool: threadpool::Pool,
+    /// the GDK runtime's interface objects handed out, by (class, interface)
+    pub gdk: HashMap<(u128, u128), u64>,
     /// COM objects the host made, by interface: one vtable each
     pub vtables: HashMap<&'static str, u64>,
     /// TlsAlloc / FlsAlloc slots handed out
@@ -145,6 +148,7 @@ pub fn handlers() -> HashMap<&'static str, Handler> {
     text::register(&mut map);
     user::register(&mut map);
     xgameruntime::register(&mut map);
+    gdk::register(&mut map);
     d3d12_null::register(&mut map);
     // after kernel32 and crt: the file functions also take the standard handles
     files::register(&mut map);

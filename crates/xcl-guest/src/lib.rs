@@ -144,6 +144,9 @@ pub struct Guest {
     pub output: Vec<u8>,
     /// the host's own notes (unimplemented functions, debug strings)
     pub log: Vec<String>,
+    /// arguments the function being answered does not see: 1 for a GDK runtime function called
+    /// through its interface, whose first argument is the object
+    arg_shift: usize,
     /// the last `trace_len` import calls, oldest first (0: off)
     pub trace: std::collections::VecDeque<String>,
     pub trace_len: usize,
@@ -178,6 +181,7 @@ impl Guest {
             strict: false,
             output: Vec::new(),
             log: Vec::new(),
+            arg_shift: 0,
             trace: Default::default(),
             trace_len: 0,
             win: win::State::default(),
@@ -206,7 +210,7 @@ impl Guest {
 
     /// Integer argument `i` of the import call being answered.
     pub fn arg(&self, i: usize) -> Result<u64, Stop> {
-        Ok(abi::Args::new(&self.cpu, &self.mem).get(i)?)
+        Ok(abi::Args::new(&self.cpu, &self.mem).get(i + self.arg_shift)?)
     }
 
     pub fn thread(&self) -> &Thread {
@@ -388,9 +392,23 @@ impl Guest {
             let a = |i| self.arg(i).unwrap_or(0);
             self.trace.push_back(format!("{dll}!{name}({:#x}, {:#x}, {:#x}, {:#x})", a(0), a(1), a(2), a(3)));
         }
+        let through_interface = dll == win::gdk::INTERFACE;
         let value = match self.handlers.get(name.as_str()) {
-            Some(&handler) => handler(self)?,
+            Some(&handler) => {
+                // (a function this one calls back into the title may be answered in between)
+                let outer = std::mem::replace(&mut self.arg_shift, through_interface as usize);
+                let value = handler(self);
+                self.arg_shift = outer;
+                value?
+            }
             None if self.strict => return Err(Stop::Unimplemented { dll, name }),
+            // a runtime function the host lacks fails, as a result code: 0 would say it worked
+            None if through_interface => {
+                if self.imports[index].calls == 1 {
+                    self.log.push(format!("[GDK] {name} → E_NOTIMPL"));
+                }
+                win::gdk::E_NOTIMPL
+            }
             None => {
                 if self.imports[index].calls == 1 {
                     self.log.push(format!("[STUB] {dll}!{name} → 0"));

@@ -40,6 +40,9 @@ pub mod xma2;
 pub mod xg;
 #[cfg(windows)]
 pub mod xgameruntime;
+/// The GDK runtime's function table (data only): also for the hosts that are not Windows.
+#[path = "xgameruntime/gdk_table.rs"]
+pub mod gdk_table;
 
 /// Build an export list from functions whose Rust names equal the exported names.
 #[macro_export]

@@ -6,7 +6,7 @@
 pub mod accessibility;
 pub mod api;
 pub mod gamesave;
-pub mod gdk_table;
+pub use super::gdk_table;
 pub mod networking;
 pub mod taskqueue;
 pub mod xasync;
