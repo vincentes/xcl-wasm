@@ -25,9 +25,11 @@ counterpart:
 `xcl inspect` / `xcl disasm` run on a file picked in a page
 ([In the browser](#in-the-browser-webassembly)). An x64 interpreter (`crates/xcl-emu`) and the
 guest around it (`crates/xcl-guest`: PE loader, threads, exceptions, title memory, files, XGameRuntime) run XCL's own
-test title to its end inside the WebAssembly module: all 31 of its checks that need no graphics
-or audio pass (files with the overlay, its game DLL and XGameRuntime among them); the other 19
-wait for D3D12.X, DirectStorage, Media Foundation and XAudio2. **No retail game runs in the
+test title inside the WebAssembly module: 40 of its 50 checks pass – everything that needs no
+graphics or audio, and the memory side of D3D12.X, which a software device does (resources in
+title memory, command queues that copy, write and wait). What is left needs rendering (a WebGPU
+back end and a way to run the console's shaders there), DirectStorage, the XG texture library,
+Media Foundation and XAudio2. **No retail game runs in the
 browser yet**: there is no graphics, and the interpreter is not a JIT. Everything below describes the Windows
 runtime this fork starts from; the port is meant to leave it unchanged, which has not been
 re-verified on Windows since the port's first changes.
