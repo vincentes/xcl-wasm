@@ -269,11 +269,31 @@ fn InitializeCriticalSection(g: &mut Guest) -> H {
     Ok(1)
 }
 
-fn enter_critical_section(g: &mut Guest, block: bool) -> H {
-    let cs = g.arg(0)?;
+/// Take the critical section at `cs` for the running thread when nobody else owns it.
+pub(super) fn try_enter_cs(g: &mut Guest, cs: u64) -> Result<bool, Stop> {
     let me = g.thread().id as u64;
     let owner = g.mem.read_u64(cs + 16)?;
     if owner != 0 && owner != me {
+        return Ok(false);
+    }
+    let count = g.mem.read_u32(cs + 12)?;
+    g.mem.write_u32(cs + 12, count + 1)?;
+    g.mem.write_u64(cs + 16, me)?;
+    Ok(true)
+}
+
+pub(super) fn leave_cs(g: &mut Guest, cs: u64) -> Result<(), Stop> {
+    let count = g.mem.read_u32(cs + 12)?.saturating_sub(1);
+    g.mem.write_u32(cs + 12, count)?;
+    if count == 0 {
+        g.mem.write_u64(cs + 16, 0)?;
+    }
+    Ok(())
+}
+
+fn enter_critical_section(g: &mut Guest, block: bool) -> H {
+    let cs = g.arg(0)?;
+    if !try_enter_cs(g, cs)? {
         if !block {
             return Ok(0);
         }
@@ -282,9 +302,6 @@ fn enter_critical_section(g: &mut Guest, block: bool) -> H {
         return Err(Stop::Wait);
     }
     g.thread_mut().wait = None;
-    let count = g.mem.read_u32(cs + 12)?;
-    g.mem.write_u32(cs + 12, count + 1)?;
-    g.mem.write_u64(cs + 16, me)?;
     Ok(1)
 }
 
@@ -298,11 +315,7 @@ fn TryEnterCriticalSection(g: &mut Guest) -> H {
 
 fn LeaveCriticalSection(g: &mut Guest) -> H {
     let cs = g.arg(0)?;
-    let count = g.mem.read_u32(cs + 12)?.saturating_sub(1);
-    g.mem.write_u32(cs + 12, count)?;
-    if count == 0 {
-        g.mem.write_u64(cs + 16, 0)?;
-    }
+    leave_cs(g, cs)?;
     Ok(0)
 }
 
@@ -333,7 +346,8 @@ fn WaitOnAddress(g: &mut Guest) -> H {
     }
 }
 
-fn wake(g: &mut Guest, all: bool) -> H {
+/// Wake the threads (one, or all) that wait on the address in the first argument.
+pub(super) fn wake(g: &mut Guest, all: bool) -> H {
     let address = g.arg(0)?;
     for t in g.threads.iter_mut().filter(|t| t.exit_code.is_none()) {
         if let Some(w) = t.wait.as_mut().filter(|w| w.address == address && !w.woken) {
