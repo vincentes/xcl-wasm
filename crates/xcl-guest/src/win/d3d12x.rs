@@ -58,9 +58,12 @@ pub enum Kind {
     QueryHeap,
     CommandSignature,
     Blob,
+    /// the device as an IDXGIDevice, and its adapter
+    DxgiDevice,
+    DxgiAdapter,
 }
 
-const KINDS: [Kind; 14] = [
+const KINDS: [Kind; 16] = [
     Kind::Device,
     Kind::CommandQueue,
     Kind::CommandAllocator,
@@ -75,6 +78,8 @@ const KINDS: [Kind; 14] = [
     Kind::QueryHeap,
     Kind::CommandSignature,
     Kind::Blob,
+    Kind::DxgiDevice,
+    Kind::DxgiAdapter,
 ];
 
 impl Kind {
@@ -94,6 +99,8 @@ impl Kind {
             Kind::QueryHeap => "ID3D12QueryHeap",
             Kind::CommandSignature => "ID3D12CommandSignature",
             Kind::Blob => "ID3DBlob",
+            Kind::DxgiDevice => "IDXGIDevice",
+            Kind::DxgiAdapter => "IDXGIAdapter",
         }
     }
 }
@@ -123,6 +130,8 @@ pub enum Command {
     /// hold the queue until (`size` bytes at `at`) & mask compares to value (D3D12_COMPARISON_FUNC)
     Wait { at: u64, size: u8, func: u32, value: u64, mask: u64 },
     Signal { fence: u64, value: u64 },
+    /// PresentX: the frame is what the resource holds when the queue gets here
+    Present { token: u64, resource: u64 },
 }
 
 #[derive(Default)]
@@ -140,6 +149,45 @@ pub struct State {
     fence_events: Vec<(u64, u64, u64)>,
     /// RegisterPagePoolX: index → (address, pages)
     page_pools: Vec<Option<(u64, u32)>>,
+    /// render target views: descriptor handle → resource
+    render_targets: HashMap<u64, u64>,
+    dxgi_device: u64,
+    dxgi_adapter: u64,
+    pub clock: FrameClock,
+    /// the frame PresentX showed last
+    pub frame: Option<Frame>,
+    /// frames presented
+    pub presents: u64,
+}
+
+/// A presented frame: the pixels of the title's back buffer, rows top down.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    /// DXGI_FORMAT of the pixels (28: R8G8B8A8_UNORM, 87: B8G8R8A8_UNORM …)
+    pub format: u32,
+    pub pixels: Vec<u8>,
+    pub token: u64,
+}
+
+/// The console's frame clock (device slots 78–81): a title sets a frame interval, schedules
+/// events at offsets into every interval (type 0: the frame's origin, 1 and 2: further points)
+/// and waits for them; the origin hands out the frame's token, which PresentX names.
+#[derive(Debug, Default)]
+pub struct FrameClock {
+    interval_ns: u64,
+    base_ns: u64,
+    active: bool,
+    /// per event type: its offset into the interval when it is scheduled, and the last event a
+    /// wait took
+    scheduled: [Option<u64>; 3],
+    taken: [u64; 3],
+    next_token: u64,
+    /// (token, guest time of its origin)
+    issued: VecDeque<(u64, u64)>,
+    /// (token, origin, flip)
+    flipped: VecDeque<(u64, u64, u64)>,
 }
 
 /// Where XCL's Windows runtime keeps memory that the CPU reads back (its "coherent window",
@@ -207,16 +255,69 @@ fn object<'a>(g: &'a mut Guest, at: u64) -> Option<&'a mut Object> {
 
 // --- common slots ---------------------------------------------------------------------------
 
+/// QueryInterface(riid, out): the object itself for every interface, but the device, which is
+/// also an IDXGIDevice (an object of its own here: the interfaces' slots differ) – and that one
+/// gives the device back for anything else.
 fn QueryInterface(g: &mut Guest) -> H {
-    let (this, ppv) = (g.arg(0)?, g.arg(2)?);
+    let (this, riid, ppv) = (g.arg(0)?, g.arg(1)?, g.arg(2)?);
     if ppv == 0 {
         return Ok(E_INVALIDARG);
     }
-    if let Some(o) = object(g, this) {
+    // IDXGIDevice, IDXGIDevice1, IDXGIDevice2 (the first word of their IIDs)
+    let dxgi = riid != 0 && matches!(g.mem.read_u32(riid)?, 0x54ec_77fa | 0x77db_970f | 0x0500_8617);
+    let kind = object(g, this).map(|o| o.kind);
+    let target = match (kind, dxgi) {
+        (Some(Kind::Device), true) => {
+            if g.win.d3d.dxgi_device == 0 {
+                g.win.d3d.dxgi_device = new_object(g, Kind::DxgiDevice)?;
+            }
+            g.win.d3d.dxgi_device
+        }
+        (Some(Kind::DxgiDevice), false) => device(g)?,
+        _ => this,
+    };
+    if let Some(o) = object(g, target) {
         o.refs += 1;
     }
-    g.mem.write_u64(ppv, this)?;
+    g.mem.write_u64(ppv, target)?;
     Ok(0)
+}
+
+/// IDXGIDevice::GetAdapter(out)
+fn DxgiDevice_GetAdapter(g: &mut Guest) -> H {
+    let out = g.arg(1)?;
+    if g.win.d3d.dxgi_adapter == 0 {
+        g.win.d3d.dxgi_adapter = new_object(g, Kind::DxgiAdapter)?;
+    }
+    let adapter = g.win.d3d.dxgi_adapter;
+    g.mem.write_u64(out, adapter)?;
+    Ok(0)
+}
+
+/// The adapter's LUID, as the device reports it.
+const ADAPTER_LUID: u64 = 0x5843_4C00;
+
+/// IDXGIAdapter::GetDesc(DXGI_ADAPTER_DESC out): a name, AMD's vendor id, the title memory as
+/// shared memory, the LUID at +296
+fn DxgiAdapter_GetDesc(g: &mut Guest) -> H {
+    let out = g.arg(1)?;
+    g.mem.write(out, &[0u8; 304])?;
+    for (i, c) in "XCL software device".encode_utf16().enumerate() {
+        g.mem.write_u16(out + 2 * i as u64, c)?;
+    }
+    g.mem.write_u32(out + 256, 0x1002)?;
+    g.mem.write_u64(out + 288, xcl::state::config().title_memory_budget_mb() << 20)?;
+    g.mem.write_u64(out + 296, ADAPTER_LUID)?;
+    Ok(0)
+}
+
+/// IDXGIAdapter::EnumOutputs: there is no display behind the adapter
+fn DxgiAdapter_EnumOutputs(g: &mut Guest) -> H {
+    let out = g.arg(2)?;
+    if out != 0 {
+        g.mem.write_u64(out, 0)?;
+    }
+    Ok(0x887A_0002) // DXGI_ERROR_NOT_FOUND
 }
 
 fn AddRef(g: &mut Guest) -> H {
@@ -582,7 +683,7 @@ fn Device_GetCopyableFootprints(g: &mut Guest) -> H {
 fn Device_GetAdapterLuid(g: &mut Guest) -> H {
     let ret = g.arg(1)?;
     if ret != 0 {
-        g.mem.write_u64(ret, 0x5843_4C00)?;
+        g.mem.write_u64(ret, ADAPTER_LUID)?;
     }
     Ok(ret)
 }
@@ -638,6 +739,27 @@ fn run(g: &mut Guest, c: &Command) -> Result<bool, xcl_emu::mem::Fault> {
                 _ => true,
             };
             return Ok(met);
+        }
+        Command::Present { token, resource } => {
+            let now = g.now_ns();
+            let d3d = &mut g.win.d3d;
+            let origin = d3d.clock.issued.iter().rev().find(|e| e.0 == token).map_or(now, |e| e.1);
+            d3d.clock.flipped.push_back((token, origin.min(now), now));
+            if d3d.clock.flipped.len() > 64 {
+                d3d.clock.flipped.pop_front();
+            }
+            d3d.presents += 1;
+            // the back buffer's texels as they are in its memory: rows of 4 bytes a texel (this
+            // device keeps textures linear; the console's tiling is not modelled)
+            if let Some(o) = d3d.objects.get(&resource).filter(|o| o.kind == Kind::Resource) {
+                let u32_at = |i: usize| u32::from_le_bytes(o.desc[i..i + 4].try_into().unwrap());
+                let (width, height, format, at) = (u32_at(16), u32_at(24), u32_at(32), o.mem.0);
+                let mut pixels = vec![0u8; width as usize * height as usize * 4];
+                if pixels.len() as u64 <= o.mem.1 {
+                    g.mem.read(at, &mut pixels)?;
+                    g.win.d3d.frame = Some(Frame { width, height, format, pixels, token });
+                }
+            }
         }
         Command::Signal { fence, value } => {
             if let Some(f) = object(g, fence).filter(|o| o.kind == Kind::Fence) {
@@ -837,6 +959,168 @@ fn List_AllocateUploadMemory(g: &mut Guest) -> H {
     Ok((block + alignment - 1) & !(alignment - 1))
 }
 
+/// device #20 CreateRenderTargetView(resource, desc, descriptor): remembered, for clears
+fn Device_CreateRenderTargetView(g: &mut Guest) -> H {
+    let (resource, handle) = (g.arg(1)?, g.arg(3)?);
+    g.win.d3d.render_targets.insert(handle, resource);
+    Ok(0)
+}
+
+/// list #52 ClearRenderTargetView(descriptor, colour[4], rect count, rects): the whole target
+/// gets the colour (targets of 8 bits a channel; other formats are left)
+fn List_ClearRenderTargetView(g: &mut Guest) -> H {
+    let (handle, colour) = (g.arg(1)?, g.arg(2)?);
+    let Some(&resource) = g.win.d3d.render_targets.get(&handle) else { return Ok(0) };
+    let Some((at, size, desc)) = object(g, resource).map(|o| (o.mem.0, o.mem.1, o.desc)) else { return Ok(0) };
+    let u32_at = |i: usize| u32::from_le_bytes(desc[i..i + 4].try_into().unwrap());
+    let (width, height, format) = (u32_at(16) as u64, u32_at(24) as u64, u32_at(32));
+    let mut channel = [0u32; 4];
+    for (i, c) in channel.iter_mut().enumerate() {
+        let f = f32::from_bits(g.mem.read_u32(colour + 4 * i as u64)?);
+        *c = (f.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+    }
+    let value = match format {
+        // R8G8B8A8 (typeless, unorm, sRGB)
+        27..=29 => channel[0] | channel[1] << 8 | channel[2] << 16 | channel[3] << 24,
+        // B8G8R8A8 / B8G8R8X8
+        87 | 88 | 90..=93 => channel[2] | channel[1] << 8 | channel[0] << 16 | channel[3] << 24,
+        _ => return Ok(0),
+    };
+    let bytes = width * height * 4;
+    if bytes > size {
+        return Ok(0);
+    }
+    record(g, Command::Fill { at, bytes, value })
+}
+
+/// queue #30 PresentX(plane count, planes, parameters); a plane is { frame token @0, resource
+/// count @8, resources @0x10 }: the first plane's first resource is the frame
+fn Queue_PresentX(g: &mut Guest) -> H {
+    let (queue, planes, at) = (g.arg(0)?, g.arg(1)? as u32, g.arg(2)?);
+    if planes == 0 || at == 0 {
+        return Ok(E_INVALIDARG);
+    }
+    let (token, count, resources) = (g.mem.read_u64(at)?, g.mem.read_u32(at + 8)?, g.mem.read_u64(at + 0x10)?);
+    let resource = if count != 0 && resources != 0 { g.mem.read_u64(resources)? } else { 0 };
+    stream(g, queue).push_back(Command::Present { token, resource });
+    pump(g);
+    Ok(0)
+}
+
+// --- the frame clock ------------------------------------------------------------------------------
+
+/// what ScheduleFrameEventX returns when it starts the clock
+const STARTED_CLOCK: u64 = 0x1000_0000;
+const E_FAIL: u64 = 0x8000_4005;
+
+/// Frame intervals the console accepts (µs, with the rounding a title may use): 60, 30, 20 and
+/// 15 Hz. (120 Hz needs a display that runs at it.)
+fn interval_valid(us: u32) -> bool {
+    let near = |base: u32, span: u32| us.abs_diff(base) <= span;
+    near(16667, 16) || near(33333, 34) || near(50000, 49) || near(66667, 67)
+}
+
+/// device #78 SetFrameIntervalX(output, length µs, periodicity, flags); a length of 0 stops it
+fn Device_SetFrameIntervalX(g: &mut Guest) -> H {
+    let us = g.arg(2)? as u32;
+    if us != 0 && !interval_valid(us) {
+        return Ok(E_INVALIDARG);
+    }
+    let clock = &mut g.win.d3d.clock;
+    clock.interval_ns = us as u64 * 1000;
+    if us == 0 {
+        clock.active = false;
+        clock.scheduled = [None; 3];
+    }
+    Ok(0)
+}
+
+/// device #79 ScheduleFrameEventX(type, offset µs, ancillary handles, flags); flag 1: take the
+/// event off the schedule. The ancillary handles (signalled with the event on the console) are
+/// not signalled here.
+fn Device_ScheduleFrameEventX(g: &mut Guest) -> H {
+    let (kind, offset_us, flags) = (g.arg(1)? as usize, g.arg(2)? as u32 as u64, g.arg(4)? as u32);
+    let now = g.now_ns();
+    let clock = &mut g.win.d3d.clock;
+    let unschedule = flags & 1 != 0;
+    if clock.interval_ns == 0 || kind >= 3 || (!clock.active && kind != 0) || (unschedule && (kind == 0 || clock.scheduled[0].is_none())) {
+        return Ok(E_INVALIDARG);
+    }
+    let mut hr = S_FALSE;
+    if !clock.active {
+        clock.active = true;
+        clock.base_ns = now;
+        clock.taken = [now; 3];
+        hr = STARTED_CLOCK;
+    }
+    clock.scheduled[kind] = if unschedule { None } else { Some(offset_us * 1000 % clock.interval_ns) };
+    Ok(hr)
+}
+
+/// device #80 WaitFrameEventX(type, timeout ms, ancillary handles, flags, token in / out):
+/// waits for the type's next event; the origin (type 0) gives the frame its token. S_FALSE at
+/// the timeout.
+fn Device_WaitFrameEventX(g: &mut Guest) -> H {
+    let (kind, timeout, token_at) = (g.arg(1)? as usize, g.arg(2)? as u32, g.arg(5)?);
+    let now = g.now_ns();
+    let clock = &g.win.d3d.clock;
+    let Some(offset) = clock.scheduled.get(kind).copied().flatten() else { return Ok(E_INVALIDARG) };
+    // the first event base + offset + k × interval after the one taken last
+    let first = clock.base_ns + offset;
+    let after = clock.taken[kind];
+    let event = if after < first { first } else { first + ((after - first) / clock.interval_ns + 1) * clock.interval_ns };
+    let waited = super::kernel32::wait(g, now >= event, timeout);
+    match waited {
+        Err(Stop::Wait) => {
+            // the event ends the wait
+            if let Some(w) = g.thread_mut().wait.as_mut() {
+                w.deadline = Some(w.deadline.map_or(event, |d| d.min(event)));
+            }
+            Err(Stop::Wait)
+        }
+        Err(stop) => Err(stop),
+        Ok(false) => Ok(S_FALSE),
+        Ok(true) => {
+            let clock = &mut g.win.d3d.clock;
+            clock.taken[kind] = event;
+            if kind == 0 {
+                clock.next_token = (clock.next_token + 1) & 0xFFFF_FFFF_FFFF;
+                let token = clock.next_token.max(1);
+                clock.issued.push_back((token, event));
+                if clock.issued.len() > 64 {
+                    clock.issued.pop_front();
+                }
+                if token_at != 0 {
+                    g.mem.write_u64(token_at, token)?;
+                }
+            }
+            Ok(0)
+        }
+    }
+}
+
+/// device #81 GetFrameStatisticsX(token, type, count in / out, statistics): one record
+/// { type @0, origin @0x10, flip @0x18 } (100 ns units) once the frame was presented
+fn Device_GetFrameStatisticsX(g: &mut Guest) -> H {
+    let (token, kind, count_at, out) = (g.arg(1)?, g.arg(2)? as u32, g.arg(3)?, g.arg(4)?);
+    if count_at == 0 || out == 0 {
+        return Ok(E_INVALIDARG);
+    }
+    pump(g);
+    let Some(&(_, origin, flip)) = g.win.d3d.clock.flipped.iter().rev().find(|f| f.0 == token) else {
+        g.mem.write_u32(count_at, 0)?;
+        return Ok(E_FAIL);
+    };
+    if g.mem.read_u32(count_at)? < 1 {
+        return Ok(E_INVALIDARG);
+    }
+    g.mem.write_u32(count_at, 1)?;
+    g.mem.write_u32(out, kind)?;
+    g.mem.write_u64(out + 0x10, origin / 100)?;
+    g.mem.write_u64(out + 0x18, flip / 100)?;
+    Ok(0)
+}
+
 // --- heaps, resources, blobs -----------------------------------------------------------------------
 
 /// GetDesc(hidden return): the description the heap was made from
@@ -1011,6 +1295,14 @@ fn slots(kind: Kind) -> Vec<(usize, Handler)> {
         v.extend([(3, Blob_GetBufferPointer as Handler), (4, Blob_GetBufferSize)]);
         return v;
     }
+    // IDXGIObject has its own four methods after IUnknown's
+    if matches!(kind, Kind::DxgiDevice | Kind::DxgiAdapter) {
+        v.extend_from_slice(match kind {
+            Kind::DxgiDevice => &[(7, DxgiDevice_GetAdapter as Handler)],
+            _ => &[(7, DxgiAdapter_EnumOutputs as Handler), (8, DxgiAdapter_GetDesc)],
+        });
+        return v;
+    }
     // ID3D12Object: GetPrivateData, SetPrivateData, SetPrivateDataInterface, SetName
     v.extend([(3, Object_GetPrivateData as Handler), (4, ret_ok), (5, ret_ok), (6, ret_ok)]);
     if kind != Kind::Device {
@@ -1033,7 +1325,7 @@ fn slots(kind: Kind) -> Vec<(usize, Handler)> {
             (17, ret_ok),
             (18, Device_CreateShaderResourceView),
             (19, ret_ok),
-            (20, ret_ok),
+            (20, Device_CreateRenderTargetView),
             (21, ret_ok),
             (22, ret_ok),
             (23, ret_ok),
@@ -1068,6 +1360,10 @@ fn slots(kind: Kind) -> Vec<(usize, Handler)> {
             (73, Device_CreateCommandListX),
             (74, Device_RegisterPagePoolX),
             (75, Device_UnregisterPagePoolX),
+            (78, Device_SetFrameIntervalX),
+            (79, Device_ScheduleFrameEventX),
+            (80, Device_WaitFrameEventX),
+            (81, Device_GetFrameStatisticsX),
             (86, Device_CreatePipelineState), // CreatePipelineState(stream desc, riid, out)
         ],
         Kind::CommandQueue => &[
@@ -1077,6 +1373,7 @@ fn slots(kind: Kind) -> Vec<(usize, Handler)> {
             (16, Queue_GetTimestampFrequency),
             (17, Queue_GetClockCalibration),
             (18, Hidden_ZeroDesc16), // GetDesc
+            (30, Queue_PresentX),
         ],
         Kind::CommandAllocator => &[(8, ret_ok)], // Reset
         Kind::CommandList => &[
@@ -1084,6 +1381,9 @@ fn slots(kind: Kind) -> Vec<(usize, Handler)> {
             (9, ret_ok), // Close
             (10, List_Reset),
             (15, List_CopyBufferRegion),
+            (26, ret_ok), // ResourceBarrier
+            (50, ret_ok), // OMSetRenderTargets
+            (52, List_ClearRenderTargetView),
             (60, List_CopyMemoryToMemoryX),
             (61, List_FillMemoryWith32BitValueX),
             (69, List_Write32BitValueX),
@@ -1259,6 +1559,78 @@ mod tests {
         call(&mut g, "ID3D12GraphicsCommandList::#69", &[list, mem + 0x400, 7, 0, 0]);
         call(&mut g, "ID3D12GraphicsCommandList::#93", &[list]);
         assert_eq!(g.mem.read_u32(mem + 0x400).unwrap(), 7);
+    }
+
+    #[test]
+    fn a_cleared_back_buffer_is_presented_as_a_frame() {
+        let (mut g, out) = guest();
+        call(&mut g, "D3D12CreateDevice", &[0, 0xC100, 0, out]);
+        let dev = g.mem.read_u64(out).unwrap();
+        // the frame clock: 60 Hz, the origin scheduled; a wait is due one interval on
+        assert_eq!(call(&mut g, "ID3D12Device::#79", &[dev, 0, 0, 0, 0]), E_INVALIDARG, "no interval yet");
+        assert_eq!(call(&mut g, "ID3D12Device::#78", &[dev, 0, 12345, 1, 0]), E_INVALIDARG, "not a frame interval");
+        assert_eq!(call(&mut g, "ID3D12Device::#78", &[dev, 0, 16667, 1, 0]), 0);
+        assert_eq!(call(&mut g, "ID3D12Device::#79", &[dev, 0, 0, 0, 0]), STARTED_CLOCK);
+        g.win.time_ns += 16_667_000;
+        assert_eq!(call(&mut g, "ID3D12Device::#80", &[dev, 0, 500, 0, 0, out]), 0);
+        let token = g.mem.read_u64(out).unwrap();
+        assert_ne!(token, 0);
+
+        // a 4×2 RGBA8 render target, cleared and presented
+        let desc = out + 0x100;
+        g.mem.write_u32(desc, 3).unwrap();
+        g.mem.write_u64(desc + 16, 4).unwrap();
+        g.mem.write_u32(desc + 24, 2).unwrap();
+        g.mem.write_u16(desc + 28, 1).unwrap();
+        g.mem.write_u32(desc + 32, 28).unwrap();
+        assert_eq!(call(&mut g, "ID3D12Device::#27", &[dev, 0, 0, desc, 0, 0, 0, out]), 0);
+        let target = g.mem.read_u64(out).unwrap();
+        let view = 0x7777_0000;
+        call(&mut g, "ID3D12Device::#20", &[dev, target, 0, view]);
+        call(&mut g, "ID3D12Device::#8", &[dev, 0, 0, out]);
+        let queue = g.mem.read_u64(out).unwrap();
+        call(&mut g, "ID3D12Device::#12", &[dev, 0, 0, 0, 0, 0, out]);
+        let list = g.mem.read_u64(out).unwrap();
+        let colour = out + 0x200;
+        for (i, c) in [0.1f32, 0.5, 0.9, 1.0].into_iter().enumerate() {
+            g.mem.write_u32(colour + 4 * i as u64, c.to_bits()).unwrap();
+        }
+        call(&mut g, "ID3D12GraphicsCommandList::#52", &[list, view, colour, 0, 0]);
+        g.mem.write_u64(out, list).unwrap();
+        call(&mut g, "ID3D12CommandQueue::#10", &[queue, 1, out]);
+        // no frame before PresentX, and no statistics for the token
+        assert!(g.win.d3d.frame.is_none());
+        g.mem.write_u32(out + 0x300, 1).unwrap();
+        assert_eq!(call(&mut g, "ID3D12Device::#81", &[dev, token, 0, out + 0x300, out + 0x340]), E_FAIL);
+        // plane { token, resource count, resources }
+        let plane = out + 0x400;
+        g.mem.write_u64(plane, token).unwrap();
+        g.mem.write_u32(plane + 8, 1).unwrap();
+        g.mem.write_u64(plane + 0x10, plane + 0x40).unwrap();
+        g.mem.write_u64(plane + 0x40, target).unwrap();
+        assert_eq!(call(&mut g, "ID3D12CommandQueue::#30", &[queue, 1, plane, 0]), 0);
+        let frame = g.win.d3d.frame.clone().expect("a frame");
+        assert_eq!((frame.width, frame.height, frame.format, frame.token, g.win.d3d.presents), (4, 2, 28, token, 1));
+        assert_eq!(frame.pixels.len(), 32);
+        assert!(frame.pixels.chunks(4).all(|p| p == [26, 128, 230, 255]), "{:?}", &frame.pixels[..8]);
+        g.mem.write_u32(out + 0x300, 1).unwrap();
+        assert_eq!(call(&mut g, "ID3D12Device::#81", &[dev, token, 0, out + 0x300, out + 0x340]), 0);
+        let (origin, flip) = (g.mem.read_u64(out + 0x350).unwrap(), g.mem.read_u64(out + 0x358).unwrap());
+        assert!(origin != 0 && origin <= flip);
+
+        // the device as an IDXGIDevice1 and back: its adapter has the device's LUID
+        g.mem.write_u32(out + 0x500, 0x77db_970f).unwrap();
+        assert_eq!(call(&mut g, "ID3D12Device::#0", &[dev, out + 0x500, out]), 0);
+        let dxgi = g.mem.read_u64(out).unwrap();
+        assert_ne!(dxgi, dev);
+        call(&mut g, "IDXGIDevice::#7", &[dxgi, out]);
+        let adapter = g.mem.read_u64(out).unwrap();
+        call(&mut g, "IDXGIAdapter::#8", &[adapter, out + 0x600]);
+        call(&mut g, "ID3D12Device::#43", &[dev, out + 0x580]);
+        assert_eq!(g.mem.read_u64(out + 0x600 + 296).unwrap(), g.mem.read_u64(out + 0x580).unwrap());
+        g.mem.write_u32(out + 0x500, 0x1898_19f1).unwrap();
+        call(&mut g, "IDXGIDevice::#0", &[dxgi, out + 0x500, out]);
+        assert_eq!(g.mem.read_u64(out).unwrap(), dev);
     }
 
     #[test]

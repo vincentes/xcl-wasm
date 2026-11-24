@@ -33,8 +33,6 @@ const FAILS: &[&str] = &[
     "D3D12.X: retail-format console shader",
     "D3D12.X: triangle rendered",
     "D3D12.X: dynamic depth bias",
-    // the frame clock and PresentX
-    "D3D12.X: frame clock",
     // libraries the guest does not have
     "DirectStorage",
 ];
@@ -70,7 +68,7 @@ fn the_test_title_passes_its_checks_up_to_where_the_guest_gets() {
         passed += !expected_to_fail as usize;
     }
     // the title ends itself in its XG texture check (no xg_xs.dll here), after these
-    assert_eq!(passed, 40, "checks passed");
+    assert_eq!(passed, 41, "checks passed");
     assert!(checks.last().is_some_and(|l| l.starts_with("[FAIL] DirectStorage")), "the last check reached");
     // … with a fail-fast (its own abort), not a fault of the guest
     assert_eq!(stop, Stop::Exit(0xC000_0409));
