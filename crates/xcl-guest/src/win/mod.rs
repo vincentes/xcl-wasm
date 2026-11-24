@@ -9,7 +9,7 @@ use xcl_emu::mem::{Fault, Memory, PROT_R, PROT_W};
 use crate::{Guest, Handler, Stop};
 
 mod crt;
-pub mod d3d12_null;
+pub mod d3d12x;
 pub mod files;
 pub mod gdk;
 pub mod heap;
@@ -46,7 +46,7 @@ pub struct State {
     pub xmem: kernelx::XMem,
     pub window_classes: u32,
     pub xgr: xgameruntime::State,
-    pub d3d: d3d12_null::State,
+    pub d3d: d3d12x::State,
     pub pool: threadpool::Pool,
     /// the GDK runtime's interface objects handed out, by (class, interface)
     pub gdk: HashMap<(u128, u128), u64>,
@@ -151,7 +151,7 @@ pub fn handlers() -> HashMap<&'static str, Handler> {
     user::register(&mut map);
     xgameruntime::register(&mut map);
     gdk::register(&mut map);
-    d3d12_null::register(&mut map);
+    d3d12x::register(&mut map);
     // after kernel32 and crt: the file functions also take the standard handles
     files::register(&mut map);
     // after kernel32: VirtualFree also knows the graphics region

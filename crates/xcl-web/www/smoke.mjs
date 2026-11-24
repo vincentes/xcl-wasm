@@ -94,13 +94,12 @@ if (titlePath) {
   const passes = lines.filter((l) => l.startsWith("[PASS] ")).length;
   const fails = lines.filter((l) => l.startsWith("[FAIL] ")).length;
   assert.match(out, /^xcl_testtitle: start\n/);
-  // it runs to its end (functions the host lacks answer 0, so later checks fail), and the
-  // checks up to the graphics ones pass
-  assert.match(out, /\nxcl_testtitle: done, failures: \d+\n/);
-  assert.match(out, /--- stopped: Exit\(/);
+  // the checks that need no GPU pass (those up to the graphics ones, and the memory side of
+  // D3D12.X); then the title ends itself in its XG texture check, a library the guest lacks
   assert.ok(lines.slice(1, 32).every((l) => l.startsWith("[PASS] ")), `the first 31 checks:\n${lines.slice(0, 34).join("\n")}`);
-  assert.ok(passes >= 31, `only ${passes} checks passed`);
-  ran = `test title ran to its end: ${passes} checks passed, ${fails} failed, in ${Math.round(performance.now() - t0)} ms`;
+  assert.ok(passes >= 40, `only ${passes} checks passed`);
+  assert.match(out, /--- stopped: Exit\(c0000409\)/);
+  ran = `test title: ${passes} checks passed, ${fails} failed, then it aborts in its XG check; in ${Math.round(performance.now() - t0)} ms`;
 }
 
 console.log(`xcl-web smoke: ok (${xcl.version()}, ${wasm.length} B; ${ran})`);

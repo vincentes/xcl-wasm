@@ -51,10 +51,15 @@ impl Default for XMem {
 
 impl XMem {
     /// A range of the graphics region: first fit, `align` a power of two.
-    fn take(&mut self, size: u64, align: u64) -> Option<u64> {
+    pub(super) fn take(&mut self, size: u64, align: u64) -> Option<u64> {
+        self.take_from(0, size, align)
+    }
+
+    /// … at or above `from`.
+    pub(super) fn take_from(&mut self, from: u64, size: u64, align: u64) -> Option<u64> {
         for i in 0..self.free.len() {
             let (base, len) = self.free[i];
-            let at = base.checked_add(align - 1)? & !(align - 1);
+            let at = base.max(from).checked_add(align - 1)? & !(align - 1);
             let Some(end) = at.checked_add(size) else { continue };
             if end > base + len {
                 continue;
@@ -73,7 +78,7 @@ impl XMem {
     }
 
     /// Give a range back; neighbouring free ranges merge.
-    fn give(&mut self, base: u64) -> Option<u64> {
+    pub(super) fn give(&mut self, base: u64) -> Option<u64> {
         let size = self.ranges.remove(&base)?;
         let i = self.free.partition_point(|&(b, _)| b < base);
         self.free.insert(i, (base, size));

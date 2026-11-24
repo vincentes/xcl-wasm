@@ -6,3 +6,7 @@ members = ["crates/xcl", "crates/xcl-emu", "crates/xcl-guest", "crates/xcl-web",
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-only"
+
+# the interpreter is the inner loop of every guest test: optimised in development builds too
+[profile.dev.package.xcl-emu]
+opt-level = 3

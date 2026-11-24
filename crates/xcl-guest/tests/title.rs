@@ -25,41 +25,18 @@ fn add_folder(g: &mut Guest, dir: &std::path::Path, prefix: &str) {
     }
 }
 
-/// The checks of the title the guest passes so far, in the title's order.
-const PASSES: &[&str] = &[
-    "argv: command line belongs to the game",
-    "static TLS: template on main thread",
-    "static TLS: every new thread gets its own initialised copy",
-    "C++-style exceptions: panic is caught (RtlPcToFileHeader)",
-    "kernelx: GetConsoleType / XSystemGetDeviceType",
-    "kernelx: XMemAlloc alignment + zeroing",
-    "kernelx: XMemVirtualAlloc – graphics memory type in UMA, others from Windows",
-    "xmem: working-set statistics, physical pages mapped and freed",
-    "xmem: physical pages mapped into reserved address space keep their contents",
-    "kernelx: graphics memory lives in the GPU-visible 4 GiB-aligned region (UMA)",
-    "user32: a top-level window made either way (CreateWindowExW / A) is the hidden 1920x1080 console screen",
-    "GameInput: GameInputCreate reaches the system GameInput (timestamps advance)",
-    "kernelx: TitleMemoryStatus",
-    "kernelx: SetThreadName / GetThreadName",
-    "kernelx: unimplemented import becomes a stub and the title keeps running",
-    "modules: GetModuleHandle(NULL) is the game image",
-    "modules: LoadLibrary/GetProcAddress on an HLE module",
-    "game DLL: static import + DllMain + TLS + its own kernelx import",
-    "files: console paths G:\\ and GAME: read from the game folder",
-    "files: CRT fopen goes through the VFS too",
-    "files: writes go to the overlay, game folder untouched",
-    "files: delete hides the file without touching the original",
-    "files: directory listing merges overlay and hides deleted files",
-    "files: T:\\ title scratch storage",
-    "files: T:\\ free space (the host volume behind the mount)",
-    "XGameRuntime: initialize + package identity",
-    "XTaskQueue: manual, delayed and thread-pool dispatch",
-    "XUser: silent sign-in, device association, and no XSTS token offline",
-    "XTaskQueue composite + XNetworking + advapi32legacy LSA fallback",
-    "storage: save folder + persistent local storage",
-    "XPersistentLocalStorage: a drive root, as on the console",
-    // on the null device: nothing is rendered, the fence completes at once
-    "D3D12.X: queue + fence signal on the GPU",
+/// The checks of the title that cannot pass yet, by the start of their names, and why. Every
+/// other check has to pass.
+const FAILS: &[&str] = &[
+    // they compile HLSL at run time (D3DCompile), render and read pixels back: no GPU back end
+    "D3D12.X: shaders captured",
+    "D3D12.X: retail-format console shader",
+    "D3D12.X: triangle rendered",
+    "D3D12.X: dynamic depth bias",
+    // the frame clock and PresentX
+    "D3D12.X: frame clock",
+    // libraries the guest does not have
+    "DirectStorage",
 ];
 
 #[test]
@@ -70,7 +47,6 @@ fn the_test_title_passes_its_checks_up_to_where_the_guest_gets() {
     };
     let data = std::fs::read(&path).unwrap();
     let mut g = Guest::new();
-    g.strict = true;
     g.command_line = "xcl_testtitle.exe --hello".into();
     // the game folder: the repository's test data and the title's DLL, built next to the title
     let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/testgame");
@@ -79,29 +55,25 @@ fn the_test_title_passes_its_checks_up_to_where_the_guest_gets() {
     g.vfs.add_game_file("testgame_mw.dll", std::fs::read(path.with_file_name("testgame_mw.dll")).expect("testgame_mw.dll next to the title"));
     let exe = g.map_image("xcl_testtitle.exe", &data).unwrap();
     g.start(exe, 1 << 20).unwrap();
-    let stop = loop {
-        match g.run(2_000_000_000) {
-            // the title checks that a function nobody implements becomes a stub answering 0
-            Stop::Unimplemented { name, .. } if name == "XclDefinitelyMissingFunction" => g.answer_import(0).unwrap(),
-            stop => break stop,
-        }
-    };
+    // functions the guest lacks answer 0: the checks that need them fail, the title goes on
+    let stop = g.run(4_000_000_000);
     let output = String::from_utf8_lossy(&g.output).into_owned();
     println!("{output}--- stopped: {stop:x?} after {} instructions of the main thread", g.cpu.icount);
     let lines: Vec<&str> = output.lines().collect();
     assert_eq!(lines.first(), Some(&"xcl_testtitle: start"));
-    // every check up to the graphics ones passes; those need a GPU (and an HLSL compiler), which
-    // the null device is not, and fail
     let checks: Vec<&str> = lines.iter().skip(1).copied().filter(|l| l.starts_with("[PASS] ") || l.starts_with("[FAIL] ")).collect();
-    assert!(checks.len() >= PASSES.len(), "only {} checks ran", checks.len());
-    for (line, name) in checks.iter().zip(PASSES) {
-        assert_eq!(*line, format!("[PASS] {name}"));
+    let mut passed = 0;
+    for line in &checks {
+        let name = &line[7..];
+        let expected_to_fail = FAILS.iter().any(|f| name.starts_with(f));
+        assert_eq!(line.starts_with("[FAIL] "), expected_to_fail, "{line}");
+        passed += !expected_to_fail as usize;
     }
-    for line in &checks[PASSES.len()..] {
-        assert!(line.starts_with("[FAIL] D3D12.X: "), "{line}");
-    }
-    // it has not crashed: it either ran to its end or reached a function that is not there yet
-    assert!(matches!(stop, Stop::Exit(_) | Stop::Unimplemented { .. }), "{stop:x?}");
+    // the title ends itself in its XG texture check (no xg_xs.dll here), after these
+    assert_eq!(passed, 40, "checks passed");
+    assert!(checks.last().is_some_and(|l| l.starts_with("[FAIL] DirectStorage")), "the last check reached");
+    // … with a fail-fast (its own abort), not a fault of the guest
+    assert_eq!(stop, Stop::Exit(0xC000_0409));
     // the game folder is as it was: what the title changed is in the overlay
     assert_eq!(g.vfs.game_file("data\\hello.txt"), Some(&std::fs::read(folder.join("data/hello.txt")).unwrap()[..]));
     assert!(g.vfs.game_file("data\\delete_me.txt").is_some());

@@ -309,6 +309,8 @@ impl Guest {
             if ran != 0 {
                 idle = 0;
             }
+            // what goes on behind the title's back: the queues of the graphics device
+            win::d3d12x::pump(self);
             let waits = match exit {
                 Exit::Limit => {
                     if left == 0 {
