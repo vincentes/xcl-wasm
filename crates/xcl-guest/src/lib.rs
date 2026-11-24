@@ -95,6 +95,8 @@ pub struct Wait {
 /// A guest thread. The registers of the running one are in `Guest::cpu`.
 pub struct Thread {
     pub id: u32,
+    /// SetThreadName
+    pub name: String,
     /// its registers while another thread runs
     cpu: Cpu,
     pub teb: u64,
@@ -204,7 +206,7 @@ impl Guest {
         cpu.r[xcl_emu::cpu::RSP] = top - 0x40;
         let ret = cpu.trap_address(return_slot);
         abi::call(&mut cpu, &mut self.mem, entry, &[argument], ret)?;
-        self.threads.push(Thread { id, cpu, teb, last_error: 0, tls_slots: Vec::new(), wait: None, exit_code: None, seh: Vec::new() });
+        self.threads.push(Thread { id, name: String::new(), cpu, teb, last_error: 0, tls_slots: Vec::new(), wait: None, exit_code: None, seh: Vec::new() });
         Ok(self.threads.len() - 1)
     }
 

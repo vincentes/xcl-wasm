@@ -11,6 +11,7 @@ use crate::{Guest, Handler, Stop};
 mod crt;
 pub mod heap;
 mod kernel32;
+mod kernelx;
 pub mod seh;
 
 /// A module's static TLS, from its TLS directory.
@@ -33,6 +34,7 @@ pub struct State {
     /// nesting of `Guest::call`
     pub call_depth: u32,
     pub heap: heap::Heap,
+    pub xmem: kernelx::XMem,
     /// TlsAlloc / FlsAlloc slots handed out
     pub tls_count: usize,
     /// guest time (see `Guest::now_ns`)
@@ -106,6 +108,8 @@ pub fn handlers() -> HashMap<&'static str, Handler> {
     crt::register(&mut map);
     kernel32::register(&mut map);
     seh::register(&mut map);
+    // after kernel32: VirtualFree also knows the graphics region
+    kernelx::register(&mut map);
     map
 }
 

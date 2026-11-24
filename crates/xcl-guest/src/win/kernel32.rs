@@ -379,7 +379,6 @@ const PAGE_READWRITE: u32 = 0x04;
 const PAGE_EXECUTE_READ: u32 = 0x20;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const MEM_COMMIT: u32 = 0x1000;
-const MEM_RELEASE: u32 = 0x8000;
 const MEM_FREE: u32 = 0x1_0000;
 const MEM_PRIVATE: u32 = 0x2_0000;
 
@@ -424,15 +423,6 @@ pub(super) fn virtual_alloc(g: &mut Guest, address: u64, size: u64, protect: u32
 fn VirtualAlloc(g: &mut Guest) -> H {
     let (address, size, protect) = (g.arg(0)?, g.arg(1)?, g.arg(3)? as u32);
     Ok(virtual_alloc(g, address, size, protect))
-}
-
-fn VirtualFree(g: &mut Guest) -> H {
-    let (address, kind) = (g.arg(0)?, g.arg(2)? as u32);
-    if kind & MEM_RELEASE != 0 {
-        return Ok(g.mem.unmap(address) as u64);
-    }
-    // decommit: the pages stay mapped
-    Ok(1)
 }
 
 fn VirtualProtect(g: &mut Guest) -> H {
@@ -730,7 +720,7 @@ pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
     register!(map; ExitProcess, TerminateProcess, GetCurrentProcess, GetCurrentThread, GetCurrentProcessId, GetCurrentThreadId);
     register!(map; GetLastError, SetLastError, GetCommandLineW, GetEnvironmentStringsW, GetEnvironmentVariableW);
     register!(map; TlsAlloc, TlsGetValue, TlsSetValue, GetProcessHeap, HeapAlloc, HeapReAlloc, HeapFree);
-    register!(map; VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery, GetSystemInfo);
+    register!(map; VirtualAlloc, VirtualProtect, VirtualQuery, GetSystemInfo);
     register!(map; QueryPerformanceCounter, QueryPerformanceFrequency, GetSystemTimePreciseAsFileTime, Sleep, SwitchToThread);
     register!(map; CreateThread, WaitForSingleObject, CreateEventW, SetEvent, ResetEvent, CreateWaitableTimerExW, SetWaitableTimer, CloseHandle);
     register!(map; WaitOnAddress, WakeByAddressSingle, WakeByAddressAll);
