@@ -90,6 +90,12 @@ if (titlePath) {
   xcl.gameFile("testgame_mw.dll", readFileSync(titlePath.replace(/[^\\/]+$/, "testgame_mw.dll")));
   const out = xcl.run("xcl_testtitle.exe", readFileSync(titlePath), "xcl_testtitle.exe --hello");
   xcl.clearGame();
+  // the frame the title presented: its 640×360 back buffer, cleared to (0.1, 0.5, 0.9, 1)
+  const frame = xcl.frame();
+  assert.ok(frame, "the title presented a frame");
+  assert.deepEqual([frame.width, frame.height, frame.format, frame.presented], [640, 360, 28, 1]);
+  assert.deepEqual([...frame.pixels.slice(0, 4)], [26, 128, 230, 255]);
+  assert.deepEqual([...frame.pixels.slice(-4)], [26, 128, 230, 255]);
   const lines = out.split("\n");
   const passes = lines.filter((l) => l.startsWith("[PASS] ")).length;
   const fails = lines.filter((l) => l.startsWith("[FAIL] ")).length;

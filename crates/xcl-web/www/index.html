@@ -36,6 +36,8 @@
   #state:empty { display: none; }
   #state[data-tone=ok] { background: var(--ok-soft); color: var(--ok); }
   #state[data-tone=bad] { background: var(--bad-soft); color: var(--bad); }
+  canvas { display: block; max-width: 100%; height: auto; border: 1px solid var(--ink); border-radius: 8px; margin: 0 0 0.75rem; }
+  canvas[hidden] { display: none; }
   pre { font: 12px/1.5 var(--mono); background: var(--canvas); border: 1px solid var(--ink); border-radius: 8px; color: var(--text-strong); margin: 0; padding: 0.875rem 1rem; overflow: auto; min-height: 12rem; }
   pre:empty::before { content: "Pick a file: its output appears here."; color: var(--text); font-family: system-ui, sans-serif; font-size: 13px; }
   @media (max-width: 64rem) { .hero { grid-template-columns: minmax(0, 1fr); gap: 2rem; } body { padding-top: 2rem; } }
@@ -60,6 +62,7 @@
     <label class="check"><input type="checkbox" id="json"> JSON</label>
     <input type="text" id="args" placeholder="disasm options (--offset 0x40 --all) / run arguments" aria-label="Options">
   </fieldset>
+  <canvas id="frame" hidden aria-label="The frame the title presented last"></canvas>
   <pre id="out"></pre>
 </main>
 <script type="module" src="./demo.js"></script>
@@ -77,6 +80,17 @@
     $("state").textContent = text;
     $("state").dataset.tone = tone || "";
   }
+  // the title's back buffer as it presented it last (the guest renders nothing itself)
+  function show(frame) {
+    const canvas = $("frame");
+    canvas.hidden = !frame;
+    if (!frame) return;
+    const rgba = new Uint8ClampedArray(frame.pixels);
+    if (frame.format >= 87) for (let i = 0; i < rgba.length; i += 4) [rgba[i], rgba[i + 2]] = [rgba[i + 2], rgba[i]];
+    canvas.width = frame.width;
+    canvas.height = frame.height;
+    canvas.getContext("2d").putImageData(new ImageData(rgba, frame.width, frame.height), 0, 0);
+  }
   let latest = 0;
   async function run() {
     const f = $("file").files[0];
@@ -85,6 +99,7 @@
     const data = new Uint8Array(await f.arrayBuffer());
     const cmd = document.querySelector("input[name=cmd]:checked").value;
     state("");
+    show(null);
     if (cmd === "run") {
       // the guest runs on this thread: let "Running" reach the screen first
       state("Running");
@@ -95,7 +110,10 @@
       const args = $("args").value.split(/\s+/).filter(Boolean);
       $("out").textContent =
         cmd === "inspect" ? xcl.inspect(f.name, data, $("json").checked) : cmd === "disasm" ? xcl.disasm(f.name, data, args) : xcl.run(f.name, data, [f.name, ...args].join(" "));
-      if (cmd === "run") state("Finished", "ok");
+      if (cmd === "run") {
+        state("Finished", "ok");
+        show(xcl.frame());
+      }
     } catch (e) {
       $("out").textContent = "xcl " + cmd + ": " + e.message;
       if (cmd === "run") state("Failed", "bad");

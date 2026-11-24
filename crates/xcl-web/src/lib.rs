@@ -11,6 +11,8 @@ use std::sync::Mutex;
 static OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// the game folder for the next `xcl_run`: (path in the folder, contents)
 static GAME: Mutex<Vec<(String, Vec<u8>)>> = Mutex::new(Vec::new());
+/// the frame the last run presented last: (width, height, DXGI format, frames presented, pixels)
+static FRAME: Mutex<Option<(u32, u32, u32, u64, Vec<u8>)>> = Mutex::new(None);
 
 fn answer(result: Result<String, String>) -> u32 {
     let (code, text) = match result {
@@ -135,6 +137,7 @@ pub unsafe extern "C" fn xcl_run(name: *const u8, name_len: usize, data: *const 
         return answer(Err(e));
     }
     let stop = g.run(if max_instructions == 0 { 2_000_000_000 } else { max_instructions });
+    *FRAME.lock().unwrap() = g.win.d3d.frame.take().map(|f| (f.width, f.height, f.format, g.win.d3d.presents, f.pixels));
     let mut text = String::from_utf8_lossy(&g.output).into_owned();
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
@@ -146,4 +149,22 @@ pub unsafe extern "C" fn xcl_run(name: *const u8, name_len: usize, data: *const 
     let instructions: u64 = g.cpu.icount;
     text.push_str(&format!("--- stopped: {stop:x?} ({instructions} instructions on the last thread, {} threads)\n", g.threads.len()));
     answer(Ok(text))
+}
+
+/// The frame the title of the last `xcl_run` presented last (PresentX): the answer is
+/// `width height format presented` (format: a DXGI_FORMAT, 28 is R8G8B8A8, 87 B8G8R8A8), and
+/// the pixels – four bytes each, rows top down – are at `xcl_frame_ptr()`, `width × height × 4`
+/// bytes. An error when the title presented nothing. Nothing is rendered by the guest: this is
+/// what the title's back buffer held in memory (clears, and what the title wrote itself).
+#[no_mangle]
+pub extern "C" fn xcl_frame() -> u32 {
+    answer(match FRAME.lock().unwrap().as_ref() {
+        Some((width, height, format, presents, _)) => Ok(format!("{width} {height} {format} {presents}")),
+        None => Err("the title presented no frame".into()),
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn xcl_frame_ptr() -> *const u8 {
+    FRAME.lock().unwrap().as_ref().map_or(std::ptr::null(), |f| f.4.as_ptr())
 }

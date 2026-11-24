@@ -46,5 +46,20 @@ export async function load(source) {
     clearGame: () => call(x.xcl_game_file, "", new Uint8Array(0)),
     /** Run a title on the x86-64 guest: its output, then a `--- stopped: …` line. */
     run: (name, data, commandLine = "", maxInstructions = 0) => call(x.xcl_run, name, data, commandLine, BigInt(maxInstructions)),
+    /**
+     * The frame the last run presented last, or null: { width, height, format (a DXGI_FORMAT:
+     * 28 R8G8B8A8, 87 B8G8R8A8), presented (frames so far), pixels (4 bytes each, top down) }.
+     */
+    frame: () => {
+      let info;
+      try {
+        info = call(x.xcl_frame);
+      } catch {
+        return null;
+      }
+      const [width, height, format, presented] = info.split(" ").map(Number);
+      const pixels = new Uint8Array(x.memory.buffer, Number(x.xcl_frame_ptr()), width * height * 4).slice();
+      return { width, height, format, presented, pixels };
+    },
   };
 }
