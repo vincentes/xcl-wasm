@@ -5,7 +5,7 @@ use crate::cpu::*;
 use crate::exec::{Ctx, Rm, R};
 
 /// Element-wise integer operation on lanes of `w` bytes.
-fn lanes(a: u128, b: u128, w: u32, f: impl Fn(u64, u64) -> u64) -> u128 {
+pub(crate) fn lanes(a: u128, b: u128, w: u32, f: impl Fn(u64, u64) -> u64) -> u128 {
     let bits = w * 8;
     let m = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
     let mut r = 0u128;
@@ -17,7 +17,7 @@ fn lanes(a: u128, b: u128, w: u32, f: impl Fn(u64, u64) -> u64) -> u128 {
     r
 }
 
-fn sxl(v: u64, w: u32) -> i64 {
+pub(crate) fn sxl(v: u64, w: u32) -> i64 {
     match w {
         1 => v as i8 as i64,
         2 => v as i16 as i64,
@@ -26,16 +26,16 @@ fn sxl(v: u64, w: u32) -> i64 {
     }
 }
 
-fn ps(a: u128) -> [f32; 4] {
+pub(crate) fn ps(a: u128) -> [f32; 4] {
     std::array::from_fn(|i| f32::from_bits((a >> (i * 32)) as u32))
 }
-fn from_ps(v: [f32; 4]) -> u128 {
+pub(crate) fn from_ps(v: [f32; 4]) -> u128 {
     v.iter().enumerate().fold(0, |r, (i, x)| r | (x.to_bits() as u128) << (i * 32))
 }
-fn pd(a: u128) -> [f64; 2] {
+pub(crate) fn pd(a: u128) -> [f64; 2] {
     [f64::from_bits(a as u64), f64::from_bits((a >> 64) as u64)]
 }
-fn from_pd(v: [f64; 2]) -> u128 {
+pub(crate) fn from_pd(v: [f64; 2]) -> u128 {
     v[0].to_bits() as u128 | (v[1].to_bits() as u128) << 64
 }
 
@@ -85,7 +85,7 @@ fn compare<T: PartialOrd>(p: u8, x: T, y: T) -> bool {
     }
 }
 
-fn f32_to_i32(x: f32, trunc: bool) -> u32 {
+pub(crate) fn f32_to_i32(x: f32, trunc: bool) -> u32 {
     let r = if trunc { x.trunc() } else { x.round_ties_even() };
     if r.is_nan() || r >= 2147483648.0 || r < -2147483648.0 {
         0x8000_0000
@@ -93,7 +93,7 @@ fn f32_to_i32(x: f32, trunc: bool) -> u32 {
         r as i32 as u32
     }
 }
-fn f64_to_i32(x: f64, trunc: bool) -> u32 {
+pub(crate) fn f64_to_i32(x: f64, trunc: bool) -> u32 {
     let r = if trunc { x.trunc() } else { x.round_ties_even() };
     if r.is_nan() || r >= 2147483648.0 || r < -2147483648.0 {
         0x8000_0000
@@ -110,7 +110,7 @@ fn f64_to_i64(x: f64, trunc: bool) -> u64 {
     }
 }
 
-fn saturate_s(v: i64, w: u32) -> u64 {
+pub(crate) fn saturate_s(v: i64, w: u32) -> u64 {
     let (lo, hi) = match w {
         1 => (i8::MIN as i64, i8::MAX as i64),
         2 => (i16::MIN as i64, i16::MAX as i64),
@@ -118,7 +118,7 @@ fn saturate_s(v: i64, w: u32) -> u64 {
     };
     v.clamp(lo, hi) as u64
 }
-fn saturate_u(v: i64, w: u32) -> u64 {
+pub(crate) fn saturate_u(v: i64, w: u32) -> u64 {
     v.clamp(0, if w == 1 { 0xFF } else { 0xFFFF }) as u64
 }
 
@@ -137,7 +137,7 @@ fn pack(a: u128, b: u128, w: u32, unsigned: bool) -> u128 {
 }
 
 /// PUNPCKL* / PUNPCKH*: interleave the low or high lanes of `a` and `b`.
-fn unpack(a: u128, b: u128, w: u32, high: bool) -> u128 {
+pub(crate) fn unpack(a: u128, b: u128, w: u32, high: bool) -> u128 {
     let bits = w * 8;
     let n = 16 / w;
     let m = if bits == 64 { u128::from(u64::MAX) } else { (1u128 << bits) - 1 };
@@ -151,7 +151,7 @@ fn unpack(a: u128, b: u128, w: u32, high: bool) -> u128 {
 }
 
 /// Shift every lane (`w` bytes) by `count` bits: 0 left, 1 logical right, 2 arithmetic right.
-fn shift_lanes(a: u128, w: u32, count: u64, kind: u8) -> u128 {
+pub(crate) fn shift_lanes(a: u128, w: u32, count: u64, kind: u8) -> u128 {
     let bits = (w * 8) as u64;
     lanes(a, 0, w, |x, _| match kind {
         0 => {
@@ -251,8 +251,8 @@ impl Ctx<'_> {
     }
 }
 
-const LOW32: u128 = 0xFFFF_FFFF;
-const LOW64: u128 = 0xFFFF_FFFF_FFFF_FFFF;
+pub(crate) const LOW32: u128 = 0xFFFF_FFFF;
+pub(crate) const LOW64: u128 = 0xFFFF_FFFF_FFFF_FFFF;
 
 /// Execute the 0F-map instruction `op`. `false`: not one this module implements.
 pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
@@ -302,6 +302,49 @@ pub(crate) fn exec(c: &mut Ctx, op: u8) -> R<bool> {
             } else {
                 c.wr_x(rm, 16, v)?;
             }
+        }
+        // SSE3: movddup (F2 12), movsldup (F3 12), movshdup (F3 16)
+        0x12 | 0x16 if f3 || f2 => {
+            if op == 0x16 && f2 {
+                return Ok(false);
+            }
+            let (reg, rm) = c.modrm()?;
+            let v = if f2 {
+                let b = c.rd_x(rm, if c.half == 0 && !c.l { 8 } else { 16 })? & LOW64;
+                b | b << 64
+            } else {
+                let b = ps(c.rd_x(rm, 16)?);
+                let k = (op == 0x16) as usize;
+                from_ps([b[k], b[k], b[2 + k], b[2 + k]])
+            };
+            c.set_x(reg, v);
+        }
+        // SSE3: haddpd / haddps (7C), hsubpd / hsubps (7D), addsubpd / addsubps (D0)
+        0x7C | 0x7D | 0xD0 if p66 || f2 => {
+            let (reg, rm) = c.modrm()?;
+            let (a, b) = (c.src1(reg), c.rd_x(rm, 16)?);
+            let v = if p66 {
+                let (x, y) = (pd(a), pd(b));
+                from_pd(match op {
+                    0x7C => [x[0] + x[1], y[0] + y[1]],
+                    0x7D => [x[0] - x[1], y[0] - y[1]],
+                    _ => [x[0] - y[0], x[1] + y[1]],
+                })
+            } else {
+                let (x, y) = (ps(a), ps(b));
+                from_ps(match op {
+                    0x7C => [x[0] + x[1], x[2] + x[3], y[0] + y[1], y[2] + y[3]],
+                    0x7D => [x[0] - x[1], x[2] - x[3], y[0] - y[1], y[2] - y[3]],
+                    _ => [x[0] - y[0], x[1] + y[1], x[2] - y[2], x[3] + y[3]],
+                })
+            };
+            c.set_x(reg, v);
+        }
+        // SSE3: lddqu
+        0xF0 if f2 => {
+            let (reg, rm) = c.modrm()?;
+            let v = c.rd_x(rm, 16)?;
+            c.set_x(reg, v);
         }
         // movlps / movlpd load (register form: movhlps)
         0x12 if none || p66 => {

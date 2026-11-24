@@ -416,3 +416,173 @@ c4 e1 eb 2a c1       | - | - | vcvtsi2sd xmm0, xmm2, rcx
 c5 fc 5b c1          | - | - | vcvtdq2ps ymm0, ymm1
 c5 f8 77             | - | - | vzeroupper
 c5 fc 77             | - | - | vzeroall
+
+# --- SSE3, SSSE3, SSE4.1
+f2 0f 12 c1          | - | - | movddup xmm0, xmm1
+f2 0f 12 07          | - | - | movddup xmm0, [rdi]
+f3 0f 12 c1          | - | - | movsldup xmm0, xmm1
+f3 0f 16 c1          | - | - | movshdup xmm0, xmm1
+f2 0f f0 07          | - | - | lddqu xmm0, [rdi]
+66 0f 38 00 c1       | - | - | pshufb xmm0, xmm1
+66 0f 38 01 c1       | - | - | phaddw xmm0, xmm1
+66 0f 38 02 c1       | - | - | phaddd xmm0, xmm1
+66 0f 38 03 c1       | - | - | phaddsw xmm0, xmm1
+66 0f 38 05 c1       | - | - | phsubw xmm0, xmm1
+66 0f 38 06 c1       | - | - | phsubd xmm0, xmm1
+66 0f 38 07 c1       | - | - | phsubsw xmm0, xmm1
+66 0f 38 04 c1       | - | - | pmaddubsw xmm0, xmm1
+66 0f 38 08 c1       | - | - | psignb xmm0, xmm1
+66 0f 38 09 c1       | - | - | psignw xmm0, xmm1
+66 0f 38 0a c1       | - | - | psignd xmm0, xmm1
+66 0f 38 0b c1       | - | - | pmulhrsw xmm0, xmm1
+66 0f 38 1c c1       | - | - | pabsb xmm0, xmm1
+66 0f 38 1d c1       | - | - | pabsw xmm0, xmm1
+66 0f 38 1e c1       | - | - | pabsd xmm0, xmm1
+66 0f 3a 0f c1 05    | - | - | palignr xmm0, xmm1, 5
+66 0f 3a 0f c1 13    | - | - | palignr xmm0, xmm1, 19
+66 0f 38 10 d1       | - | - | pblendvb xmm2, xmm1  [xmm0 implicit]
+66 0f 38 14 d1       | - | - | blendvps xmm2, xmm1
+66 0f 38 15 d1       | - | - | blendvpd xmm2, xmm1
+# ptest / vtest*: OF is not compared. Intel's manual has it cleared (as the interpreter does);
+# the recording made under Rosetta 2 leaves it as it was.
+66 0f 38 17 c1       | paso | - | ptest xmm0, xmm1
+66 0f 38 17 c0       | paso | - | ptest xmm0, xmm0
+66 0f 38 20 c1       | - | - | pmovsxbw xmm0, xmm1
+66 0f 38 21 c1       | - | - | pmovsxbd xmm0, xmm1
+66 0f 38 22 c1       | - | - | pmovsxbq xmm0, xmm1
+66 0f 38 23 c1       | - | - | pmovsxwd xmm0, xmm1
+66 0f 38 24 c1       | - | - | pmovsxwq xmm0, xmm1
+66 0f 38 25 07       | - | - | pmovsxdq xmm0, [rdi]
+66 0f 38 30 c1       | - | - | pmovzxbw xmm0, xmm1
+66 0f 38 31 c1       | - | - | pmovzxbd xmm0, xmm1
+66 0f 38 32 07       | - | - | pmovzxbq xmm0, [rdi]
+66 0f 38 33 c1       | - | - | pmovzxwd xmm0, xmm1
+66 0f 38 34 c1       | - | - | pmovzxwq xmm0, xmm1
+66 0f 38 35 c1       | - | - | pmovzxdq xmm0, xmm1
+66 0f 38 28 c1       | - | - | pmuldq xmm0, xmm1
+66 0f 38 29 c1       | - | - | pcmpeqq xmm0, xmm1
+66 0f 38 2a 07       | - | - | movntdqa xmm0, [rdi]
+66 0f 38 2b c1       | - | - | packusdw xmm0, xmm1
+66 0f 38 37 c1       | - | - | pcmpgtq xmm0, xmm1
+66 0f 38 38 c1       | - | - | pminsb xmm0, xmm1
+66 0f 38 39 c1       | - | - | pminsd xmm0, xmm1
+66 0f 38 3a c1       | - | - | pminuw xmm0, xmm1
+66 0f 38 3b c1       | - | - | pminud xmm0, xmm1
+66 0f 38 3c c1       | - | - | pmaxsb xmm0, xmm1
+66 0f 38 3d c1       | - | - | pmaxsd xmm0, xmm1
+66 0f 38 3e c1       | - | - | pmaxuw xmm0, xmm1
+66 0f 38 3f c1       | - | - | pmaxud xmm0, xmm1
+66 0f 38 40 c1       | - | - | pmulld xmm0, xmm1
+66 0f 38 41 c1       | - | - | phminposuw xmm0, xmm1
+66 0f 3a 0c c1 05    | - | - | blendps xmm0, xmm1, 5
+66 0f 3a 0d c1 02    | - | - | blendpd xmm0, xmm1, 2
+66 0f 3a 0e c1 a5    | - | - | pblendw xmm0, xmm1, 0xa5
+66 0f 3a 14 c8 0b    | - | - | pextrb eax, xmm1, 11
+66 0f 3a 14 0f 03    | - | - | pextrb [rdi], xmm1, 3
+66 0f 3a 15 c8 06    | - | - | pextrw eax, xmm1, 6
+66 0f 3a 16 c8 02    | - | - | pextrd eax, xmm1, 2
+66 48 0f 3a 16 c8 01 | - | - | pextrq rax, xmm1, 1
+66 0f 3a 17 c8 03    | - | - | extractps eax, xmm1, 3
+66 0f 3a 20 c1 09    | - | - | pinsrb xmm0, ecx, 9
+66 0f 3a 22 c1 02    | - | - | pinsrd xmm0, ecx, 2
+66 48 0f 3a 22 c1 01 | - | - | pinsrq xmm0, rcx, 1
+66 0f 3a 21 c1 9a    | - | - | insertps xmm0, xmm1, 0x9a
+66 0f 3a 21 07 28    | - | - | insertps xmm0, [rdi], 0x28
+
+# --- AVX / AVX2 only
+c4 e2 6d 00 c1       | - | - | vpshufb ymm0, ymm2, ymm1
+c4 e2 6d 02 c1       | - | - | vphaddd ymm0, ymm2, ymm1
+c4 e2 6d 04 c1       | - | - | vpmaddubsw ymm0, ymm2, ymm1
+c4 e2 6d 0b c1       | - | - | vpmulhrsw ymm0, ymm2, ymm1
+c4 e2 7d 1e c1       | - | - | vpabsd ymm0, ymm1
+c4 e2 6d 2b c1       | - | - | vpackusdw ymm0, ymm2, ymm1
+c4 e2 6d 3d c1       | - | - | vpmaxsd ymm0, ymm2, ymm1
+c4 e2 6d 40 c1       | - | - | vpmulld ymm0, ymm2, ymm1
+c4 e2 6d 29 c1       | - | - | vpcmpeqq ymm0, ymm2, ymm1
+c4 e3 6d 0f c1 07    | - | - | vpalignr ymm0, ymm2, ymm1, 7
+c4 e3 6d 02 c1 a5    | - | - | vpblendd ymm0, ymm2, ymm1, 0xa5
+c4 e3 6d 0c c1 5a    | - | - | vblendps ymm0, ymm2, ymm1, 0x5a
+c4 e3 6d 0d c1 06    | - | - | vblendpd ymm0, ymm2, ymm1, 6
+c4 e3 6d 0e c1 a5    | - | - | vpblendw ymm0, ymm2, ymm1, 0xa5
+c4 e3 6d 4c c1 30    | - | - | vpblendvb ymm0, ymm2, ymm1, ymm3
+c4 e3 6d 4a c1 30    | - | - | vblendvps ymm0, ymm2, ymm1, ymm3
+c4 e3 6d 4b c1 30    | - | - | vblendvpd ymm0, ymm2, ymm1, ymm3
+c4 e2 7d 17 c1       | paso | - | vptest ymm0, ymm1
+c4 e2 7d 0e c1       | paso | - | vtestps ymm0, ymm1
+c4 e2 7d 0f c1       | paso | - | vtestpd ymm0, ymm1
+c4 e2 7d 20 c1       | - | - | vpmovsxbw ymm0, xmm1
+c4 e2 7d 22 c1       | - | - | vpmovsxbq ymm0, xmm1
+c4 e2 7d 35 c1       | - | - | vpmovzxdq ymm0, xmm1
+c4 e2 7d 31 07       | - | - | vpmovzxbd ymm0, [rdi]
+c4 e2 79 30 c1       | - | - | vpmovzxbw xmm0, xmm1
+c4 e2 7d 18 c1       | - | - | vbroadcastss ymm0, xmm1
+c4 e2 7d 18 07       | - | - | vbroadcastss ymm0, [rdi]
+c4 e2 79 18 c1       | - | - | vbroadcastss xmm0, xmm1
+c4 e2 7d 19 c1       | - | - | vbroadcastsd ymm0, xmm1
+c4 e2 7d 1a 07       | - | - | vbroadcastf128 ymm0, [rdi]
+c4 e2 7d 5a 07       | - | - | vbroadcasti128 ymm0, [rdi]
+c4 e2 7d 58 c1       | - | - | vpbroadcastd ymm0, xmm1
+c4 e2 7d 59 c1       | - | - | vpbroadcastq ymm0, xmm1
+c4 e2 7d 78 c1       | - | - | vpbroadcastb ymm0, xmm1
+c4 e2 7d 79 07       | - | - | vpbroadcastw ymm0, [rdi]
+c4 e2 6d 36 c1       | - | - | vpermd ymm0, ymm2, ymm1
+c4 e2 6d 16 c1       | - | - | vpermps ymm0, ymm2, ymm1
+c4 e3 fd 00 c1 1b    | - | - | vpermq ymm0, ymm1, 0x1b
+c4 e3 fd 01 c1 d8    | - | - | vpermpd ymm0, ymm1, 0xd8
+c4 e3 6d 06 c1 31    | - | - | vperm2f128 ymm0, ymm2, ymm1, 0x31
+c4 e3 6d 46 c1 82    | - | - | vperm2i128 ymm0, ymm2, ymm1, 0x82
+c4 e3 6d 18 c1 01    | - | - | vinsertf128 ymm0, ymm2, xmm1, 1
+c4 e3 6d 38 07 00    | - | - | vinserti128 ymm0, ymm2, [rdi], 0
+c4 e3 7d 19 c8 01    | - | - | vextractf128 xmm0, ymm1, 1
+c4 e3 7d 39 0f 01    | - | - | vextracti128 [rdi], ymm1, 1
+c4 e2 6d 0c c1       | - | - | vpermilps ymm0, ymm2, ymm1
+c4 e2 6d 0d c1       | - | - | vpermilpd ymm0, ymm2, ymm1
+c4 e3 7d 04 c1 1b    | - | - | vpermilps ymm0, ymm1, 0x1b
+c4 e3 7d 05 c1 06    | - | - | vpermilpd ymm0, ymm1, 6
+c4 e2 6d 45 c1       | - | - | vpsrlvd ymm0, ymm2, ymm1
+# the quadword forms with counts of 0..127: for a count with its top bit set the recording made
+# under Rosetta 2 shifts by the low bits, where the manual (and the interpreter) give zero
+c5 f5 73 d1 39 c4 e2 ed 45 c1 | - | - | vpsrlq ymm1, ymm1, 57; vpsrlvq ymm0, ymm2, ymm1
+c4 e2 6d 46 c1       | - | - | vpsravd ymm0, ymm2, ymm1
+c4 e2 6d 47 c1       | - | - | vpsllvd ymm0, ymm2, ymm1
+c5 f5 73 d1 39 c4 e2 ed 47 c1 | - | - | vpsrlq ymm1, ymm1, 57; vpsllvq ymm0, ymm2, ymm1
+c4 e2 6d 2c 07       | - | - | vmaskmovps ymm0, ymm2, [rdi]
+c4 e2 6d 2e 07       | - | - | vmaskmovps [rdi], ymm2, ymm0
+c4 e2 6d 8c 07       | - | - | vpmaskmovd ymm0, ymm2, [rdi]
+c4 e2 ed 8e 07       | - | - | vpmaskmovq [rdi], ymm2, ymm0
+c5 ff 12 c1          | - | - | vmovddup ymm0, ymm1
+c5 fe 16 c1          | - | - | vmovshdup ymm0, ymm1
+c5 fe e6 c1          | - | - | vcvtdq2pd ymm0, xmm1
+
+# --- floating point on exact values (integers converted first, so no rounding and no NaN)
+0f 5b c0 0f 5b c9 0f 58 c1                   | - | - | cvtdq2ps x2; addps xmm0, xmm1
+0f 5b c0 0f 5b c9 0f 5c c1                   | - | - | cvtdq2ps x2; subps xmm0, xmm1
+0f 5b c0 0f 5b c9 0f 5d c1                   | - | - | cvtdq2ps x2; minps xmm0, xmm1
+0f 5b c0 0f 5b c9 0f 5f c1                   | - | - | cvtdq2ps x2; maxps xmm0, xmm1
+0f 5b c0 0f 5b c9 0f c2 c1 01                | - | - | cvtdq2ps x2; cmpltps xmm0, xmm1
+0f 5b c0 0f 5b c9 0f c2 c1 06                | - | - | cvtdq2ps x2; cmpnleps xmm0, xmm1
+0f 5b c0 0f 5b c9 0f 2e c1                   | - | - | cvtdq2ps x2; ucomiss xmm0, xmm1
+f2 48 0f 2a c0 f2 48 0f 2a c9 f2 0f 58 c1    | - | - | cvtsi2sd rax, rcx; addsd xmm0, xmm1
+f2 48 0f 2a c0 f2 48 0f 2a c9 f2 0f 59 c1    | - | - | cvtsi2sd rax, rcx; mulsd xmm0, xmm1
+f2 48 0f 2a c0 f2 48 0f 2a c9 f2 0f 5e c1    | - | rcx=3 | cvtsi2sd rax, rcx; divsd xmm0, xmm1
+f2 48 0f 2a c0 f2 48 0f 2a c9 66 0f 2f c1    | - | - | cvtsi2sd rax, rcx; comisd xmm0, xmm1
+f2 0f 2a c0 f2 0f 51 c0                      | - | rax=90000 | cvtsi2sd eax; sqrtsd xmm0, xmm0
+f2 48 0f 2a c0 f2 48 0f 2c c8                | - | - | cvtsi2sd rax; cvttsd2si rcx, xmm0
+f2 0f 2a c0 f2 0f 5a c0 f3 0f 5a c8          | - | - | cvtsi2sd eax; cvtsd2ss; cvtss2sd xmm1, xmm0
+f2 0f 2a c0 f2 0f 2a c9 f2 0f 5e c1 66 0f 3a 0b c0 01 | - | rcx=7 | divsd; roundsd xmm0, xmm0, floor
+f2 0f 2a c0 f2 0f 2a c9 f2 0f 5e c1 66 0f 3a 0b c0 02 | - | rcx=7 | divsd; roundsd xmm0, xmm0, ceil
+f2 0f 2a c0 f2 0f 2a c9 f2 0f 5e c1 66 0f 3a 0b c0 00 | - | rcx=2 | divsd; roundsd xmm0, xmm0, nearest
+f2 0f 2a c0 f2 0f 2a c9 f2 0f 5e c1 f2 0f 2d c0       | - | rcx=2 | divsd; cvtsd2si eax, xmm0
+0f 5b c0 0f 5b c9 66 0f 3a 40 c1 f1          | - | - | cvtdq2ps x2; dpps xmm0, xmm1, 0xf1
+c5 fc 5b c0 c5 fc 5b c9 c5 fc 5b d2 c4 e2 6d b8 c1 | - | - | vcvtdq2ps x3; vfmadd231ps ymm0, ymm2, ymm1
+c5 fc 5b c0 c5 fc 5b c9 c5 fc 5b d2 c4 e2 6d 98 c1 | - | - | vcvtdq2ps x3; vfmadd132ps ymm0, ymm2, ymm1
+c5 fc 5b c0 c5 fc 5b c9 c5 fc 5b d2 c4 e2 6d aa c1 | - | - | vcvtdq2ps x3; vfmsub213ps ymm0, ymm2, ymm1
+c5 fc 5b c0 c5 fc 5b c9 c5 fc 5b d2 c4 e2 6d ac c1 | - | - | vcvtdq2ps x3; vfnmadd213ps ymm0, ymm2, ymm1
+c5 fc 5b c0 c5 fc 5b c9 c5 fc 5b d2 c4 e2 6d a6 c1 | - | - | vcvtdq2ps x3; vfmaddsub213ps ymm0, ymm2, ymm1
+c5 fc 5b c0 c5 fc 5b c9 c5 fc 5b d2 c4 e2 69 b9 c1 | - | - | vcvtdq2ps x3; vfmadd231ss xmm0, xmm2, xmm1
+c5 fc 5b c9 c5 fc 5a c1                      | - | - | vcvtdq2ps ymm1; vcvtps2pd ymm0, xmm1
+c5 fe e6 c9 c5 fd 5a c1                      | - | - | vcvtdq2pd ymm1; vcvtpd2ps xmm0, ymm1
+c5 fe e6 c9 c5 fd e6 c1                      | - | - | vcvtdq2pd ymm1; vcvttpd2dq xmm0, ymm1
+c5 fc 5b c9 c4 e3 7d 1d c8 00 c4 e2 7d 13 c0 | - | - | vcvtdq2ps; vcvtps2ph xmm0, ymm1; vcvtph2ps ymm0, xmm0
+c5 fc 5b c0 c5 fc 5b c9 c5 fc 58 c1          | - | - | vcvtdq2ps x2; vaddps ymm0, ymm0, ymm1
+c5 fc 5b c0 c5 fc 5b c9 c5 fc 59 c1          | - | - | vcvtdq2ps x2; vmulps ymm0, ymm0, ymm1

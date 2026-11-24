@@ -3,6 +3,141 @@
 
 use crate::cpu::*;
 use crate::exec::{mask, sign_bit, Ctx, Rm, R};
+use crate::sse::{from_pd, from_ps, lanes, pd, ps, saturate_s, saturate_u, shift_lanes, sxl, LOW32, LOW64};
+
+/// Run `kernel` (one instruction on 128-bit operands) on the lower halves and, for a 256-bit
+/// instruction, again on the upper ones: it decodes its operands itself, so the instruction's
+/// bytes are read a second time.
+fn per_half(c: &mut Ctx, kernel: impl Fn(&mut Ctx) -> R<bool>) -> R<bool> {
+    let start = c.pc;
+    if !kernel(c)? {
+        return Ok(false);
+    }
+    if c.l {
+        c.pc = start;
+        c.half = 1;
+        kernel(c)?;
+        c.half = 0;
+    }
+    Ok(true)
+}
+
+impl Ctx<'_> {
+    /// All 256 bits of a vector register, as its two halves.
+    fn y(&self, r: u8) -> [u128; 2] {
+        let v = &self.cpu.v[r as usize];
+        [v[0] as u128 | (v[1] as u128) << 64, v[2] as u128 | (v[3] as u128) << 64]
+    }
+
+    /// Write a vector register whole; a 128-bit VEX result has a zero upper half.
+    fn set_y(&mut self, r: u8, v: [u128; 2]) {
+        self.cpu.v[r as usize] = [v[0] as u64, (v[0] >> 64) as u64, v[1] as u64, (v[1] >> 64) as u64];
+    }
+
+    /// A whole register or 32 bytes of memory.
+    fn rd_y(&self, rm: Rm) -> R<[u128; 2]> {
+        Ok(match rm {
+            Rm::Reg(r) => self.y(r),
+            _ => {
+                let a = self.ea(rm);
+                [u128::from_le_bytes(self.mem.read_n(a)?), u128::from_le_bytes(self.mem.read_n(a + 16)?)]
+            }
+        })
+    }
+
+    /// The low `bytes` of a register or that many bytes of memory, whatever half is worked on.
+    fn rd_low(&self, rm: Rm, bytes: u8) -> R<u128> {
+        Ok(match rm {
+            Rm::Reg(r) => self.y(r)[0],
+            _ => {
+                let a = self.ea(rm);
+                match bytes {
+                    1 => self.mem.read_u8(a)? as u128,
+                    2 => self.mem.read_u16(a)? as u128,
+                    4 => self.mem.read_u32(a)? as u128,
+                    8 => self.mem.read_u64(a)? as u128,
+                    _ => u128::from_le_bytes(self.mem.read_n(a)?),
+                }
+            }
+        })
+    }
+}
+
+/// Element `i` (of `w` bytes) of a vector held as bytes.
+fn element(v: &[u8], i: usize, w: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b[..w].copy_from_slice(&v[i * w..(i + 1) * w]);
+    u64::from_le_bytes(b)
+}
+
+fn bytes_of(v: [u128; 2]) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[..16].copy_from_slice(&v[0].to_le_bytes());
+    b[16..].copy_from_slice(&v[1].to_le_bytes());
+    b
+}
+
+fn halves_of(b: &[u8; 32]) -> [u128; 2] {
+    [u128::from_le_bytes(b[..16].try_into().unwrap()), u128::from_le_bytes(b[16..].try_into().unwrap())]
+}
+
+/// Half-precision → single.
+fn f16_to_f32(h: u16) -> f32 {
+    let (sign, exp, frac) = ((h >> 15) as u32, ((h >> 10) & 0x1F) as u32, (h & 0x3FF) as u32);
+    let bits = match exp {
+        0 if frac == 0 => 0,
+        0 => {
+            // subnormal: normalise
+            let shift = frac.leading_zeros() - 21;
+            ((113 - shift) << 23) | ((frac << shift) & 0x3FF) << 13
+        }
+        31 => 0x7F80_0000 | frac << 13 | if frac != 0 { 0x40_0000 } else { 0 },
+        _ => (exp + 112) << 23 | frac << 13,
+    };
+    f32::from_bits(sign << 31 | bits)
+}
+
+/// Single → half-precision, round to nearest even.
+fn f32_to_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x7F_FFFF;
+    if exp == 255 {
+        return sign | 0x7C00 | if frac != 0 { 0x200 | (frac >> 13) as u16 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 31 {
+        return sign | 0x7C00;
+    }
+    // the significand with its leading one, shifted to 10 fraction bits (more for subnormals)
+    let (m, shift) = if e <= 0 { (frac | 0x80_0000, 14 - e) } else { (frac, 13) };
+    if shift > 24 {
+        return sign;
+    }
+    let half = 1u32 << (shift - 1);
+    let rounded = (m >> shift) + ((m & half != 0 && (m & (half - 1) != 0 || (m >> shift) & 1 != 0)) as u32);
+    sign | ((e.max(0) as u16) << 10).wrapping_add(rounded as u16)
+}
+
+/// Round as ROUNDPS / ROUNDSD's immediate says (bit 2: the current mode, which is nearest).
+fn round_f64(x: f64, mode: u8) -> f64 {
+    match if mode & 4 != 0 { 0 } else { mode & 3 } {
+        0 => x.round_ties_even(),
+        1 => x.floor(),
+        2 => x.ceil(),
+        _ => x.trunc(),
+    }
+}
+
+fn round_f32(x: f32, mode: u8) -> f32 {
+    match if mode & 4 != 0 { 0 } else { mode & 3 } {
+        0 => x.round_ties_even(),
+        1 => x.floor(),
+        2 => x.ceil(),
+        _ => x.trunc(),
+    }
+}
 
 /// Scalar instructions of map 0F: they work on the low element whatever the vector length says.
 fn is_scalar(c: &Ctx, op: u8) -> bool {
@@ -41,6 +176,36 @@ fn map_0f(c: &mut Ctx, op: u8) -> R<bool> {
     if is_scalar(c, op) {
         c.l = false;
     }
+    // conversions between four doubles and four singles / dwords: one side is 128 bits wide
+    if c.l && (op == 0x5A && c.rep == 0 || op == 0xE6) {
+        let (reg, rm) = c.modrm()?;
+        let out = match (op, c.opsz16, c.rep) {
+            // vcvtps2pd ymm, xmm/m128
+            (0x5A, false, _) => {
+                let x = ps(c.rd_low(rm, 16)?);
+                [from_pd([x[0] as f64, x[1] as f64]), from_pd([x[2] as f64, x[3] as f64])]
+            }
+            // vcvtdq2pd ymm, xmm/m128
+            (0xE6, _, 0xF3) => {
+                let b = c.rd_low(rm, 16)?;
+                let d = |i: u32| (b >> (32 * i)) as u32 as i32 as f64;
+                [from_pd([d(0), d(1)]), from_pd([d(2), d(3)])]
+            }
+            // vcvtpd2ps / vcvtpd2dq / vcvttpd2dq xmm, ymm/m256
+            _ => {
+                let y = c.rd_y(rm)?;
+                let x = [pd(y[0])[0], pd(y[0])[1], pd(y[1])[0], pd(y[1])[1]];
+                let lo = if op == 0x5A {
+                    from_ps(x.map(|v| v as f32))
+                } else {
+                    x.iter().enumerate().fold(0u128, |r, (i, &v)| r | (crate::sse::f64_to_i32(v, c.opsz16) as u128) << (32 * i))
+                };
+                [lo, 0]
+            }
+        };
+        c.set_y(reg, out);
+        return Ok(true);
+    }
     let start = c.pc;
     if !crate::sse::exec(c, op)? {
         return Ok(false);
@@ -63,7 +228,298 @@ fn bmi_flags(c: &mut Ctx, r: u64, sz: u8, carry: bool) {
     c.cpu.set_flag(SF, r & sign_bit(sz) != 0);
 }
 
+/// The instructions of map 0F 38 that work lane by lane: one 128-bit half.
+fn lanewise_38(c: &mut Ctx, op: u8) -> R<bool> {
+    let w = c.rex & 8 != 0;
+    let (reg, rm) = c.modrm()?;
+    let b = c.rd_x(rm, 16)?;
+    let a = c.src1(reg);
+    let byte = |v: u128, i: u32| (v >> (8 * i)) as u8;
+    let word = |v: u128, i: u32| (v >> (16 * i)) as u16 as i16 as i64;
+    let dword = |v: u128, i: u32| (v >> (32 * i)) as u32 as i32 as i64;
+    let v: u128 = match op {
+        // pshufb
+        0x00 => (0..16).fold(0, |r, i| r | if byte(b, i) & 0x80 != 0 { 0 } else { (byte(a, (byte(b, i) & 15) as u32) as u128) << (8 * i) }),
+        // phaddw phaddd phaddsw / phsubw phsubd phsubsw: pairs of a, then pairs of b
+        0x01..=0x03 | 0x05..=0x07 => {
+            let sub = op >= 5;
+            let (bytes, n) = if op & 3 == 2 { (4, 2) } else { (2, 4) };
+            (0..2 * n).fold(0, |r, i| {
+                let src = if i < n { a } else { b };
+                let k = 2 * (i % n);
+                let (x, y) = if bytes == 2 { (word(src, k), word(src, k + 1)) } else { (dword(src, k), dword(src, k + 1)) };
+                let t = if sub { x - y } else { x + y };
+                let t = if op & 3 == 3 { saturate_s(t, 2) } else { t as u64 };
+                let m = if bytes == 2 { 0xFFFF } else { 0xFFFF_FFFF };
+                r | ((t & m) as u128) << (8 * bytes * i)
+            })
+        }
+        // pmaddubsw: unsigned bytes of a × signed bytes of b, neighbours added with saturation
+        0x04 => (0..8).fold(0, |r, i| {
+            let p = |k: u32| byte(a, k) as i64 * byte(b, k) as i8 as i64;
+            r | ((saturate_s(p(2 * i) + p(2 * i + 1), 2) & 0xFFFF) as u128) << (16 * i)
+        }),
+        // psignb / w / d
+        0x08..=0x0A => {
+            let w = 1 << (op - 8);
+            lanes(a, b, w, |x, y| match sxl(y, w) {
+                0 => 0,
+                s if s < 0 => x.wrapping_neg(),
+                _ => x,
+            })
+        }
+        // pmulhrsw
+        0x0B => lanes(a, b, 2, |x, y| ((((sxl(x, 2) * sxl(y, 2)) >> 14) + 1) >> 1) as u64),
+        // vpermilps / vpermilpd by a control vector
+        0x0C if c.vex => (0..4).fold(0, |r, i| r | ((a >> (32 * ((b >> (32 * i)) as u32 & 3))) & LOW32) << (32 * i)),
+        0x0D if c.vex => (0..2).fold(0, |r, i| r | ((a >> (64 * ((b >> (64 * i + 1)) as u32 & 1))) & LOW64) << (64 * i)),
+        // pabsb / w / d
+        0x1C..=0x1E => {
+            let w = 1 << (op - 0x1C);
+            lanes(b, 0, w, |x, _| sxl(x, w).unsigned_abs())
+        }
+        // pmuldq
+        0x28 => lanes(a, b, 8, |x, y| (x as u32 as i32 as i64).wrapping_mul(y as u32 as i32 as i64) as u64),
+        0x29 => lanes(a, b, 8, |x, y| if x == y { !0 } else { 0 }),
+        // movntdqa
+        0x2A => b,
+        // packusdw
+        0x2B => (0..8).fold(0, |r, i| {
+            let v = dword(if i < 4 { a } else { b }, i % 4);
+            r | ((saturate_u(v, 2) & 0xFFFF) as u128) << (16 * i)
+        }),
+        0x37 => lanes(a, b, 8, |x, y| if (x as i64) > (y as i64) { !0 } else { 0 }),
+        // pminsb pminsd pminuw pminud pmaxsb pmaxsd pmaxuw pmaxud
+        0x38..=0x3F => {
+            let (w, signed) = match op & 3 {
+                0 => (1, true),
+                1 => (4, true),
+                2 => (2, false),
+                _ => (4, false),
+            };
+            let max = op >= 0x3C;
+            lanes(a, b, w, |x, y| {
+                let first = if signed { sxl(x, w) < sxl(y, w) } else { x < y };
+                if first != max {
+                    x
+                } else {
+                    y
+                }
+            })
+        }
+        0x40 => lanes(a, b, 4, u64::wrapping_mul),
+        // vpsrlvd/q, vpsravd, vpsllvd/q: every element by its own count
+        0x45..=0x47 if c.vex => {
+            let bytes = if w { 8 } else { 4 };
+            let kind = [1, 2, 0][(op - 0x45) as usize];
+            lanes(a, b, bytes, |x, n| shift_lanes(x as u128, bytes, n, kind) as u64)
+        }
+        // FMA: 132 / 213 / 231 forms of fmaddsub fmsubadd fmadd fmsub fnmadd fnmsub
+        0x96..=0x9F | 0xA6..=0xAF | 0xB6..=0xBF if c.vex => {
+            let dst = c.x(reg);
+            // (multiplicand, multiplier, addend)
+            let (x, y, z) = match op >> 4 {
+                9 => (dst, b, a),
+                0xA => (a, dst, b),
+                _ => (a, b, dst),
+            };
+            let kind = op & 0xF;
+            let scalar = kind >= 9 && kind & 1 == 1;
+            // per element: negate the product? subtract the addend?
+            let signs = |i: usize| match kind {
+                6 => (false, i % 2 == 0),
+                7 => (false, i % 2 == 1),
+                8 | 9 => (false, false),
+                0xA | 0xB => (false, true),
+                0xC | 0xD => (true, false),
+                _ => (true, true),
+            };
+            let r = if w {
+                let (x, y, z) = (pd(x), pd(y), pd(z));
+                from_pd(std::array::from_fn(|i| {
+                    let (np, nz) = signs(i);
+                    (if np { -x[i] } else { x[i] }).mul_add(y[i], if nz { -z[i] } else { z[i] })
+                }))
+            } else {
+                let (x, y, z) = (ps(x), ps(y), ps(z));
+                from_ps(std::array::from_fn(|i| {
+                    let (np, nz) = signs(i);
+                    (if np { -x[i] } else { x[i] }).mul_add(y[i], if nz { -z[i] } else { z[i] })
+                }))
+            };
+            if scalar {
+                let keep = if w { LOW64 } else { LOW32 };
+                (dst & !keep) | (r & keep)
+            } else {
+                r
+            }
+        }
+        _ => return Ok(false),
+    };
+    c.set_x(reg, v);
+    Ok(true)
+}
+
+/// pmovsx / pmovzx: the low elements of the source, widened to fill the destination.
+fn widen(c: &mut Ctx, op: u8) -> R<bool> {
+    let (from, to): (usize, usize) = match op & 7 {
+        0 => (1, 2),
+        1 => (1, 4),
+        2 => (1, 8),
+        3 => (2, 4),
+        4 => (2, 8),
+        5 => (4, 8),
+        _ => return Ok(false),
+    };
+    let signed = op < 0x30;
+    let (reg, rm) = c.modrm()?;
+    let total = if c.l { 32 } else { 16 };
+    let n = total / to;
+    let src = c.rd_low(rm, (n * from) as u8)?.to_le_bytes();
+    let mut out = [0u8; 32];
+    for i in 0..n {
+        let v = element(&src, i, from);
+        let v = if signed { sxl(v, from as u32) as u64 } else { v };
+        out[i * to..(i + 1) * to].copy_from_slice(&v.to_le_bytes()[..to]);
+    }
+    let out = halves_of(&out);
+    if c.vex {
+        c.set_y(reg, out);
+    } else {
+        c.set_x(reg, out[0]);
+    }
+    Ok(true)
+}
+
 fn map_0f38(c: &mut Ctx, op: u8) -> R<bool> {
+    let vector = c.opsz16 && c.rep == 0;
+    match op {
+        0x00..=0x0D | 0x1C..=0x1E | 0x28..=0x2B | 0x37..=0x40 | 0x45..=0x47 | 0x96..=0x9F | 0xA6..=0xAF | 0xB6..=0xBF if vector => {
+            // a scalar FMA form works on the low element only
+            if op >= 0x96 && op & 0xF >= 9 && op & 1 == 1 {
+                c.l = false;
+            }
+            return per_half(c, |c| lanewise_38(c, op));
+        }
+        0x20..=0x25 | 0x30..=0x35 if vector => return widen(c, op),
+        // pblendvb / blendvps / blendvpd: by the sign bits of XMM0's elements
+        0x10 | 0x14 | 0x15 if vector && !c.vex => {
+            let (reg, rm) = c.modrm()?;
+            let b = c.rd_x(rm, 16)?;
+            let (a, m) = (c.x(reg), c.x(0));
+            let w = match op {
+                0x10 => 1,
+                0x14 => 4,
+                _ => 8,
+            };
+            let v = lanes(m, 0, w, |x, _| if sxl(x, w) < 0 { !0 } else { 0 });
+            c.set_x(reg, (a & !v) | (b & v));
+            return Ok(true);
+        }
+        // ptest, vtestps, vtestpd: ZF = no common bits, CF = nothing of b outside a
+        0x17 | 0x0E | 0x0F if vector => {
+            let (reg, rm) = c.modrm()?;
+            let (a, b) = if c.l { (c.y(reg), c.rd_y(rm)?) } else { ([c.x(reg), 0], [c.rd_x(rm, 16)?, 0]) };
+            let signs = match op {
+                0x0E => lanes(!0, 0, 4, |_, _| 0x8000_0000),
+                0x0F => lanes(!0, 0, 8, |_, _| 1 << 63),
+                _ => !0,
+            };
+            let zf = (0..2).all(|i| a[i] & b[i] & signs == 0);
+            let cf = (0..2).all(|i| !a[i] & b[i] & signs == 0);
+            c.cpu.rflags &= !(CF | ZF | SF | OF | PF | AF);
+            c.cpu.set_flag(ZF, zf);
+            c.cpu.set_flag(CF, cf);
+            return Ok(true);
+        }
+        // vcvtph2ps
+        0x13 if vector && c.vex => {
+            let (reg, rm) = c.modrm()?;
+            let src = c.rd_low(rm, if c.l { 16 } else { 8 })?;
+            let f = |i: u32| f16_to_f32((src >> (16 * i)) as u16);
+            let out = [from_ps([f(0), f(1), f(2), f(3)]), if c.l { from_ps([f(4), f(5), f(6), f(7)]) } else { 0 }];
+            c.set_y(reg, out);
+            return Ok(true);
+        }
+        // vpermps / vpermd ymm, ymm (indexes), ymm/m256
+        0x16 | 0x36 if vector && c.vex && c.l => {
+            let (reg, rm) = c.modrm()?;
+            let src = bytes_of(c.rd_y(rm)?);
+            let index = bytes_of(c.y(c.vvvv));
+            let mut out = [0u8; 32];
+            for i in 0..8 {
+                let k = element(&index, i, 4) as usize & 7;
+                out[4 * i..4 * i + 4].copy_from_slice(&src[4 * k..4 * k + 4]);
+            }
+            c.set_y(reg, halves_of(&out));
+            return Ok(true);
+        }
+        // broadcasts: vbroadcastss / sd / f128 / i128, vpbroadcastb / w / d / q
+        0x18 | 0x19 | 0x1A | 0x5A | 0x58 | 0x59 | 0x78 | 0x79 if vector && c.vex => {
+            let w: usize = match op {
+                0x18 | 0x58 => 4,
+                0x19 | 0x59 => 8,
+                0x1A | 0x5A => 16,
+                0x78 => 1,
+                _ => 2,
+            };
+            let (reg, rm) = c.modrm()?;
+            let src = c.rd_low(rm, w as u8)?.to_le_bytes();
+            let mut out = [0u8; 32];
+            for chunk in out[..if c.l { 32 } else { 16 }].chunks_mut(w) {
+                chunk.copy_from_slice(&src[..w]);
+            }
+            c.set_y(reg, halves_of(&out));
+            return Ok(true);
+        }
+        // vmaskmovps / pd, vpmaskmovd / q: load (2C 2D 8C) or store (2E 2F 8E) the elements
+        // whose mask element (in vvvv) has its sign bit set
+        0x2C..=0x2F | 0x8C | 0x8E if vector && c.vex => {
+            let w: usize = match op {
+                0x2C | 0x2E => 4,
+                0x2D | 0x2F => 8,
+                _ => {
+                    if c.rex & 8 != 0 {
+                        8
+                    } else {
+                        4
+                    }
+                }
+            };
+            let store = matches!(op, 0x2E | 0x2F | 0x8E);
+            let (reg, rm) = c.modrm()?;
+            if matches!(rm, Rm::Reg(_)) {
+                return Ok(false);
+            }
+            let at = c.ea(rm);
+            let mask = bytes_of(c.y(c.vvvv));
+            let mut reg_bytes = if store { bytes_of(c.y(reg)) } else { [0u8; 32] };
+            for i in 0..if c.l { 32 } else { 16 } / w {
+                if mask[i * w + w - 1] & 0x80 == 0 {
+                    continue;
+                }
+                let a = at + (i * w) as u64;
+                if store {
+                    c.mem.write(a, &reg_bytes[i * w..(i + 1) * w])?;
+                } else {
+                    c.mem.read(a, &mut reg_bytes[i * w..(i + 1) * w])?;
+                }
+            }
+            if !store {
+                c.set_y(reg, halves_of(&reg_bytes));
+            }
+            return Ok(true);
+        }
+        // phminposuw
+        0x41 if vector && !c.l => {
+            let (reg, rm) = c.modrm()?;
+            let b = c.rd_x(rm, 16)?;
+            let (value, index) = (0..8).map(|i| ((b >> (16 * i)) as u16, i)).min().unwrap();
+            c.set_x(reg, value as u128 | (index as u128) << 16);
+            return Ok(true);
+        }
+        _ => {}
+    }
     let sz = if c.rex & 8 != 0 { 8 } else { 4 };
     let m = mask(sz);
     let bits = sz as u64 * 8;
@@ -193,10 +649,184 @@ fn map_0f38(c: &mut Ctx, op: u8) -> R<bool> {
     Ok(true)
 }
 
+/// The instructions of map 0F 3A that work lane by lane (an 8-bit immediate follows).
+fn lanewise_3a(c: &mut Ctx, op: u8) -> R<bool> {
+    let (reg, rm) = c.modrm()?;
+    let imm = c.fetch8()?;
+    let b = c.rd_x(rm, 16)?;
+    let a = c.src1(reg);
+    let half = c.half as u32;
+    // select elements of b where the mask (one bit per element of `w` bytes) says so
+    let blend = |mask: u32, w: u32| (0..16 / w).fold(0u128, |r, i| {
+        let m: u128 = if w == 8 { LOW64 } else if w == 4 { LOW32 } else { 0xFFFF };
+        let src = if mask >> i & 1 != 0 { b } else { a };
+        r | ((src >> (8 * w * i)) & m) << (8 * w * i)
+    });
+    let v: u128 = match op {
+        // vpblendd: 8 mask bits for the 8 dwords of a YMM; blendps likewise; blendpd 4 for 4
+        0x02 if c.vex => blend(imm as u32 >> (4 * half), 4),
+        0x0C => blend(imm as u32 >> (4 * half), 4),
+        0x0D => blend(imm as u32 >> (2 * half), 8),
+        // pblendw: the same 8 bits for both halves
+        0x0E => blend(imm as u32, 2),
+        // vpermilps / vpermilpd by an immediate
+        0x04 if c.vex => (0..4).fold(0, |r, i| r | ((b >> (32 * ((imm >> (2 * i)) as u32 & 3))) & LOW32) << (32 * i)),
+        0x05 if c.vex => (0..2).fold(0, |r, i| r | ((b >> (64 * ((imm as u32 >> (i + 2 * half)) & 1))) & LOW64) << (64 * i)),
+        // roundps / roundpd
+        0x08 => from_ps(ps(b).map(|x| round_f32(x, imm))),
+        0x09 => from_pd(pd(b).map(|x| round_f64(x, imm))),
+        // roundss / roundsd: the low element of b, the rest of a
+        0x0A => (a & !LOW32) | round_f32(f32::from_bits(b as u32), imm).to_bits() as u128,
+        0x0B => (a & !LOW64) | round_f64(f64::from_bits(b as u64), imm).to_bits() as u128,
+        // palignr: the bytes of a:b from byte `imm` on
+        0x0F => {
+            let n = imm as u32;
+            match n {
+                0 => b,
+                1..=15 => b >> (8 * n) | a << (8 * (16 - n)),
+                16 => a,
+                17..=31 => a >> (8 * (n - 16)),
+                _ => 0,
+            }
+        }
+        // dpps: the products the high nibble selects, summed into the elements the low one names
+        0x40 => {
+            let (x, y) = (ps(a), ps(b));
+            let p: [f32; 4] = std::array::from_fn(|i| if imm >> (4 + i) & 1 != 0 { x[i] * y[i] } else { 0.0 });
+            let sum = (p[0] + p[1]) + (p[2] + p[3]);
+            from_ps(std::array::from_fn(|i| if imm >> i & 1 != 0 { sum } else { 0.0 }))
+        }
+        0x41 => {
+            let (x, y) = (pd(a), pd(b));
+            let p: [f64; 2] = std::array::from_fn(|i| if imm >> (4 + i) & 1 != 0 { x[i] * y[i] } else { 0.0 });
+            let sum = p[0] + p[1];
+            from_pd(std::array::from_fn(|i| if imm >> i & 1 != 0 { sum } else { 0.0 }))
+        }
+        // vblendvps / vblendvpd / vpblendvb: by the sign bits of a fourth register
+        0x4A..=0x4C if c.vex => {
+            let w = [4, 8, 1][(op - 0x4A) as usize];
+            let m = lanes(c.x(imm >> 4), 0, w, |x, _| if sxl(x, w) < 0 { !0 } else { 0 });
+            (a & !m) | (b & m)
+        }
+        _ => return Ok(false),
+    };
+    c.set_x(reg, v);
+    Ok(true)
+}
+
 fn map_0f3a(c: &mut Ctx, op: u8) -> R<bool> {
-    match (op, c.vex) {
+    let vector = c.opsz16 && c.rep == 0;
+    match op {
+        0x02 | 0x04 | 0x05 | 0x08..=0x0F | 0x40 | 0x41 | 0x4A..=0x4C if vector => {
+            if matches!(op, 0x0A | 0x0B) {
+                c.l = false;
+            }
+            return per_half(c, |c| lanewise_3a(c, op));
+        }
+        // vpermq / vpermpd ymm, ymm/m256, imm8
+        0x00 | 0x01 if vector && c.vex && c.l => {
+            let (reg, rm) = c.modrm()?;
+            let imm = c.fetch8()? as usize;
+            let src = bytes_of(c.rd_y(rm)?);
+            let mut out = [0u8; 32];
+            for i in 0..4 {
+                let k = (imm >> (2 * i)) & 3;
+                out[8 * i..8 * i + 8].copy_from_slice(&src[8 * k..8 * k + 8]);
+            }
+            c.set_y(reg, halves_of(&out));
+        }
+        // vperm2f128 / vperm2i128: each half of the result is a half of either source, or zero
+        0x06 | 0x46 if vector && c.vex && c.l => {
+            let (reg, rm) = c.modrm()?;
+            let imm = c.fetch8()?;
+            let (a, b) = (c.y(c.vvvv), c.rd_y(rm)?);
+            let pick = |sel: u8| if sel & 8 != 0 { 0 } else { [a[0], a[1], b[0], b[1]][(sel & 3) as usize] };
+            c.set_y(reg, [pick(imm), pick(imm >> 4)]);
+        }
+        // vinsertf128 / vinserti128 ymm, ymm, xmm/m128, imm8
+        0x18 | 0x38 if vector && c.vex && c.l => {
+            let (reg, rm) = c.modrm()?;
+            let imm = c.fetch8()?;
+            let b = c.rd_low(rm, 16)?;
+            let mut out = c.y(c.vvvv);
+            out[(imm & 1) as usize] = b;
+            c.set_y(reg, out);
+        }
+        // vextractf128 / vextracti128 xmm/m128, ymm, imm8
+        0x19 | 0x39 if vector && c.vex && c.l => {
+            let (reg, rm) = c.modrm()?;
+            let imm = c.fetch8()?;
+            let v = c.y(reg)[(imm & 1) as usize];
+            match rm {
+                Rm::Reg(r) => c.set_y(r, [v, 0]),
+                _ => c.mem.write(c.ea(rm), &v.to_le_bytes())?,
+            }
+        }
+        // pextrb / pextrw / pextrd / pextrq, extractps: an element to a register or memory
+        0x14..=0x17 if vector && !c.l => {
+            let (reg, rm) = c.modrm()?;
+            let imm = c.fetch8()? as u32;
+            let (w, sz): (u32, u8) = match op {
+                0x14 => (1, 1),
+                0x15 => (2, 2),
+                0x16 if c.rex & 8 != 0 => (8, 8),
+                _ => (4, 4),
+            };
+            let v = (c.x(reg) >> (8 * w * (imm % (16 / w)))) as u64 & mask(sz);
+            match rm {
+                // a register gets the element zero-extended
+                Rm::Reg(r) => c.sreg(r, 8, v),
+                _ => c.wr_rm(rm, sz, v)?,
+            }
+        }
+        // pinsrb / pinsrd / pinsrq
+        0x20 | 0x22 if vector && !c.l => {
+            let (reg, rm) = c.modrm()?;
+            let imm = c.fetch8()? as u32;
+            let (w, sz): (u32, u8) = match op {
+                0x20 => (1, 1),
+                _ if c.rex & 8 != 0 => (8, 8),
+                _ => (4, 4),
+            };
+            let v = c.rd_rm(rm, sz)? as u128;
+            let shift = 8 * w * (imm % (16 / w));
+            let m = (mask(sz) as u128) << shift;
+            let out = (c.src1(reg) & !m) | v << shift;
+            c.set_x(reg, out);
+        }
+        // insertps: one element of the source into one of the destination, then zero some
+        0x21 if vector && !c.l => {
+            let (reg, rm) = c.modrm()?;
+            let imm = c.fetch8()? as u32;
+            let element = match rm {
+                Rm::Reg(r) => (c.x(r) >> (32 * (imm >> 6))) & LOW32,
+                _ => c.rd_x(rm, 4)?,
+            };
+            let shift = 32 * ((imm >> 4) & 3);
+            let mut out = (c.src1(reg) & !(LOW32 << shift)) | element << shift;
+            for i in (0..4).filter(|i| imm >> i & 1 != 0) {
+                out &= !(LOW32 << (32 * i));
+            }
+            c.set_x(reg, out);
+        }
+        // vcvtps2ph xmm/m, xmm/ymm, imm8 (rounding: nearest)
+        0x1D if vector && c.vex => {
+            let (reg, rm) = c.modrm()?;
+            c.fetch8()?;
+            let src = c.y(reg);
+            let n = if c.l { 8 } else { 4 };
+            let mut out = 0u128;
+            for i in 0..n {
+                let x = ps(src[i / 4])[i % 4];
+                out |= (f32_to_f16(x) as u128) << (16 * i);
+            }
+            match rm {
+                Rm::Reg(r) => c.set_y(r, [out, 0]),
+                _ => c.mem.write(c.ea(rm), &out.to_le_bytes()[..2 * n])?,
+            }
+        }
         // rorx r, r/m, imm8
-        (0xF0, true) if c.rep == 0xF2 => {
+        0xF0 if c.vex && c.rep == 0xF2 => {
             let sz = if c.rex & 8 != 0 { 8 } else { 4 };
             let (reg, rm) = c.modrm()?;
             let n = c.fetch8()? as u32 & (sz as u32 * 8 - 1);
@@ -206,6 +836,5 @@ fn map_0f3a(c: &mut Ctx, op: u8) -> R<bool> {
         }
         _ => return Ok(false),
     }
-    let _ = Rm::Reg(0);
     Ok(true)
 }
