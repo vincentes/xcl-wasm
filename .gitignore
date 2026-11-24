@@ -43,3 +43,6 @@ frame_*.bmp
 
 # Python bytecode of the scripts
 __pycache__/
+
+# the built WebAssembly module, copied next to the page (crates/xcl-web/README.md)
+crates/xcl-web/www/*.wasm

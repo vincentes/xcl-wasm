@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XCL</title>
+<style>
+  body { font: 15px/1.4 system-ui, sans-serif; margin: 2rem auto; max-width: 70rem; padding: 0 1rem; }
+  pre { background: #111; color: #ddd; padding: 1rem; overflow: auto; min-height: 10rem; }
+  fieldset { border: 0; padding: 0; margin: 1rem 0; display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
+</style>
+<h1>XCL in the browser</h1>
+<p id="status">loading…</p>
+<fieldset>
+  <input type="file" id="file">
+  <label><input type="radio" name="cmd" value="inspect" checked> inspect (game exe / dll)</label>
+  <label><input type="radio" name="cmd" value="disasm"> disasm (console shader)</label>
+  <label><input type="checkbox" id="json"> JSON</label>
+  <input type="text" id="args" placeholder="disasm options, e.g. --offset 0x40 --all" size="36">
+</fieldset>
+<pre id="out"></pre>
+<script type="module">
+  import { load } from "./xcl.mjs";
+  const $ = (id) => document.getElementById(id);
+  let xcl;
+  try {
+    xcl = await load("./xcl_web.wasm");
+    $("status").textContent = xcl.version() + " – the file you pick is read in this tab only.";
+  } catch (e) {
+    $("status").textContent = "XCL needs a browser with 64-bit WebAssembly memory (memory64): " + e;
+  }
+  async function run() {
+    const f = $("file").files[0];
+    if (!xcl || !f) return;
+    const data = new Uint8Array(await f.arrayBuffer());
+    const cmd = document.querySelector("input[name=cmd]:checked").value;
+    try {
+      $("out").textContent =
+        cmd === "inspect" ? xcl.inspect(f.name, data, $("json").checked) : xcl.disasm(f.name, data, $("args").value.split(/\s+/).filter(Boolean));
+    } catch (e) {
+      $("out").textContent = "xcl " + cmd + ": " + e.message;
+    }
+  }
+  for (const id of ["file", "json", "args"]) $(id).addEventListener("change", run);
+  for (const r of document.querySelectorAll("input[name=cmd]")) r.addEventListener("change", run);
+</script>
+</html>

@@ -565,6 +565,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "xcl-web"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "xcl",
+]
+
+[[package]]
 name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"

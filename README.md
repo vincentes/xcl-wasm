@@ -143,6 +143,12 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
 
+### In the browser (WebAssembly)
+
+`crates/xcl-web` builds the part of XCL that needs no Windows as a 64-bit WebAssembly module
+(`wasm64-unknown-unknown`). So far that is `xcl inspect` and `xcl disasm` on a file picked in the
+page; it does not run games. See [`crates/xcl-web/README.md`](crates/xcl-web/README.md).
+
 ## Tests
 
 ```powershell

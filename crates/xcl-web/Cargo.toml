@@ -1,0 +1,18 @@
+[package]
+name = "xcl-web"
+description = "XCL in the browser: the platform-independent part of XCL as a WebAssembly (wasm64) module."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "xcl_web"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+# the logic is tested in `xcl`; the module itself by www/smoke.mjs under Node
+test = false
+
+[dependencies]
+xcl = { path = "../xcl" }
+serde_json = "1"
