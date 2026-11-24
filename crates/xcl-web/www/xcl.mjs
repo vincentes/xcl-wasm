@@ -46,6 +46,10 @@ export async function load(source) {
     clearGame: () => call(x.xcl_game_file, "", new Uint8Array(0)),
     /** Run a title on the x86-64 guest: its output, then a `--- stopped: …` line. */
     run: (name, data, commandLine = "", maxInstructions = 0) => call(x.xcl_run, name, data, commandLine, BigInt(maxInstructions)),
+    /** Assemble RDNA2 instructions (lines of `NAME ENCODING FIELD=value …`) to code. */
+    assemble: (lines) => Uint8Array.from(call(x.xcl_rdna2_assemble, lines.join("\n")).match(/../g) ?? [], (h) => parseInt(h, 16)),
+    /** An RDNA2 program as a WGSL compute shader in kernel mode (throws what is missing). */
+    wgslKernel: (code) => call(x.xcl_wgsl_kernel, code),
     /** Start a title that keeps running (`step`); the game folder is `gameFile`'s. */
     start: (name, data, commandLine = "") => call(x.xcl_session_start, name, data, commandLine),
     /**

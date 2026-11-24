@@ -9,6 +9,7 @@
 use std::sync::Mutex;
 
 mod session;
+mod wgsl;
 
 static OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// the game folder for the next `xcl_run`: (path in the folder, contents)

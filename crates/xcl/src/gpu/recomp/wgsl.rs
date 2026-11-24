@@ -1,0 +1,448 @@
+//! RDNA2 → WGSL: the recompiler's back end for WebGPU. **A beginning**: kernel mode only (the
+//! program runs on a register file, as the HLSL back end's instruction tests do) and a first
+//! set of instructions – 32-bit float and integer arithmetic, compares, selects, the scalar
+//! unit, branches. No memory, no textures, no exports, no graphics stages yet.
+//!
+//! WGSL has no wave of 64 lanes to rely on (the HLSL back end pins one with `WaveSize(64)` and
+//! uses wave intrinsics), so here **one invocation runs the whole wave**: a vector register is
+//! an array of 64 values and a vector instruction a loop over the lanes EXEC has on. That makes
+//! lane masks exact without any subgroup feature: VCC and EXEC are two 32-bit halves, a compare
+//! sets the bits of its lanes.
+//!
+//! Control flow is the dispatcher loop (`switch pc` over basic blocks), exact for any branch.
+//!
+//! Kernel ABI (the HLSL back end's): `io` holds 128 SGPR slots (106 / 107 VCC, 126 / 127 EXEC,
+//! 125 SCC) and then, per lane, 256 VGPRs; `res` gets the same back.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+
+use super::{KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS};
+use crate::gpu::rdna2::{self, Decoded};
+
+pub struct Translation {
+    pub wgsl: String,
+    /// dwords of the `io` and `res` buffers
+    pub dwords: usize,
+}
+
+fn field(d: &Decoded, name: &str) -> Option<u64> {
+    rdna2::field_value(d.enc, &d.words, name)
+}
+
+/// A 32-bit source operand by its 9-bit code, as a WGSL `u32` expression (`l`: the lane).
+fn source(code: u64, literal: Option<u32>) -> Result<String, String> {
+    Ok(match code {
+        0..=105 | 124 => format!("s[{code}]"),
+        106 => "vcc.x".into(),
+        107 => "vcc.y".into(),
+        125 | 128 => "0u".into(),
+        126 => "exec.x".into(),
+        127 => "exec.y".into(),
+        129..=192 => format!("{}u", code - 128),
+        193..=208 => format!("{}u", (-((code - 192) as i32)) as u32),
+        // 0.5 -0.5 1 -1 2 -2 4 -4, 1 / (2π)
+        240..=248 => format!("{}u", [0x3F00_0000u32, 0xBF00_0000, 0x3F80_0000, 0xBF80_0000, 0x4000_0000, 0xC000_0000, 0x4080_0000, 0xC080_0000, 0x3E22_F983][(code - 240) as usize]),
+        251 => "u32(all(vcc == vec2<u32>(0u)))".into(),
+        252 => "u32(all(exec == vec2<u32>(0u)))".into(),
+        253 => "u32(scc)".into(),
+        255 => format!("{}u", literal.ok_or("a literal operand without its literal")?),
+        256..=511 => format!("v{}[l]", code - 256),
+        _ => return Err(format!("source operand {code}")),
+    })
+}
+
+/// A 64-bit scalar source: a register pair, VCC, EXEC or a constant, as `vec2<u32>` (low, high).
+fn source64(code: u64, literal: Option<u32>) -> Result<String, String> {
+    Ok(match code {
+        0..=104 => format!("vec2<u32>(s[{code}], s[{}])", code + 1),
+        106 => "vcc".into(),
+        126 => "exec".into(),
+        128..=192 => format!("vec2<u32>({}u, 0u)", code - 128),
+        193..=208 => format!("vec2<u32>({}u, 0xffffffffu)", (-((code - 192) as i32)) as u32),
+        255 => format!("vec2<u32>({}u, 0u)", literal.ok_or("a literal operand without its literal")?),
+        _ => return Err(format!("64-bit source operand {code}")),
+    })
+}
+
+/// Assign a 32-bit value to a scalar destination.
+fn store(code: u64, value: &str) -> Result<String, String> {
+    Ok(match code {
+        0..=105 | 124 => format!("s[{code}] = {value};"),
+        106 => format!("vcc.x = {value};"),
+        107 => format!("vcc.y = {value};"),
+        125 => format!("_ = {value};"),
+        126 => format!("exec.x = {value};"),
+        127 => format!("exec.y = {value};"),
+        _ => return Err(format!("scalar destination {code}")),
+    })
+}
+
+fn store64(code: u64, value: &str) -> Result<String, String> {
+    Ok(match code {
+        0..=104 => format!("{{ let t = {value}; s[{code}] = t.x; s[{}] = t.y; }}", code + 1),
+        106 => format!("vcc = {value};"),
+        125 => format!("_ = {value};"),
+        126 => format!("exec = {value};"),
+        _ => return Err(format!("64-bit scalar destination {code}")),
+    })
+}
+
+/// A compare of `a` and `b` (expressions of type `ty`) by the instruction's condition name.
+fn condition(op: &str, a: &str, b: &str, float: bool) -> Option<String> {
+    // unordered float compares are the negation of the ordered opposite
+    let nan = format!("({a} != {a} || {b} != {b})");
+    Some(match (op, float) {
+        ("f", _) => "false".into(),
+        ("tru", _) | ("t", _) => "true".into(),
+        ("lt", _) => format!("({a} < {b})"),
+        ("eq", _) => format!("({a} == {b})"),
+        ("le", _) => format!("({a} <= {b})"),
+        ("gt", _) => format!("({a} > {b})"),
+        ("lg", true) => format!("({a} < {b} || {a} > {b})"),
+        ("lg", false) | ("ne", false) => format!("({a} != {b})"),
+        ("ge", _) => format!("({a} >= {b})"),
+        ("o", true) => format!("!{nan}"),
+        ("u", true) => nan,
+        ("nge", true) => format!("!({a} >= {b})"),
+        ("nlg", true) => format!("!({a} < {b} || {a} > {b})"),
+        ("ngt", true) => format!("!({a} > {b})"),
+        ("nle", true) => format!("!({a} <= {b})"),
+        ("neq", true) => format!("!({a} == {b})"),
+        ("nlt", true) => format!("!({a} < {b})"),
+        _ => return None,
+    })
+}
+
+fn f(e: &str) -> String {
+    format!("bitcast<f32>({e})")
+}
+
+fn i(e: &str) -> String {
+    format!("bitcast<i32>({e})")
+}
+
+fn fr(e: String) -> String {
+    format!("bitcast<u32>({e})")
+}
+
+/// The value a vector instruction writes, from its sources `a` `b` `c` (`u32` expressions).
+fn vector_value(name: &str, a: &str, b: &str, c: &str) -> Option<String> {
+    let (fa, fb, fc, ia, ib) = (f(a), f(b), f(c), i(a), i(b));
+    Some(match name {
+        "v_mov_b32" => a.to_string(),
+        "v_not_b32" => format!("~{a}"),
+        "v_add_f32" => fr(format!("{fa} + {fb}")),
+        "v_sub_f32" => fr(format!("{fa} - {fb}")),
+        "v_subrev_f32" => fr(format!("{fb} - {fa}")),
+        "v_mul_f32" => fr(format!("{fa} * {fb}")),
+        "v_min_f32" => fr(format!("min({fa}, {fb})")),
+        "v_max_f32" => fr(format!("max({fa}, {fb})")),
+        "v_fma_f32" => fr(format!("fma({fa}, {fb}, {fc})")),
+        "v_floor_f32" => fr(format!("floor({fa})")),
+        "v_ceil_f32" => fr(format!("ceil({fa})")),
+        "v_trunc_f32" => fr(format!("trunc({fa})")),
+        "v_rndne_f32" => fr(format!("round({fa})")),
+        "v_fract_f32" => fr(format!("fract({fa})")),
+        "v_sqrt_f32" => fr(format!("sqrt({fa})")),
+        "v_rcp_f32" => fr(format!("1.0 / {fa}")),
+        "v_rsq_f32" => fr(format!("inverseSqrt({fa})")),
+        "v_cvt_f32_i32" => fr(format!("f32({ia})")),
+        "v_cvt_f32_u32" => fr(format!("f32({a})")),
+        "v_cvt_i32_f32" => fr(format!("i32({fa})")),
+        "v_cvt_u32_f32" => format!("u32({fa})"),
+        "v_add_nc_u32" => format!("{a} + {b}"),
+        "v_sub_nc_u32" => format!("{a} - {b}"),
+        "v_subrev_nc_u32" => format!("{b} - {a}"),
+        "v_mul_lo_u32" => format!("{a} * {b}"),
+        "v_mul_hi_u32" => format!("mul_hi({a}, {b})"),
+        "v_and_b32" => format!("{a} & {b}"),
+        "v_or_b32" => format!("{a} | {b}"),
+        "v_xor_b32" => format!("{a} ^ {b}"),
+        "v_xnor_b32" => format!("~({a} ^ {b})"),
+        "v_lshlrev_b32" => format!("{b} << ({a} & 31u)"),
+        "v_lshrrev_b32" => format!("{b} >> ({a} & 31u)"),
+        "v_ashrrev_i32" => fr(format!("{ib} >> ({a} & 31u)")),
+        "v_min_u32" => format!("min({a}, {b})"),
+        "v_max_u32" => format!("max({a}, {b})"),
+        "v_min_i32" => fr(format!("min({ia}, {ib})")),
+        "v_max_i32" => fr(format!("max({ia}, {ib})")),
+        "v_cndmask_b32" => format!("select({a}, {b}, on(vcc, l))"),
+        _ => return None,
+    })
+}
+
+/// One instruction as WGSL statements (branches are the caller's).
+fn statement(d: &Decoded) -> Result<String, String> {
+    let name = d.inst.name.to_ascii_lowercase();
+    let lit = d.literal;
+    let enc = d.enc.name;
+    // --- the vector unit
+    if name.starts_with("v_") {
+        if enc.contains("SDWA") || enc.contains("DPP") {
+            return Err(format!("{name} ({enc})"));
+        }
+        if ["ABS", "NEG", "OMOD", "CLAMP"].iter().any(|m| field(d, m).unwrap_or(0) != 0) {
+            return Err(format!("{name} with operand modifiers"));
+        }
+        let a = source(field(d, "SRC0").ok_or("SRC0")?, lit)?;
+        let b = match (field(d, "VSRC1"), field(d, "SRC1")) {
+            (Some(v), _) => format!("v{v}[l]"),
+            (None, Some(c)) => source(c, lit)?,
+            (None, None) => "0u".into(),
+        };
+        let c = field(d, "SRC2").map(|c| source(c, lit)).transpose()?.unwrap_or_else(|| "0u".into());
+        if let Some(rest) = name.strip_prefix("v_cmp_") {
+            let (op, ty) = rest.rsplit_once('_').ok_or(&name)?;
+            let cast = |e: &str| match ty {
+                "f32" => Ok(f(e)),
+                "i32" => Ok(i(e)),
+                "u32" => Ok(e.to_string()),
+                _ => Err(format!("{name}")),
+            };
+            let test = condition(op, &cast(&a)?, &cast(&b)?, ty == "f32").ok_or(&name)?;
+            // the mask goes to VCC, or to the register pair the VOP3 form names
+            let to = store64(if enc.contains("VOP3") { field(d, "VDST").ok_or("VDST")? } else { 106 }, "m")?;
+            return Ok(format!("{{ var m = vec2<u32>(0u); for (var l = 0u; l < 64u; l++) {{ if (on(exec, l) && {test}) {{ m = put(m, l); }} }} {to} }}"));
+        }
+        let value = vector_value(&name, &a, &b, &c).ok_or(&name)?;
+        let dst = field(d, "VDST").ok_or("VDST")?;
+        return Ok(format!("for (var l = 0u; l < 64u; l++) {{ if (on(exec, l)) {{ v{dst}[l] = {value}; }} }}"));
+    }
+    // --- the scalar unit
+    let s0 = field(d, "SSRC0");
+    let s1 = field(d, "SSRC1");
+    let dst = field(d, "SDST");
+    let x = |c: Option<u64>| source(c.ok_or("a scalar source")?, lit);
+    let x64 = |c: Option<u64>| source64(c.ok_or("a scalar source")?, lit);
+    let to = |value: &str| store(dst.ok_or("SDST")?, value);
+    let to64 = |value: &str| store64(dst.ok_or("SDST")?, value);
+    Ok(match name.as_str() {
+        "s_nop" | "s_waitcnt" => String::new(),
+        "s_mov_b32" => to(&x(s0)?)?,
+        "s_mov_b64" => to64(&x64(s0)?)?,
+        "s_movk_i32" => to(&format!("{}u", field(d, "SIMM16").ok_or("SIMM16")? as u16 as i16 as i32 as u32))?,
+        "s_not_b32" => format!("{{ let r = ~{}; scc = r != 0u; {} }}", x(s0)?, to("r")?),
+        "s_not_b64" => format!("{{ let r = ~{}; scc = any(r != vec2<u32>(0u)); {} }}", x64(s0)?, to64("r")?),
+        "s_add_u32" => format!("{{ let a = {}; let r = a + {}; scc = r < a; {} }}", x(s0)?, x(s1)?, to("r")?),
+        "s_sub_u32" => format!("{{ let a = {}; let b = {}; scc = b > a; {} }}", x(s0)?, x(s1)?, to("a - b")?),
+        "s_add_i32" => format!("{{ let a = {}; let b = {}; let r = a + b; scc = ((~(a ^ b)) & (a ^ r)) >> 31u != 0u; {} }}", x(s0)?, x(s1)?, to("r")?),
+        "s_sub_i32" => format!("{{ let a = {}; let b = {}; let r = a - b; scc = ((a ^ b) & (a ^ r)) >> 31u != 0u; {} }}", x(s0)?, x(s1)?, to("r")?),
+        "s_mul_i32" => to(&format!("{} * {}", x(s0)?, x(s1)?))?,
+        "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_andn2_b32" | "s_orn2_b32" => {
+            let (a, b) = (x(s0)?, x(s1)?);
+            let r = match name.as_str() {
+                "s_and_b32" => format!("{a} & {b}"),
+                "s_or_b32" => format!("{a} | {b}"),
+                "s_xor_b32" => format!("{a} ^ {b}"),
+                "s_andn2_b32" => format!("{a} & ~{b}"),
+                _ => format!("{a} | ~{b}"),
+            };
+            format!("{{ let r = {r}; scc = r != 0u; {} }}", to("r")?)
+        }
+        "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64" => {
+            let (a, b) = (x64(s0)?, x64(s1)?);
+            let r = match name.as_str() {
+                "s_and_b64" => format!("{a} & {b}"),
+                "s_or_b64" => format!("{a} | {b}"),
+                "s_xor_b64" => format!("{a} ^ {b}"),
+                "s_andn2_b64" => format!("{a} & ~{b}"),
+                _ => format!("{a} | ~{b}"),
+            };
+            format!("{{ let r = {r}; scc = any(r != vec2<u32>(0u)); {} }}", to64("r")?)
+        }
+        "s_lshl_b32" => format!("{{ let r = {} << ({} & 31u); scc = r != 0u; {} }}", x(s0)?, x(s1)?, to("r")?),
+        "s_lshr_b32" => format!("{{ let r = {} >> ({} & 31u); scc = r != 0u; {} }}", x(s0)?, x(s1)?, to("r")?),
+        "s_ashr_i32" => format!("{{ let r = bitcast<u32>({} >> ({} & 31u)); scc = r != 0u; {} }}", i(&x(s0)?), x(s1)?, to("r")?),
+        "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
+            let (a, b) = (x(s0)?, x(s1)?);
+            let signed = name.ends_with("i32");
+            let less = if signed { format!("{} < {}", i("a"), i("b")) } else { "a < b".to_string() };
+            let first = if name.starts_with("s_min") { less } else { if signed { format!("{} > {}", i("a"), i("b")) } else { "a > b".to_string() } };
+            format!("{{ let a = {a}; let b = {b}; scc = {first}; {} }}", to("select(b, a, scc)")?)
+        }
+        "s_cselect_b32" => to(&format!("select({}, {}, scc)", x(s1)?, x(s0)?))?,
+        // EXEC is saved, then masked with the source; SCC: lanes are left
+        "s_and_saveexec_b64" | "s_or_saveexec_b64" | "s_andn2_saveexec_b64" | "s_andn1_saveexec_b64" => {
+            let a = x64(s0)?;
+            let r = match name.as_str() {
+                "s_and_saveexec_b64" => "a & exec",
+                "s_or_saveexec_b64" => "a | exec",
+                "s_andn2_saveexec_b64" => "a & ~exec",
+                _ => "~a & exec",
+            };
+            format!("{{ let a = {a}; let saved = exec; exec = {r}; scc = any(exec != vec2<u32>(0u)); {} }}", to64("saved")?)
+        }
+        _ => {
+            if let Some(rest) = name.strip_prefix("s_cmp_") {
+                let (op, ty) = rest.rsplit_once('_').ok_or(&name)?;
+                let (a, b) = (x(s0)?, x(s1)?);
+                let (a, b) = if ty == "i32" { (i(&a), i(&b)) } else { (a, b) };
+                return Ok(format!("scc = {};", condition(op, &a, &b, false).ok_or(&name)?));
+            }
+            return Err(name);
+        }
+    })
+}
+
+/// Translate a program into a WGSL compute shader of the kernel ABI. `Err`: the instructions
+/// this back end does not have yet, or a program it cannot decode.
+pub fn translate_kernel(code: &[u8]) -> Result<Translation, String> {
+    let mut insts: Vec<Decoded> = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let d = rdna2::decode(&code[off..], off as u64).map_err(|e| format!("+{off:#x}: cannot decode ({e:?})"))?;
+        off += d.len;
+        insts.push(d);
+    }
+    let starts: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
+    // basic blocks start at the program's start, at branch targets and after branches
+    let mut leaders: BTreeSet<u64> = BTreeSet::from([0]);
+    for d in &insts {
+        if d.inst.flags & rdna2::F_BRANCH == 0 {
+            continue;
+        }
+        let target = rdna2::branch_target(d).ok_or_else(|| format!("+{:#x}: {} (an indirect branch)", d.pc, d.inst.name.to_ascii_lowercase()))?;
+        if !starts.contains(&target) {
+            return Err(format!("+{:#x}: branch to {target:#x}, which is not the start of an instruction", d.pc));
+        }
+        leaders.insert(target);
+        leaders.insert(d.pc + d.len as u64);
+    }
+    let mut vgprs: BTreeSet<u64> = BTreeSet::new();
+    let mut written: BTreeSet<u64> = BTreeSet::new();
+    for d in &insts {
+        let (r, w) = rdna2::vgpr_uses(d);
+        vgprs.extend(r.iter().copied());
+        vgprs.extend(w.iter().copied());
+        written.extend(w);
+    }
+    let mut unsupported: BTreeMap<String, usize> = BTreeMap::new();
+    let mut body = String::new();
+    const END: u32 = 0xFFFF_FFFF;
+    let mut open = false;
+    for d in &insts {
+        if leaders.contains(&d.pc) {
+            if open {
+                // falling into the next block
+                let _ = writeln!(body, "        pc = {}u;\n      }}", d.pc);
+            }
+            let _ = writeln!(body, "      case {}u {{", d.pc);
+            open = true;
+        }
+        let name = d.inst.name.to_ascii_lowercase();
+        let next = d.pc + d.len as u64;
+        let _ = writeln!(body, "        // {}", rdna2::format(d));
+        if name == "s_endpgm" {
+            let _ = writeln!(body, "        pc = {END}u;\n      }}");
+            open = false;
+            continue;
+        }
+        if d.inst.flags & rdna2::F_BRANCH != 0 {
+            let target = rdna2::branch_target(d).unwrap_or(0);
+            let taken = match name.as_str() {
+                "s_branch" => Some("true"),
+                "s_cbranch_scc0" => Some("!scc"),
+                "s_cbranch_scc1" => Some("scc"),
+                "s_cbranch_vccz" => Some("all(vcc == vec2<u32>(0u))"),
+                "s_cbranch_vccnz" => Some("any(vcc != vec2<u32>(0u))"),
+                "s_cbranch_execz" => Some("all(exec == vec2<u32>(0u))"),
+                "s_cbranch_execnz" => Some("any(exec != vec2<u32>(0u))"),
+                _ => None,
+            };
+            match taken {
+                Some(cond) => {
+                    let _ = writeln!(body, "        if ({cond}) {{ pc = {target}u; }} else {{ pc = {next}u; }}\n      }}");
+                }
+                None => *unsupported.entry(name).or_default() += 1,
+            }
+            open = false;
+            continue;
+        }
+        match statement(d) {
+            Ok(text) if text.is_empty() => {}
+            Ok(text) => {
+                let _ = writeln!(body, "        {text}");
+            }
+            Err(what) => *unsupported.entry(what).or_default() += 1,
+        }
+    }
+    if open {
+        // the code ends without s_endpgm
+        let _ = writeln!(body, "        pc = {END}u;\n      }}");
+    }
+    if !unsupported.is_empty() {
+        let list: Vec<String> = unsupported.iter().map(|(n, c)| format!("{n} ×{c}")).collect();
+        return Err(format!("not in the WGSL back end yet: {}", list.join(", ")));
+    }
+    let lanes = KERNEL_LANES;
+    let mut w = String::new();
+    let _ = writeln!(w, "// RDNA2 program in kernel mode, made by XCL (gpu::recomp::wgsl): one invocation runs the wave.");
+    let _ = writeln!(w, "@group(0) @binding(0) var<storage, read> io: array<u32>;");
+    let _ = writeln!(w, "@group(0) @binding(1) var<storage, read_write> res: array<u32>;");
+    let _ = writeln!(w, "var<private> s: array<u32, {KERNEL_SGPRS}>;");
+    let _ = writeln!(w, "var<private> exec: vec2<u32>;\nvar<private> vcc: vec2<u32>;\nvar<private> scc: bool;");
+    for v in &vgprs {
+        let _ = writeln!(w, "var<private> v{v}: array<u32, {lanes}>;");
+    }
+    // helpers: a lane's bit in a mask, the mask with a lane's bit, the high half of a product
+    let _ = writeln!(w, "fn on(m: vec2<u32>, l: u32) -> bool {{ if (l < 32u) {{ return ((m.x >> l) & 1u) != 0u; }} return ((m.y >> (l - 32u)) & 1u) != 0u; }}");
+    let _ = writeln!(w, "fn put(m: vec2<u32>, l: u32) -> vec2<u32> {{ if (l < 32u) {{ return vec2<u32>(m.x | (1u << l), m.y); }} return vec2<u32>(m.x, m.y | (1u << (l - 32u))); }}");
+    let _ = writeln!(w, "fn mul_hi(a: u32, b: u32) -> u32 {{ let al = a & 0xffffu; let ah = a >> 16u; let bl = b & 0xffffu; let bh = b >> 16u; let mid = ah * bl + ((al * bl) >> 16u); let mid2 = al * bh + (mid & 0xffffu); return ah * bh + (mid >> 16u) + (mid2 >> 16u); }}");
+    let _ = writeln!(w, "@compute @workgroup_size(1) fn main() {{");
+    let _ = writeln!(w, "  for (var i = 0u; i < {KERNEL_SGPRS}u; i++) {{ s[i] = io[i]; }}");
+    let _ = writeln!(w, "  exec = vec2<u32>(io[126], io[127]);\n  vcc = vec2<u32>(io[106], io[107]);\n  scc = io[{KERNEL_SCC_SLOT}] != 0u;");
+    for v in &vgprs {
+        let _ = writeln!(w, "  for (var l = 0u; l < {lanes}u; l++) {{ v{v}[l] = io[{KERNEL_SGPRS}u + l * {KERNEL_VGPRS}u + {v}u]; }}");
+    }
+    let _ = writeln!(w, "  var pc = 0u;\n  // a program that never ends is cut off\n  for (var steps = 0u; steps < 1000000u; steps++) {{\n    switch pc {{");
+    w.push_str(&body);
+    let _ = writeln!(w, "      default {{ pc = {END}u; }}\n    }}\n    if (pc == {END}u) {{ break; }}\n  }}");
+    let total = KERNEL_SGPRS + KERNEL_LANES * KERNEL_VGPRS;
+    let _ = writeln!(w, "  for (var i = 0u; i < {total}u; i++) {{ res[i] = io[i]; }}");
+    let _ = writeln!(w, "  for (var i = 0u; i < {KERNEL_SGPRS}u; i++) {{ res[i] = s[i]; }}");
+    let _ = writeln!(w, "  res[106] = vcc.x; res[107] = vcc.y; res[126] = exec.x; res[127] = exec.y; res[{KERNEL_SCC_SLOT}] = u32(scc);");
+    for v in &written {
+        let _ = writeln!(w, "  for (var l = 0u; l < {lanes}u; l++) {{ res[{KERNEL_SGPRS}u + l * {KERNEL_VGPRS}u + {v}u] = v{v}[l]; }}");
+    }
+    let _ = writeln!(w, "}}");
+    Ok(Translation { wgsl: w, dwords: total })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asm(insts: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
+        insts.iter().flat_map(|(name, enc, fields, lit)| rdna2::encode(name, enc, fields, *lit).unwrap()).collect()
+    }
+
+    #[test]
+    fn a_program_becomes_a_dispatcher_over_its_blocks() {
+        // v_add_f32 v5, v1, v2 ; s_cbranch_vccz +1 ; v_mov_b32 v6, 1.0 ; s_endpgm
+        let code = asm(&[
+            ("V_ADD_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 257), ("VSRC1", 2)], None),
+            ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 242)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]);
+        let t = translate_kernel(&code).unwrap();
+        assert!(t.wgsl.contains("v5[l] = bitcast<u32>(bitcast<f32>(v1[l]) + bitcast<f32>(v2[l]));"), "{}", t.wgsl);
+        // three blocks: the start, the instruction the branch skips, the end
+        assert_eq!(t.wgsl.matches("      case ").count(), 3, "{}", t.wgsl);
+        assert!(t.wgsl.contains("if (all(vcc == vec2<u32>(0u))) { pc = 12u; } else { pc = 8u; }"), "{}", t.wgsl);
+        assert!(t.wgsl.contains("v6[l] = 1065353216u;"));
+        // only the registers the program uses are declared, only the written ones stored
+        assert!(t.wgsl.contains("var<private> v1: array<u32, 64>;") && !t.wgsl.contains("var<private> v3:"));
+        assert!(t.wgsl.contains("+ 5u] = v5[l];") && !t.wgsl.contains("+ 1u] = v1[l];"));
+        assert_eq!(t.dwords, 128 + 64 * 256);
+    }
+
+    #[test]
+    fn what_is_missing_is_named() {
+        // v_sin_f32 v0, v1 is not in this back end
+        let code = asm(&[("V_SIN_F32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 257)], None), ("S_ENDPGM", "ENC_SOPP", &[], None)]);
+        let e = translate_kernel(&code).err().unwrap();
+        assert!(e.contains("v_sin_f32 ×1"), "{e}");
+    }
+}

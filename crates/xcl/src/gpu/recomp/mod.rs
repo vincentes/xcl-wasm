@@ -65,6 +65,7 @@ pub mod runner;
 #[cfg(all(test, windows))]
 mod tests;
 pub mod upper_lanes;
+pub mod wgsl;
 
 use std::collections::{BTreeMap, BTreeSet};
 
