@@ -294,6 +294,37 @@ fn ResumeThread(g: &mut Guest) -> H {
     Ok(std::mem::take(&mut g.threads[index].suspended) as u64)
 }
 
+/// GetThreadGroupAffinity(thread, affinity out): GROUP_AFFINITY (16 bytes) – processor 0 of
+/// group 0, the one there is.
+fn GetThreadGroupAffinity(g: &mut Guest) -> H {
+    let out = g.arg(1)?;
+    g.mem.write(out, &[0u8; 16])?;
+    g.mem.write_u64(out, 1)?;
+    Ok(1)
+}
+
+/// SetThreadGroupAffinity(thread, affinity, previous affinity out)
+fn SetThreadGroupAffinity(g: &mut Guest) -> H {
+    let previous = g.arg(2)?;
+    if previous != 0 {
+        g.mem.write(previous, &[0u8; 16])?;
+        g.mem.write_u64(previous, 1)?;
+    }
+    Ok(1)
+}
+
+/// OpenThread(access, inherit, thread id): a handle of the thread with that id.
+fn OpenThread(g: &mut Guest) -> H {
+    let id = g.arg(2)? as u32;
+    match g.threads.iter().position(|t| t.id == id) {
+        Some(index) => Ok(g.win.new_handle(Object::Thread(index))),
+        None => {
+            g.set_last_error(ERROR_INVALID_PARAMETER);
+            Ok(0)
+        }
+    }
+}
+
 // --- interlocked singly-linked lists ------------------------------------------------------------
 
 fn InitializeSListHead(g: &mut Guest) -> H {
@@ -460,7 +491,9 @@ pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
     map.insert("DecodePointer", pointer as Handler);
     map.insert("IsDebuggerPresent", no as Handler);
     register!(map; CreateSemaphoreExW, ReleaseSemaphore, CreateMutexW, CreateMutexExW, ReleaseMutex, CreateEventExW);
-    register!(map; WaitForMultipleObjects, ResumeThread);
+    register!(map; WaitForMultipleObjects, ResumeThread, GetThreadGroupAffinity, SetThreadGroupAffinity, OpenThread);
+    map.insert("CreateMutexA", CreateMutexW as Handler);
+    map.insert("SetProcessPriorityBoost", yes as Handler);
     map.insert("CreateSemaphoreW", CreateSemaphoreExW as Handler);
     map.insert("WaitForMultipleObjectsEx", WaitForMultipleObjects as Handler);
     // the guest's threads take turns: priorities and processors change nothing
@@ -619,6 +652,20 @@ mod tests {
         g.win.time_ns += 5_000_000;
         assert_eq!(call(&mut g, 0, WaitForMultipleObjects, [2, page, 0, 5]), Ok(WAIT_TIMEOUT));
         assert_eq!(call(&mut g, 0, WaitForMultipleObjects, [1, page + 16, 0, 0]), Ok(WAIT_FAILED));
+    }
+
+    #[test]
+    fn a_thread_is_opened_by_its_id_and_runs_on_the_one_processor() {
+        let (mut g, page) = guest(2);
+        let id = g.threads[1].id as u64;
+        let handle = call(&mut g, 0, OpenThread, [0x1F_FFFF, 0, id, 0]).unwrap();
+        assert!(matches!(g.win.handles.get(&handle), Some(Object::Thread(1))));
+        assert_eq!(call(&mut g, 0, OpenThread, [0x1F_FFFF, 0, 0xDEAD, 0]), Ok(0));
+        g.mem.write(page, &[0xFF; 32]).unwrap();
+        assert_eq!(call(&mut g, 0, GetThreadGroupAffinity, [handle, page, 0, 0]), Ok(1));
+        assert_eq!((g.mem.read_u64(page).unwrap(), g.mem.read_u64(page + 8).unwrap()), (1, 0));
+        assert_eq!(call(&mut g, 0, SetThreadGroupAffinity, [handle, page, page + 16, 0]), Ok(1));
+        assert_eq!(g.mem.read_u64(page + 16).unwrap(), 1);
     }
 
     #[test]

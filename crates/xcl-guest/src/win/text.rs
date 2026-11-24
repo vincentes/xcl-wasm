@@ -133,6 +133,32 @@ fn GetCommandLineA(g: &mut Guest) -> H {
     })
 }
 
+/// RegisterAppStateChangeNotification(routine, context, registration out), and the one for
+/// "constrained": registered (the title is never suspended or constrained, so never called).
+fn RegisterAppStateChangeNotification(g: &mut Guest) -> H {
+    let out = g.arg(2)?;
+    if out != 0 {
+        g.mem.write_u64(out, 1)?;
+    }
+    Ok(0)
+}
+
+/// GetUserDefaultGeoName(name out, characters): "US" – 3 characters with the terminator.
+fn GetUserDefaultGeoName(g: &mut Guest) -> H {
+    let (out, size) = (g.arg(0)?, g.arg(1)? as u32);
+    if size == 0 {
+        return Ok(3);
+    }
+    if size < 3 {
+        g.set_last_error(ERROR_INSUFFICIENT_BUFFER);
+        return Ok(0);
+    }
+    for (i, c) in "US\0".encode_utf16().enumerate() {
+        g.mem.write_u16(out + 2 * i as u64, c)?;
+    }
+    Ok(3)
+}
+
 /// GetStartupInfoW(info): 104 bytes, of which only the size says anything.
 fn GetStartupInfoW(g: &mut Guest) -> H {
     let at = g.arg(0)?;
@@ -186,7 +212,8 @@ pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
     map.insert("RegQueryValueExW", reg_not_found as Handler);
     map.insert("RegGetValueW", reg_not_found as Handler);
     register!(map; MultiByteToWideChar, WideCharToMultiByte, lstrcmpW, lstrcmpiW, LocalAlloc, LocalFree, CoTaskMemAlloc, CoTaskMemFree);
-    register!(map; GetStartupInfoW, GetUserDefaultUILanguage, GetCommandLineA);
+    register!(map; GetStartupInfoW, GetUserDefaultUILanguage, GetCommandLineA, RegisterAppStateChangeNotification, GetUserDefaultGeoName);
+    map.insert("RegisterAppConstrainedChangeNotification", RegisterAppStateChangeNotification as Handler);
     map.insert("GlobalFree", LocalFree as Handler);
     // the functions that differ from one the host has only in what their extra arguments
     // say, which the host does not look at
