@@ -1,0 +1,19 @@
+# Records what a real x86-64 CPU does with the interpreter's test vectors
+# (crates/xcl-emu/tests/data/x64_cases.txt → x64_expected.txt). Not part of the workspace:
+# it only builds for x86-64 macOS / Linux. On an Apple Silicon Mac it runs under Rosetta:
+#
+#   cargo build --release --manifest-path scripts/x64-oracle/Cargo.toml --target x86_64-apple-darwin
+#   ROSETTA_ADVERTISE_AVX=1 scripts/x64-oracle/target/x86_64-apple-darwin/release/x64-oracle \
+#       crates/xcl-emu/tests/data/x64_cases.txt "Rosetta 2, macOS 26, Apple Silicon" \
+#       > crates/xcl-emu/tests/data/x64_expected.txt
+#
+# (Rosetta shows AVX / AVX2 only with ROSETTA_ADVERTISE_AVX=1.) Rosetta is an x86-64
+# implementation, not silicon: a recording from a real x86-64 CPU is the better reference.
+[package]
+name = "x64-oracle"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+publish = false
+
+[workspace]

@@ -1,0 +1,308 @@
+# Machine code the interpreter is compared on with a real CPU (tests/oracle.rs).
+#   hex bytes | flags left undefined (c p a z s o, - none) | registers set (reg=hex,…) | text
+# RDI and RSI point into the scratch block. scripts/x64-oracle records x64_expected.txt.
+
+# --- ALU, every size and direction
+00 c8                | - | - | add al, cl
+66 01 c8             | - | - | add ax, cx
+01 c8                | - | - | add eax, ecx
+48 01 c8             | - | - | add rax, rcx
+4d 01 c8             | - | - | add r8, r9
+02 07                | - | - | add al, [rdi]
+48 03 07             | - | - | add rax, [rdi]
+48 01 07             | - | - | add [rdi], rax
+00 e3                | - | - | add bl, ah
+40 00 e3             | - | - | add bl, spl
+08 c8                | a | - | or al, cl
+48 09 c8             | a | - | or rax, rcx
+10 c8                | - | - | adc al, cl
+48 11 c8             | - | - | adc rax, rcx
+11 07                | - | - | adc [rdi], eax
+18 c8                | - | - | sbb al, cl
+48 19 c8             | - | - | sbb rax, rcx
+66 19 c8             | - | - | sbb ax, cx
+20 c8                | a | - | and al, cl
+48 21 c8             | a | - | and rax, rcx
+28 c8                | - | - | sub al, cl
+29 c8                | - | - | sub eax, ecx
+48 29 c8             | - | - | sub rax, rcx
+30 c8                | a | - | xor al, cl
+48 31 c8             | a | - | xor rax, rcx
+38 c8                | - | - | cmp al, cl
+48 39 c8             | - | - | cmp rax, rcx
+3b 07                | - | - | cmp eax, [rdi]
+04 7f                | - | - | add al, 0x7f
+48 05 00 00 00 80    | - | - | add rax, -0x80000000
+48 83 c0 ff          | - | - | add rax, -1
+48 81 ef 78 56 34 12 | - | - | sub rdi, 0x12345678
+80 3f 80             | - | - | cmp byte [rdi], 0x80
+66 83 2f 01          | - | - | sub word [rdi], 1
+84 c8                | a | - | test al, cl
+48 85 c8             | a | - | test rax, rcx
+a9 00 00 00 80       | a | - | test eax, 0x80000000
+f6 07 81             | a | - | test byte [rdi], 0x81
+fe c0                | - | - | inc al
+48 ff c0             | - | - | inc rax
+ff 0f                | - | - | dec dword [rdi]
+66 ff c8             | - | - | dec ax
+f6 d8                | - | - | neg al
+48 f7 d8             | - | - | neg rax
+48 f7 d0             | - | - | not rax
+f6 17                | - | - | not byte [rdi]
+
+# --- shifts and rotates (OF is defined for a count of 1 only, AF never)
+d0 e0                | a  | - | shl al, 1
+48 d1 e0             | a  | - | shl rax, 1
+d3 e0                | ao | - | shl eax, cl
+48 d3 e0             | ao | - | shl rax, cl
+66 d3 e0             | ao | - | shl ax, cl
+d2 e0                | ao | - | shl al, cl
+48 c1 e0 3f          | ao | - | shl rax, 63
+d1 e8                | a  | - | shr eax, 1
+48 d3 e8             | ao | - | shr rax, cl
+d2 e8                | ao | - | shr al, cl
+66 d3 e8             | ao | - | shr ax, cl
+d1 f8                | a  | - | sar eax, 1
+48 d3 f8             | ao | - | sar rax, cl
+d2 f8                | ao | - | sar al, cl
+66 c1 f8 0f          | ao | - | sar ax, 15
+d1 c0                | -  | - | rol eax, 1
+48 d3 c0             | o  | - | rol rax, cl
+d2 c0                | o  | - | rol al, cl
+66 d3 c0             | o  | - | rol ax, cl
+d1 c8                | -  | - | ror eax, 1
+48 d3 c8             | o  | - | ror rax, cl
+d2 c8                | o  | - | ror al, cl
+d1 d0                | -  | - | rcl eax, 1
+48 d3 d0             | o  | - | rcl rax, cl
+d2 d0                | o  | - | rcl al, cl
+d1 d8                | -  | - | rcr eax, 1
+48 d3 d8             | o  | - | rcr rax, cl
+66 d3 d8             | o  | - | rcr ax, cl
+48 0f a5 d0          | ao | - | shld rax, rdx, cl
+0f a4 d0 05          | ao | - | shld eax, edx, 5
+48 0f ad d0          | ao | - | shrd rax, rdx, cl
+0f ac d0 1f          | ao | - | shrd eax, edx, 31
+
+# --- multiply and divide (the divisor is fixed: a zero would fault)
+f6 e1                | pazs | - | mul cl
+f7 e1                | pazs | - | mul ecx
+48 f7 e1             | pazs | - | mul rcx
+f6 e9                | pazs | - | imul cl
+48 f7 e9             | pazs | - | imul rcx
+0f af c1             | pazs | - | imul eax, ecx
+48 0f af c1          | pazs | - | imul rax, rcx
+66 0f af c1          | pazs | - | imul ax, cx
+48 6b c1 f9          | pazs | - | imul rax, rcx, -7
+69 c1 00 01 00 00    | pazs | - | imul eax, ecx, 0x100
+f7 f1                | cpazso | rcx=10001,rdx=3       | div ecx
+48 f7 f1             | cpazso | rcx=100000001,rdx=7   | div rcx
+f6 f1                | cpazso | rcx=ff,rax=1234       | div cl
+f7 f9                | cpazso | rcx=10001,rdx=0       | idiv ecx
+48 f7 f9             | cpazso | rcx=7,rdx=ffffffffffffffff,rax=ffffffffffffff9c | idiv rcx
+
+# --- moves and extensions
+88 e3                | - | - | mov bl, ah
+66 89 c8             | - | - | mov ax, cx
+89 c8                | - | - | mov eax, ecx
+48 8b 47 08          | - | - | mov rax, [rdi+8]
+48 89 44 0f 10       | - | rcx=28 | mov [rdi+rcx+0x10], rax
+c6 07 a5             | - | - | mov byte [rdi], 0xa5
+48 c7 07 ff ff ff ff | - | - | mov qword [rdi], -1
+0f b6 c1             | - | - | movzx eax, cl
+48 0f b7 07          | - | - | movzx rax, word [rdi]
+0f be c1             | - | - | movsx eax, cl
+48 0f bf c1          | - | - | movsx rax, cx
+66 0f be c1          | - | - | movsx ax, cl
+48 63 c1             | - | - | movsxd rax, ecx
+48 98                | - | - | cdqe
+98                   | - | - | cwde
+66 98                | - | - | cbw
+48 99                | - | - | cqo
+99                   | - | - | cdq
+66 99                | - | - | cwd
+48 87 07             | - | - | xchg [rdi], rax
+86 e0                | - | - | xchg al, ah
+48 91                | - | - | xchg rax, rcx
+48 0f c8             | - | - | bswap rax
+0f c9                | - | - | bswap ecx
+48 8d 44 8f 05       | - | - | lea rax, [rdi+rcx*4+5]
+8d 04 49             | - | - | lea eax, [rcx+rcx*2]
+50 59                | - | - | push rax; pop rcx
+66 50 66 59          | - | - | push ax; pop cx
+9c 58                | - | - | pushfq; pop rax
+9f                   | - | - | lahf
+9e                   | - | - | sahf
+f5                   | - | - | cmc
+f8                   | - | - | clc
+f9                   | - | - | stc
+
+# --- conditions
+0f 94 c0             | - | - | sete al
+0f 9c c0             | - | - | setl al
+0f 97 07             | - | - | seta [rdi]
+0f 9e c0             | - | - | setle al
+0f 9a c0             | - | - | setp al
+48 0f 44 c1          | - | - | cmove rax, rcx
+0f 4c c1             | - | - | cmovl eax, ecx
+66 0f 47 c1          | - | - | cmova ax, cx
+0f 42 07             | - | - | cmovb eax, [rdi]
+72 02 31 c0          | a | - | jb +2; xor eax, eax
+7f 03 48 ff c0       | - | - | jg +3; inc rax
+e3 02 ff c0          | - | - | jrcxz +2; inc eax
+
+# --- bits
+48 0f a3 c8          | pazso | - | bt rax, rcx
+0f a3 0f             | pazso | rcx=45 | bt [rdi], ecx
+48 0f ab c8          | pazso | - | bts rax, rcx
+48 0f b3 c8          | pazso | - | btr rax, rcx
+0f bb 0f             | pazso | rcx=25 | btc [rdi], ecx
+48 0f ba e0 3f       | pazso | - | bt rax, 63
+0f ba 2f 07          | pazso | - | bts dword [rdi], 7
+48 0f bc c1          | cpaso | rcx=80000000000 | bsf rax, rcx
+48 0f bd c1          | cpaso | rcx=80000000001 | bsr rax, rcx
+0f bc c1             | cpaso | rcx=10         | bsf eax, ecx
+f3 48 0f b8 c1       | - | - | popcnt rax, rcx
+f3 0f b8 07          | - | - | popcnt eax, [rdi]
+
+# --- atomics
+# cmpxchg: only ZF is compared. The other flags are those of `cmp accumulator, destination`
+# (Intel's manual, and what the interpreter does); the recording at hand, made under Rosetta 2,
+# has those of `cmp destination, accumulator`.
+48 0f b1 0f          | cpaso | - | cmpxchg [rdi], rcx
+0f b0 0f             | cpaso | - | cmpxchg [rdi], cl
+48 0f c1 07          | - | - | xadd [rdi], rax
+0f c0 c8             | - | - | xadd al, cl
+48 0f c7 0f          | - | - | cmpxchg16b [rdi]
+0f c7 0f             | - | - | cmpxchg8b [rdi]
+
+# --- strings (RCX fixed: a random count would leave the scratch block)
+a4                   | - | - | movsb
+48 a5                | - | - | movsq
+f3 a4                | - | rcx=11 | rep movsb
+f3 48 a5             | - | rcx=5  | rep movsq
+f3 aa                | - | rcx=13 | rep stosb
+f3 48 ab             | - | rcx=4  | rep stosq
+66 ab                | - | - | stosw
+ac                   | - | - | lodsb
+48 ad                | - | - | lodsq
+a6                   | - | - | cmpsb
+f3 a6                | - | rcx=20 | repe cmpsb
+f2 ae                | - | rcx=40 | repne scasb
+f3 48 af             | - | rcx=8  | repe scasq
+
+# --- SSE / SSE2: moves
+0f 10 07             | - | - | movups xmm0, [rdi]
+0f 11 0f             | - | - | movups [rdi], xmm1
+f3 0f 10 c1          | - | - | movss xmm0, xmm1
+f3 0f 10 07          | - | - | movss xmm0, [rdi]
+f3 0f 11 0f          | - | - | movss [rdi], xmm1
+f2 0f 10 c1          | - | - | movsd xmm0, xmm1
+f2 0f 10 07          | - | - | movsd xmm0, [rdi]
+66 0f 6f 07          | - | - | movdqa xmm0, [rdi]
+f3 0f 7f 0f          | - | - | movdqu [rdi], xmm1
+66 0f 6e c1          | - | - | movd xmm0, ecx
+66 48 0f 6e c1       | - | - | movq xmm0, rcx
+66 0f 7e c8          | - | - | movd eax, xmm1
+66 48 0f 7e c8       | - | - | movq rax, xmm1
+f3 0f 7e c1          | - | - | movq xmm0, xmm1
+66 0f d6 0f          | - | - | movq [rdi], xmm1
+0f 12 07             | - | - | movlps xmm0, [rdi]
+0f 12 c1             | - | - | movhlps xmm0, xmm1
+0f 16 07             | - | - | movhps xmm0, [rdi]
+0f 16 c1             | - | - | movlhps xmm0, xmm1
+0f 13 0f             | - | - | movlps [rdi], xmm1
+0f 17 0f             | - | - | movhps [rdi], xmm1
+0f 50 c1             | - | - | movmskps eax, xmm1
+66 0f 50 c1          | - | - | movmskpd eax, xmm1
+66 0f d7 c1          | - | - | pmovmskb eax, xmm1
+
+# --- SSE2: integer
+66 0f fc c1          | - | - | paddb xmm0, xmm1
+66 0f fd c1          | - | - | paddw xmm0, xmm1
+66 0f fe 07          | - | - | paddd xmm0, [rdi]
+66 0f d4 c1          | - | - | paddq xmm0, xmm1
+66 0f f8 c1          | - | - | psubb xmm0, xmm1
+66 0f fb c1          | - | - | psubq xmm0, xmm1
+66 0f ec c1          | - | - | paddsb xmm0, xmm1
+66 0f ed c1          | - | - | paddsw xmm0, xmm1
+66 0f dc c1          | - | - | paddusb xmm0, xmm1
+66 0f dd c1          | - | - | paddusw xmm0, xmm1
+66 0f e8 c1          | - | - | psubsb xmm0, xmm1
+66 0f e9 c1          | - | - | psubsw xmm0, xmm1
+66 0f d8 c1          | - | - | psubusb xmm0, xmm1
+66 0f d9 c1          | - | - | psubusw xmm0, xmm1
+66 0f d5 c1          | - | - | pmullw xmm0, xmm1
+66 0f e5 c1          | - | - | pmulhw xmm0, xmm1
+66 0f e4 c1          | - | - | pmulhuw xmm0, xmm1
+66 0f f4 c1          | - | - | pmuludq xmm0, xmm1
+66 0f f5 c1          | - | - | pmaddwd xmm0, xmm1
+66 0f f6 c1          | - | - | psadbw xmm0, xmm1
+66 0f e0 c1          | - | - | pavgb xmm0, xmm1
+66 0f e3 c1          | - | - | pavgw xmm0, xmm1
+66 0f da c1          | - | - | pminub xmm0, xmm1
+66 0f de c1          | - | - | pmaxub xmm0, xmm1
+66 0f ea c1          | - | - | pminsw xmm0, xmm1
+66 0f ee c1          | - | - | pmaxsw xmm0, xmm1
+66 0f 74 c1          | - | - | pcmpeqb xmm0, xmm1
+66 0f 75 c1          | - | - | pcmpeqw xmm0, xmm1
+66 0f 76 c1          | - | - | pcmpeqd xmm0, xmm1
+66 0f 64 c1          | - | - | pcmpgtb xmm0, xmm1
+66 0f 65 c1          | - | - | pcmpgtw xmm0, xmm1
+66 0f 66 c1          | - | - | pcmpgtd xmm0, xmm1
+66 0f db c1          | - | - | pand xmm0, xmm1
+66 0f df c1          | - | - | pandn xmm0, xmm1
+66 0f eb c1          | - | - | por xmm0, xmm1
+66 0f ef c1          | - | - | pxor xmm0, xmm1
+66 0f 60 c1          | - | - | punpcklbw xmm0, xmm1
+66 0f 61 c1          | - | - | punpcklwd xmm0, xmm1
+66 0f 62 c1          | - | - | punpckldq xmm0, xmm1
+66 0f 6c c1          | - | - | punpcklqdq xmm0, xmm1
+66 0f 68 c1          | - | - | punpckhbw xmm0, xmm1
+66 0f 69 c1          | - | - | punpckhwd xmm0, xmm1
+66 0f 6a c1          | - | - | punpckhdq xmm0, xmm1
+66 0f 6d c1          | - | - | punpckhqdq xmm0, xmm1
+66 0f 63 c1          | - | - | packsswb xmm0, xmm1
+66 0f 67 c1          | - | - | packuswb xmm0, xmm1
+66 0f 6b c1          | - | - | packssdw xmm0, xmm1
+66 0f 70 c1 1b       | - | - | pshufd xmm0, xmm1, 0x1b
+f3 0f 70 c1 4e       | - | - | pshufhw xmm0, xmm1, 0x4e
+f2 0f 70 c1 93       | - | - | pshuflw xmm0, xmm1, 0x93
+66 0f 71 d0 03       | - | - | psrlw xmm0, 3
+66 0f 71 e0 11       | - | - | psraw xmm0, 17
+66 0f 71 f0 05       | - | - | psllw xmm0, 5
+66 0f 72 d0 1f       | - | - | psrld xmm0, 31
+66 0f 72 e0 07       | - | - | psrad xmm0, 7
+66 0f 72 f0 20       | - | - | pslld xmm0, 32
+66 0f 73 d0 21       | - | - | psrlq xmm0, 33
+66 0f 73 f0 01       | - | - | psllq xmm0, 1
+66 0f 73 d8 05       | - | - | psrldq xmm0, 5
+66 0f 73 f8 0b       | - | - | pslldq xmm0, 11
+66 0f d1 c1          | - | - | psrlw xmm0, xmm1
+66 0f d2 c1          | - | - | psrld xmm0, xmm1
+66 0f d3 c1          | - | - | psrlq xmm0, xmm1
+66 0f e1 c1          | - | - | psraw xmm0, xmm1
+66 0f e2 c1          | - | - | psrad xmm0, xmm1
+66 0f f1 c1          | - | - | psllw xmm0, xmm1
+66 0f f2 c1          | - | - | pslld xmm0, xmm1
+66 0f f3 c1          | - | - | psllq xmm0, xmm1
+66 0f c4 c1 05       | - | - | pinsrw xmm0, ecx, 5
+66 0f c5 c1 06       | - | - | pextrw eax, xmm1, 6
+0f c6 c1 b1          | - | - | shufps xmm0, xmm1, 0xb1
+66 0f c6 c1 02       | - | - | shufpd xmm0, xmm1, 2
+0f 14 c1             | - | - | unpcklps xmm0, xmm1
+0f 15 c1             | - | - | unpckhps xmm0, xmm1
+66 0f 14 c1          | - | - | unpcklpd xmm0, xmm1
+66 0f 15 c1          | - | - | unpckhpd xmm0, xmm1
+0f 54 c1             | - | - | andps xmm0, xmm1
+0f 55 c1             | - | - | andnps xmm0, xmm1
+0f 56 c1             | - | - | orps xmm0, xmm1
+0f 57 c1             | - | - | xorps xmm0, xmm1
+
+# --- SSE2: conversions between integers and floating point (exact ones)
+f3 0f 2a c1          | - | - | cvtsi2ss xmm0, ecx
+f3 48 0f 2a c1       | - | - | cvtsi2ss xmm0, rcx
+f2 0f 2a c1          | - | - | cvtsi2sd xmm0, ecx
+f2 48 0f 2a c1       | - | - | cvtsi2sd xmm0, rcx
+0f 5b c1             | - | - | cvtdq2ps xmm0, xmm1
+f3 0f e6 c1          | - | - | cvtdq2pd xmm0, xmm1

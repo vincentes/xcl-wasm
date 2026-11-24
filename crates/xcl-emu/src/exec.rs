@@ -649,13 +649,27 @@ impl Ctx<'_> {
                 }
             }
             0x0F => return self.two_byte(),
+            // push / pop r: 64 bits, or 16 with the operand-size prefix
             0x50..=0x57 => {
                 let v = self.cpu.r[((op & 7) | ((self.rex & 1) << 3)) as usize];
-                self.push(v)?;
+                if self.opsz16 {
+                    let sp = self.cpu.r[RSP].wrapping_sub(2);
+                    self.mem.write_u16(sp, v as u16)?;
+                    self.cpu.r[RSP] = sp;
+                } else {
+                    self.push(v)?;
+                }
             }
             0x58..=0x5F => {
-                let v = self.pop()?;
-                self.cpu.r[((op & 7) | ((self.rex & 1) << 3)) as usize] = v;
+                let r = (op & 7) | ((self.rex & 1) << 3);
+                if self.opsz16 {
+                    let v = self.mem.read_u16(self.cpu.r[RSP])? as u64;
+                    self.cpu.r[RSP] = self.cpu.r[RSP].wrapping_add(2);
+                    self.sreg(r, 2, v);
+                } else {
+                    let v = self.pop()?;
+                    self.cpu.r[r as usize] = v;
+                }
             }
             // movsxd
             0x63 => {
