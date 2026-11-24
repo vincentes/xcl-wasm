@@ -173,6 +173,23 @@ fn map_0f(c: &mut Ctx, op: u8) -> R<bool> {
         }
         return Ok(true);
     }
+    // vldmxcsr / vstmxcsr m32: the control and status register, as the SSE forms
+    if op == 0xAE {
+        let (reg, rm) = c.modrm()?;
+        return Ok(match (reg & 7, rm) {
+            (_, Rm::Reg(_)) => false,
+            (2, _) => {
+                c.cpu.mxcsr = c.rd_rm(rm, 4)? as u32;
+                true
+            }
+            (3, _) => {
+                let v = c.cpu.mxcsr as u64;
+                c.wr_rm(rm, 4, v)?;
+                true
+            }
+            _ => false,
+        });
+    }
     if is_scalar(c, op) {
         c.l = false;
     }

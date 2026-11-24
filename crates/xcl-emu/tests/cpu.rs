@@ -196,3 +196,17 @@ fn the_guest_leaves_through_traps_faults_and_limits() {
     assert_eq!(cpu.run(&mut mem, 1000), Exit::Limit);
     assert_eq!(cpu.icount, 1000);
 }
+
+#[test]
+fn the_vex_forms_load_and_store_mxcsr() {
+    // sub rsp,16; mov dword [rsp],0x7F80; vldmxcsr [rsp]; vstmxcsr [rsp+4]; mov eax,[rsp+4];
+    // add rsp,16; ret
+    let (cpu, _) = run(&[
+        0x48, 0x83, 0xEC, 0x10, 0xC7, 0x04, 0x24, 0x80, 0x7F, 0x00, 0x00, 0xC5, 0xF8, 0xAE, 0x14, 0x24, 0xC5, 0xF8, 0xAE, 0x5C, 0x24, 0x04, 0x8B, 0x44, 0x24, 0x04, 0x48, 0x83, 0xC4,
+        0x10, 0xC3,
+    ]);
+    assert_eq!((cpu.r[RAX], cpu.mxcsr), (0x7F80, 0x7F80));
+    // with a register operand there is no such instruction
+    let (mut cpu, mut mem) = machine(&[0xC5, 0xF8, 0xAE, 0xD8, 0xC3]);
+    assert!(matches!(cpu.run(&mut mem, 10), Exit::Undefined { .. }));
+}
