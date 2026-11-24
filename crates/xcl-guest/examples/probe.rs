@@ -8,8 +8,9 @@
 //! that the host does not implement are listed, and a DLL's entry point is run
 //! (DLL_PROCESS_ATTACH). With `--run`, the folder's executable is started instead and run for
 //! that many instructions (100 million when none is given): where it stopped, the last system
-//! functions it called and the ones the host answered with a stub. Only the folder's images are
-//! read: no game data.
+//! functions it called and the ones the host answered with a stub. Without `--run` only the
+//! folder's images are read; with it the title also gets the folder's other files of up to 16 MB
+//! (the guest's file system holds a file whole: the large archives are left out, and named).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -41,7 +42,7 @@ fn main() {
     if let Some(at) = wanted.iter().position(|w| w == "--run") {
         let millions = wanted.get(at + 1).and_then(|n| n.parse::<u64>().ok()).unwrap_or(100);
         wanted.truncate(at);
-        run(&images, millions * 1_000_000);
+        run(folder, &images, millions * 1_000_000);
         return;
     }
     // function → the images that import it, over the whole folder
@@ -98,8 +99,33 @@ fn main() {
     }
 }
 
+/// The largest file the title is given whole.
+const WHOLE_FILE_LIMIT: u64 = 16 << 20;
+
+/// Give the title the files of `dir` (and below) that are not images, as `prefix` + their name.
+fn add_small_files(g: &mut Guest, dir: &Path, prefix: &str, left_out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+        let path = entry.path();
+        if path.is_dir() {
+            add_small_files(g, &path, &format!("{name}\\"), left_out);
+        } else if !is_image(&name) && !name.starts_with('.') {
+            match std::fs::metadata(&path).map(|m| m.len()) {
+                Ok(size) if size <= WHOLE_FILE_LIMIT => {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        g.vfs.add_game_file(&name, bytes);
+                    }
+                }
+                Ok(size) => left_out.push(format!("{name} ({} MB)", size >> 20)),
+                Err(_) => {}
+            }
+        }
+    }
+}
+
 /// Start the folder's executable and run it for `budget` instructions.
-fn run(images: &[(String, Vec<u8>)], budget: u64) {
+fn run(folder: &Path, images: &[(String, Vec<u8>)], budget: u64) {
     let Some((name, data)) = images.iter().find(|(n, _)| n.to_ascii_lowercase().ends_with(".exe")) else {
         println!("the folder has no executable");
         return;
@@ -110,6 +136,9 @@ fn run(images: &[(String, Vec<u8>)], budget: u64) {
     for (other, bytes) in images {
         g.vfs.add_game_file(other, bytes.clone());
     }
+    let mut left_out = Vec::new();
+    add_small_files(&mut g, folder, "", &mut left_out);
+    println!("{} files of the folder are too large to give the title whole: {}", left_out.len(), left_out.join(", "));
     let started = g.map_image(name, data).and_then(|index| g.start(index, 1 << 20));
     let stop = match started {
         Ok(()) => g.run(budget),
@@ -132,7 +161,14 @@ fn run(images: &[(String, Vec<u8>)], budget: u64) {
     }
     println!("last system calls:");
     for line in &g.trace {
-        println!("    {line}");
+        // the text a function was given, when its first argument points at some
+        let first = line.split_once('(').and_then(|(_, args)| u64::from_str_radix(args.split([',', ')']).next()?.trim_start_matches("0x"), 16).ok());
+        let name = line.split_once('(').map_or("", |(name, _)| name);
+        let text = first.filter(|&at| at > 0x1_0000).and_then(|at| if name.ends_with('W') { g.mem.wstr(at, 260).ok() } else { g.mem.cstr(at, 260).ok() });
+        match text.filter(|t| t.len() > 1 && t.chars().all(|c| !c.is_control())) {
+            Some(text) => println!("    {line}  \"{text}\""),
+            None => println!("    {line}"),
+        }
     }
     let mut called: Vec<_> = g.imports.iter().filter(|i| i.calls != 0).collect();
     called.sort_by_key(|i| std::cmp::Reverse(i.calls));
