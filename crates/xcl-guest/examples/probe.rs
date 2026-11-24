@@ -158,7 +158,36 @@ fn run(folder: &Path, images: &[(String, Vec<u8>)], budget: u64) {
     add_files(&mut g, folder, "", &mut large);
     println!("{} files of the folder ({} GB) are read on demand", large.0, large.1 >> 30);
     let started = g.map_image(name, data).and_then(|index| g.start(index, 1 << 20));
+    // XCL_PROBE_AFTER=function: from the first call of that system function on, the title is
+    // run an instruction at a time and what it executes is counted by opcode
+    let after = std::env::var("XCL_PROBE_AFTER").ok();
+    let mut opcodes: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut path: std::collections::VecDeque<u64> = Default::default();
     let stop = match started {
+        Ok(()) if after.is_some() => {
+            let name = after.as_deref().unwrap_or_default();
+            let mut left = budget;
+            let mut stepping = false;
+            loop {
+                if !stepping {
+                    stepping = g.imports.iter().any(|i| i.name == name && i.calls != 0);
+                }
+                if stepping {
+                    let rip = g.cpu.rip;
+                    let entry = opcodes.entry(opcode_of(&g, rip)).or_insert((0, rip));
+                    entry.0 += 1;
+                    if path.len() == 400_000 {
+                        path.pop_front();
+                    }
+                    path.push_back(rip);
+                }
+                let step = if stepping { 1 } else { 2000.min(left) };
+                match g.run(step) {
+                    Stop::Limit if left > step => left -= step,
+                    stop => break stop,
+                }
+            }
+        }
         Ok(()) => g.run(budget),
         Err(e) => {
             println!("{name}: not started: {e}");
@@ -185,6 +214,21 @@ fn run(folder: &Path, images: &[(String, Vec<u8>)], budget: u64) {
         let bytes: Vec<u8> = (0..48).map_while(|i| g.mem.read_u8(at + i).ok()).collect();
         println!("    at {at:#x}: {:?} {bytes:02x?}", g.mem.cstr(at, 96).unwrap_or_default());
     }
+    if !opcodes.is_empty() {
+        let mut by_count: Vec<_> = opcodes.iter().collect();
+        by_count.sort_by_key(|(_, (count, _))| *count);
+        println!("{} different opcodes since {}, {} instructions; the rarest first (count, first seen at):", by_count.len(), after.unwrap_or_default(), by_count.iter().map(|(_, (c, _))| c).sum::<u64>());
+        for (opcode, (count, first)) in by_count {
+            println!("    {opcode:<22} {count:>9}  {first:#x}");
+        }
+        // where control went last: the instructions that did not follow their predecessor
+        let jumps: Vec<String> = path.iter().zip(path.iter().skip(1)).filter(|(a, b)| **b < **a || **b > **a + 15).map(|(a, b)| format!("{a:#x}→{b:#x}")).collect();
+        println!("the last jumps: {}", jumps[jumps.len().saturating_sub(40)..].join(" "));
+        // XCL_PROBE_PATH=file: every jump since then, one a line
+        if let Ok(file) = std::env::var("XCL_PROBE_PATH") {
+            let _ = std::fs::write(file, jumps.join("\n"));
+        }
+    }
     println!("last system calls:");
     for line in &g.trace {
         // the text a function was given, when its first argument points at some
@@ -209,5 +253,37 @@ fn run(folder: &Path, images: &[(String, Vec<u8>)], budget: u64) {
     let output = String::from_utf8_lossy(&g.output);
     if !output.is_empty() {
         println!("the title wrote:\n{output}");
+    }
+}
+
+/// The opcode of the instruction at `rip`, without its operands: prefixes that change what it
+/// is (66 / F2 / F3, REX.W), the opcode map and byte, and for a group the /digit.
+fn opcode_of(g: &Guest, rip: u64) -> String {
+    let b: Vec<u8> = (0..15).map_while(|i| g.mem.read_u8(rip + i).ok()).collect();
+    let mut i = 0;
+    let mut prefix = String::new();
+    while i < b.len() {
+        match b[i] {
+            0x66 | 0xF2 | 0xF3 => prefix.push_str(&format!("{:02x} ", b[i])),
+            0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 | 0x67 | 0xF0 => {}
+            0x40..=0x4F => {
+                if b[i] & 8 != 0 {
+                    prefix.push_str("W ");
+                }
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    let at = |k: usize| b.get(i + k).copied().unwrap_or(0);
+    let digit = |k: usize| (at(k) >> 3) & 7;
+    match at(0) {
+        0xC5 => format!("vex.{} 0f {:02x}", ["", "66", "f3", "f2"][(at(1) & 3) as usize], at(2)),
+        0xC4 => format!("vex.{}{} map{} {:02x}", ["", "66", "f3", "f2"][(at(2) & 3) as usize], if at(2) & 0x80 != 0 { " W" } else { "" }, at(1) & 0x1F, at(3)),
+        0x0F if at(1) == 0x38 || at(1) == 0x3A => format!("{prefix}0f {:02x} {:02x}", at(1), at(2)),
+        0x0F if matches!(at(1), 0x00 | 0x01 | 0x18 | 0x71..=0x73 | 0xAE | 0xBA | 0xC7) => format!("{prefix}0f {:02x} /{}", at(1), digit(2)),
+        0x0F => format!("{prefix}0f {:02x}", at(1)),
+        op @ (0x80..=0x83 | 0xC0 | 0xC1 | 0xD0..=0xD3 | 0xF6 | 0xF7 | 0xFE | 0xFF | 0xD8..=0xDF) => format!("{prefix}{op:02x} /{}", digit(1)),
+        op => format!("{prefix}{op:02x}"),
     }
 }
