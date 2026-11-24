@@ -134,6 +134,17 @@ fn origin(insts: &[Decoded], at: usize, reg: u64) -> Result<Origin, String> {
     let d = &insts[def];
     let name = d.inst.name.to_ascii_lowercase();
     let get = |n: &str| field(d, n).unwrap_or(0);
+    // a copy of a register: the console's compiler builds a table's pointer this way
+    // (`s_mov_b32 s10, s5; s_mov_b32 s11, 0; s_load_dwordx4 s[16:19], s[10:11], 0x240`: the
+    // table's address is 32 bits in a user register, the upper half 0)
+    let copied = match name.as_str() {
+        "s_mov_b32" => Some(get("SSRC0")),
+        "s_mov_b64" => Some(get("SSRC0") + (reg - get("SDST"))),
+        _ => None,
+    };
+    if let Some(from) = copied.filter(|&r| r <= 105) {
+        return origin(insts, def, from);
+    }
     if !name.starts_with("s_load_dword") || get("SOFFSET") != 125 {
         return Err(format!("a descriptor in s{reg}, which {name} at +{:#x} writes", d.pc));
     }
@@ -1175,6 +1186,14 @@ mod tests {
         // a vertex has no neighbours: level 0
         let t = translate(&ps[..ps.len() - 8], Stage::Vertex { attr_base: 4, attributes: 0 }).unwrap();
         assert!(!t.wgsl.contains("textureSample(") && t.wgsl.matches("textureSampleLevel(").count() == 2, "{}", t.wgsl);
+        // a table's pointer copied from a user register, its upper half a constant
+        let table = asm(&[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 5)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),
+            ("S_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 5), ("OFFSET", 0x240), ("SOFFSET", 125)], None),
+            ("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", 9), ("VADDR", 2), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1)], None),
+        ]);
+        assert_eq!(translate_kernel(&table).unwrap().images, [Image { texture: Origin { sgpr: 5, loads: vec![0x240] }, sampler: None }]);
         // a descriptor the program computes is refused; so is a cube for now
         let made = asm(&[
             ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 8), ("SIMM16", 5)], None),
