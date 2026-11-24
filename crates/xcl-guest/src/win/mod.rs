@@ -17,6 +17,7 @@ mod kernel32;
 mod kernelx;
 mod libc;
 pub mod seh;
+mod stdio;
 mod sync;
 mod text;
 mod threadpool;
@@ -142,6 +143,7 @@ pub fn handlers() -> HashMap<&'static str, Handler> {
     let mut map = HashMap::new();
     crt::register(&mut map);
     libc::register(&mut map);
+    stdio::register(&mut map);
     kernel32::register(&mut map);
     seh::register(&mut map);
     sync::register(&mut map);

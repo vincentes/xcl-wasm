@@ -235,6 +235,78 @@ fn _strnicmp(g: &mut Guest) -> H {
     compare(g, n, true)
 }
 
+/// strcspn / strspn(text, set): the length of the start of `text` without (or of only)
+/// characters of `set`.
+fn span(g: &mut Guest, of_set: bool) -> H {
+    let (text, set) = (g.arg(0)?, g.arg(1)?);
+    let set = g.mem.cstr(set, 256)?;
+    let mut n = 0;
+    loop {
+        let c = g.mem.read_u8(text + n)?;
+        if c == 0 || set.as_bytes().contains(&c) != of_set {
+            return Ok(n);
+        }
+        n += 1;
+    }
+}
+
+fn strcspn(g: &mut Guest) -> H {
+    span(g, false)
+}
+
+fn strspn(g: &mut Guest) -> H {
+    span(g, true)
+}
+
+/// strtok_s(text or NULL, delimiters, context): the next token, ended in place; the context
+/// keeps where the scan goes on.
+fn strtok_s(g: &mut Guest) -> H {
+    let (text, delimiters, context) = (g.arg(0)?, g.arg(1)?, g.arg(2)?);
+    let delimiters = g.mem.cstr(delimiters, 256)?;
+    let is = |c: u8| delimiters.as_bytes().contains(&c);
+    let mut at = if text != 0 { text } else { g.mem.read_u64(context)? };
+    if at == 0 {
+        return Ok(0);
+    }
+    while is(g.mem.read_u8(at)?) {
+        at += 1;
+    }
+    if g.mem.read_u8(at)? == 0 {
+        g.mem.write_u64(context, at)?;
+        return Ok(0);
+    }
+    let token = at;
+    loop {
+        let c = g.mem.read_u8(at)?;
+        if c == 0 {
+            break;
+        }
+        if is(c) {
+            g.mem.write_u8(at, 0)?;
+            at += 1;
+            break;
+        }
+        at += 1;
+    }
+    g.mem.write_u64(context, at)?;
+    Ok(token)
+}
+
+/// rand_s(value out): the process's generator (the same sequence every run).
+fn rand_s(g: &mut Guest) -> H {
+    let out = g.arg(0)?;
+    if out == 0 {
+        return Ok(EINVAL);
+    }
+    let mut x = g.win.prng ^ 0x9E37_79B9_7F4A_7C15;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    g.win.prng = x;
+    g.mem.write_u32(out, (x >> 32) as u32)?;
+    Ok(0)
+}
+
 const EINVAL: u64 = 22;
 const ERANGE: u64 = 34;
 
@@ -360,6 +432,7 @@ fn one(_: &mut Guest) -> H {
 pub(super) fn register(map: &mut HashMap<&'static str, Handler>) {
     register!(map; __pctype_func, ___lc_locale_name_func, setlocale, localeconv, _get_stream_buffer_pointers, _errno);
     register!(map; _get_narrow_winmain_command_line, _time64, _aligned_malloc, _aligned_free, terminate);
+    register!(map; strcspn, strspn, strtok_s, rand_s);
     register!(map; tolower, toupper, strcmp, _stricmp, _strnicmp, wcscpy_s, wcscat_s, ldexp);
     register_classes(map);
     register_maths(map);
@@ -453,6 +526,24 @@ mod tests {
         assert_eq!(call(&mut g, wcscat_s, [to, 12, b]), Ok(ERANGE));
         assert_eq!(g.mem.read_u16(to).unwrap(), 0);
         assert_eq!(call(&mut g, wcscpy_s, [0, 16, a]), Ok(EINVAL));
+    }
+
+    #[test]
+    fn a_string_is_scanned_and_split_at_its_delimiters() {
+        let (mut g, page) = guest();
+        let (text, set, context) = (page, page + 0x100, page + 0x200);
+        g.mem.write(text, b"packroot:/levels.rpf\0").unwrap();
+        g.mem.write(set, b":/\0").unwrap();
+        assert_eq!(call(&mut g, strcspn, [text, set, 0]), Ok(8));
+        assert_eq!(call(&mut g, strspn, [text + 8, set, 0]), Ok(2));
+        assert_eq!(call(&mut g, strcspn, [text + 10, set, 0]), Ok(10));
+        let first = call(&mut g, strtok_s, [text, set, context]).unwrap();
+        assert_eq!(g.mem.cstr(first, 32).unwrap(), "packroot");
+        let second = call(&mut g, strtok_s, [0, set, context]).unwrap();
+        assert_eq!((second, g.mem.cstr(second, 32).unwrap().as_str()), (text + 10, "levels.rpf"));
+        assert_eq!(call(&mut g, strtok_s, [0, set, context]), Ok(0));
+        assert_eq!(call(&mut g, rand_s, [page + 0x300, 0, 0]), Ok(0));
+        assert_eq!(call(&mut g, rand_s, [0, 0, 0]), Ok(EINVAL));
     }
 
     #[test]
