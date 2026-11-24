@@ -66,6 +66,11 @@ pub struct Features {
 }
 
 impl Features {
+    /// Everything the interpreter implements: what a console title (built for Zen 2) expects,
+    /// short of AES, PCLMULQDQ, SHA and x87 arithmetic, which it does not have.
+    pub const IMPLEMENTED: Features =
+        Features { sse3: true, ssse3: true, sse41: true, sse42: true, popcnt: true, lzcnt: true, movbe: true, avx: true, avx2: true, fma: true, f16c: true, bmi1: true, bmi2: true, adx: true };
+
     /// x86-64 as it started: SSE2 (and POPCNT).
     pub const BASELINE: Features =
         Features { sse3: false, ssse3: false, sse41: false, sse42: false, popcnt: true, lzcnt: false, movbe: false, avx: false, avx2: false, fma: false, f16c: false, bmi1: false, bmi2: false, adx: false };

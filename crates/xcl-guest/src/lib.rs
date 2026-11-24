@@ -160,6 +160,8 @@ impl Guest {
     pub fn new() -> Self {
         let mut cpu = Cpu::new();
         cpu.set_traps(TRAP_BASE, TRAP_SLOTS);
+        // a console title is built for the console's processor and does not ask
+        cpu.features = xcl_emu::cpu::Features::IMPLEMENTED;
         Guest {
             cpu,
             threads: Vec::new(),

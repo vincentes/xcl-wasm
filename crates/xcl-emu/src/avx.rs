@@ -391,9 +391,124 @@ fn widen(c: &mut Ctx, op: u8) -> R<bool> {
     Ok(true)
 }
 
+/// A gather: the elements whose mask element (in vvvv) has its sign bit set are loaded from
+/// base + index × scale, the indexes being a vector register (VSIB). The mask ends up zero.
+fn gather(c: &mut Ctx, op: u8) -> R<bool> {
+    let m = c.fetch8()?;
+    if m >> 6 == 3 || m & 7 != 4 {
+        return Ok(false);
+    }
+    let reg = ((m >> 3) & 7) | ((c.rex & 4) << 1);
+    let sib = c.fetch8()?;
+    let index_reg = ((sib >> 3) & 7) | ((c.rex & 2) << 2);
+    let scale = sib >> 6;
+    let mut base = if sib & 7 == 5 && m >> 6 == 0 { c.fetch32()? as i32 as i64 as u64 } else { c.cpu.r[((sib & 7) | ((c.rex & 1) << 3)) as usize] };
+    match m >> 6 {
+        1 => base = base.wrapping_add(c.fetch8()? as i8 as i64 as u64),
+        2 => base = base.wrapping_add(c.fetch32()? as i32 as i64 as u64),
+        _ => {}
+    }
+    let base = base.wrapping_add(c.seg);
+    let data: usize = if c.rex & 8 != 0 { 8 } else { 4 };
+    let index: usize = if op & 1 == 0 { 4 } else { 8 };
+    // as many elements as fit both the index vector and the destination
+    let n = if c.l { 32 } else { 16 } / data.max(index);
+    let indexes = bytes_of(c.y(index_reg));
+    let mut mask = bytes_of(c.y(c.vvvv));
+    let mut out = bytes_of(c.y(reg));
+    for i in 0..n {
+        if mask[i * data + data - 1] & 0x80 != 0 {
+            let k = sxl(element(&indexes, i, index), index as u32) as u64;
+            let at = base.wrapping_add(k << scale);
+            c.mem.read(at, &mut out[i * data..(i + 1) * data])?;
+        }
+    }
+    // what lies above the elements written is cleared, in the destination and the mask
+    out[n * data..].fill(0);
+    mask.fill(0);
+    let vvvv = c.vvvv;
+    c.set_y(reg, halves_of(&out));
+    c.set_y(vvvv, halves_of(&mask));
+    Ok(true)
+}
+
+/// pcmpestri / pcmpestrm / pcmpistri / pcmpistrm: the SSE4.2 string compares.
+fn string_compare(c: &mut Ctx, op: u8) -> R<bool> {
+    let (reg, rm) = c.modrm()?;
+    let imm = c.fetch8()?;
+    let (a, b) = (c.x(reg).to_le_bytes(), c.rd_x(rm, 16)?.to_le_bytes());
+    let w: usize = if imm & 1 != 0 { 2 } else { 1 };
+    let n = 16 / w;
+    let signed = imm & 2 != 0;
+    let get = |v: &[u8; 16], i: usize| {
+        let x = element(v, i, w);
+        if signed {
+            sxl(x, w as u32)
+        } else {
+            x as i64
+        }
+    };
+    let explicit = op & 2 == 0;
+    let length = |v: &[u8; 16], reg: usize| {
+        if explicit {
+            let r = c.cpu.r[reg];
+            let len = if c.rex & 8 != 0 { (r as i64).unsigned_abs() } else { (r as u32 as i32).unsigned_abs() as u64 };
+            len.min(n as u64) as usize
+        } else {
+            (0..n).find(|&i| element(v, i, w) == 0).unwrap_or(n)
+        }
+    };
+    let (la, lb) = (length(&a, RAX), length(&b, RDX));
+    let mut res = 0u32;
+    for i in 0..n {
+        let bit = match (imm >> 2) & 3 {
+            // equal any: the element of b is one of a's
+            0 => i < lb && (0..la).any(|j| get(&a, j) == get(&b, i)),
+            // ranges: it lies in one of a's pairs
+            1 => i < lb && (0..la / 2).any(|j| get(&a, 2 * j) <= get(&b, i) && get(&b, i) <= get(&a, 2 * j + 1)),
+            // equal each: the strings agree here (beyond both ends they do)
+            2 => (i < la && i < lb && get(&a, i) == get(&b, i)) || (i >= la && i >= lb),
+            // equal ordered: a starts here in b
+            _ => (0..n - i).all(|j| j >= la || (i + j < lb && get(&a, j) == get(&b, i + j))),
+        };
+        res |= (bit as u32) << i;
+    }
+    let all = (1u32 << n) - 1;
+    let res = match (imm >> 4) & 3 {
+        1 => !res & all,
+        3 => res ^ ((1u32 << lb) - 1),
+        _ => res,
+    };
+    if op & 1 != 0 {
+        // the index of the first (or last) match, or the number of elements
+        let index = if res == 0 {
+            n as u32
+        } else if imm & 0x40 != 0 {
+            31 - res.leading_zeros()
+        } else {
+            res.trailing_zeros()
+        };
+        c.sreg(RCX as u8, 8, index as u64);
+    } else {
+        let mask = if imm & 0x40 != 0 {
+            (0..n).fold(0u128, |m, i| if res >> i & 1 != 0 { m | ((1u128 << (8 * w)) - 1) << (8 * w * i) } else { m })
+        } else {
+            res as u128
+        };
+        c.set_x(0, mask);
+    }
+    c.cpu.rflags &= !(CF | ZF | SF | OF | AF | PF);
+    c.cpu.set_flag(CF, res != 0);
+    c.cpu.set_flag(ZF, lb < n);
+    c.cpu.set_flag(SF, la < n);
+    c.cpu.set_flag(OF, res & 1 != 0);
+    Ok(true)
+}
+
 fn map_0f38(c: &mut Ctx, op: u8) -> R<bool> {
     let vector = c.opsz16 && c.rep == 0;
     match op {
+        0x90..=0x93 if vector && c.vex => return gather(c, op),
         0x00..=0x0D | 0x1C..=0x1E | 0x28..=0x2B | 0x37..=0x40 | 0x45..=0x47 | 0x96..=0x9F | 0xA6..=0xAF | 0xB6..=0xBF if vector => {
             // a scalar FMA form works on the low element only
             if op >= 0x96 && op & 0xF >= 9 && op & 1 == 1 {
@@ -723,6 +838,7 @@ fn map_0f3a(c: &mut Ctx, op: u8) -> R<bool> {
             }
             return per_half(c, |c| lanewise_3a(c, op));
         }
+        0x60..=0x63 if vector && !c.l => return string_compare(c, op),
         // vpermq / vpermpd ymm, ymm/m256, imm8
         0x00 | 0x01 if vector && c.vex && c.l => {
             let (reg, rm) = c.modrm()?;
