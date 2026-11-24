@@ -1,0 +1,13 @@
+[package]
+name = "xcl-emu"
+description = "x86-64 guest for XCL where the game's code cannot run natively (WebAssembly): guest memory, CPU state and an interpreter."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "xcl_emu"
+path = "src/lib.rs"
+
+[dependencies]

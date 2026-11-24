@@ -557,6 +557,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "xcl-emu"
+version = "0.1.0"
+
+[[package]]
 name = "xcl-testtitle"
 version = "0.1.0"
 dependencies = [
