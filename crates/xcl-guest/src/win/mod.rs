@@ -15,6 +15,7 @@ mod kernel32;
 mod kernelx;
 pub mod seh;
 mod sync;
+mod text;
 mod threadpool;
 mod user;
 pub mod xgameruntime;
@@ -127,6 +128,8 @@ pub fn handlers() -> HashMap<&'static str, Handler> {
     seh::register(&mut map);
     sync::register(&mut map);
     threadpool::register(&mut map);
+    // after kernel32: names for functions it has
+    text::register(&mut map);
     user::register(&mut map);
     xgameruntime::register(&mut map);
     // after kernel32 and crt: the file functions also take the standard handles
